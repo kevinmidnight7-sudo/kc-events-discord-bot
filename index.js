@@ -103,19 +103,22 @@ function isUnknownInteraction(err) {
   return err?.code === 10062 || err?.rawError?.code === 10062;
 }
 
-async function safeDefer(interaction, opts = {}) {
-  // If we’re already acknowledged, skip
+async function safeDefer(interaction, { ephemeral = false } = {}) {
+  // Already acknowledged? nothing to do.
   if (interaction.deferred || interaction.replied) return true;
 
-  // If the token is about to expire, bail (prevents 10062)
-  const age = Date.now() - interaction.createdTimestamp;
-  if (age > 4500) return false;   // still under Discord’s 3s defer window in most cases, but friendlier if the event loop is briefly busy
+  // Discord requires an ACK within ~3s. Aim to defer ASAP (<2s guard).
+  const ageMs = Date.now() - interaction.createdTimestamp;
+  if (ageMs > 2000) return false;
 
   try {
+    // use flags instead of deprecated "ephemeral" option
+    const opts = ephemeral ? { flags: 64 } : {};
     await interaction.deferReply(opts);
     return true;
   } catch (err) {
-    if (isUnknownInteraction(err)) return false;
+    // "Unknown interaction" means token already expired – caller will fallback.
+    if (err?.code === 10062 || err?.rawError?.code === 10062) return false;
     throw err;
   }
 }
@@ -158,10 +161,13 @@ async function finalRespond(interaction, data, fallbackText = null) {
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
     }
-    return await interaction.reply({ ...data, ephemeral: true });
+    // brand new reply (use flags for ephemeral)
+    const isEphemeral = data?.flags === 64 || data?.ephemeral === true;
+    const payload = isEphemeral ? { ...data, flags: 64 } : data;
+    return await interaction.reply(payload);
   } catch (err) {
-    if (isUnknownInteraction(err) && interaction.channel && fallbackText) {
-      // Token expired: send a normal message in channel instead of failing silently
+    // token expired? send a normal message so user still sees *something*
+    if ((err?.code === 10062 || err?.rawError?.code === 10062) && interaction.channel && fallbackText) {
       try { await interaction.channel.send(fallbackText); } catch (_) {}
       return null;
     }
@@ -432,6 +438,10 @@ client.on('interactionCreate', async (interaction) => {
   } catch (_) {}
 
   if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
+    if (!interaction.message?.editable && !interaction.deferred && !interaction.replied) {
+      return finalRespond(interaction, { content: 'That leaderboard page is stale. Run `/leaderboard` again.' },
+                          'Leaderboard interaction expired. Run `/leaderboard` again.');
+    }
     const [, type, catStr, pageStr] = interaction.customId.split(':');
     const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
     const page   = Math.max(0, parseInt(pageStr,10) || 0);
@@ -443,7 +453,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const embed = buildLbEmbed(rows, catIdx, page);
-    return interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
+    await interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
+    return;
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -451,7 +462,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'link') {
     const start = process.env.AUTH_BRIDGE_START_URL;
     const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-    return interaction.reply({ content: `Click to link your account:\n${url}`, ephemeral: true });
+    return interaction.reply({ content: `Click to link your account:\n${url}`, flags: 64 });
   }
 
   if (interaction.commandName === 'whoami') {
@@ -535,11 +546,12 @@ client.on('interactionCreate', async (interaction) => {
         }
       };
 
-      return safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
+      await safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
     } catch (e) {
       console.error('dumpme error:', e);
-      return safeEdit(interaction, { content: 'Error reading data (see logs).' });
+      await safeEdit(interaction, { content: 'Error reading data (see logs).' });
     }
+    return;
   }
 
   if (interaction.commandName === 'leaderboard') {
@@ -592,18 +604,20 @@ client.on('interactionCreate', async (interaction) => {
       console.log('[INT] badges -> getKCUidForDiscord');
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        return finalRespond(interaction, {
+        await finalRespond(interaction, {
           content: target.id === interaction.user.id
             ? 'I can’t find your KC account. Use `/link` to connect it first.'
             : `I can’t find a KC account linked to **${target.tag}**.`
         }, 'Could not find a linked KC account.');
+        return;
       }
       
       console.log('[INT] badges -> getKCProfile');
       const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
 
       if (!profile) {
-        return finalRespond(interaction, { content: 'No profile data found.' }, 'No profile data found.');
+        await finalRespond(interaction, { content: 'No profile data found.' }, 'No profile data found.');
+        return;
       }
 
       const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
