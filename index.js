@@ -113,6 +113,35 @@ async function safeEdit(interaction, data) {
   }
 }
 
+// --- Promise timeout wrapper so we never hang indefinitely
+function withTimeout(promise, ms, label = 'operation') {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([
+    promise.finally(() => clearTimeout(t)),
+    timeout,
+  ]);
+}
+
+// Always produce a user-visible message even if interaction token expired
+async function finalRespond(interaction, data, fallbackText = null) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(data);
+    }
+    return await interaction.reply({ ...data, ephemeral: true });
+  } catch (err) {
+    if (isUnknownInteraction(err) && interaction.channel && fallbackText) {
+      // Token expired: send a normal message in channel instead of failing silently
+      try { await interaction.channel.send(fallbackText); } catch (_) {}
+      return null;
+    }
+    throw err;
+  }
+}
+
 function extractYouTubeAndTikTokLinks(str = '') {
   const urls = [];
   const rx = /(https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=[\w-]+|youtu\.be\/[\w-]+|tiktok\.com\/@[A-Za-z0-9_.-]+\/video\/\d+))/gi;
@@ -125,7 +154,11 @@ function extractYouTubeAndTikTokLinks(str = '') {
 }
 
 async function getKCUidForDiscord(discordId) {
-  const snap = await rtdb.ref(`discordLinks/${discordId}`).get();
+    const snap = await withTimeout(
+    rtdb.ref(`discordLinks/${discordId}`).get(),
+    3000,
+    `RTDB discordLinks/${discordId}`
+  );
   if (!snap.exists()) return null;
   const { uid } = snap.val() || {};
   return uid || null;
@@ -143,9 +176,9 @@ async function getKCProfile(uid) {
 
   // 1) RTDB reads (preferred)
   const [userSnapRT, badgeSnapRT, postsSnapRT] = await Promise.allSettled([
-    rtdb.ref(`users/${uid}`).get(),
-    rtdb.ref(`badges/${uid}`).get(),
-    rtdb.ref(`users/${uid}/posts`).get(),
+    withTimeout(rtdb.ref(`users/${uid}`).get(), 3000, `RTDB users/${uid}`),
+    withTimeout(rtdb.ref(`badges/${uid}`).get(), 3000, `RTDB badges/${uid}`),
+    withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 3000, `RTDB users/${uid}/posts`),
   ]);
 
   const safeVal = s => (s && s.status === 'fulfilled' && s.value && s.value.exists()) ? s.value.val() : null;
@@ -156,18 +189,26 @@ async function getKCProfile(uid) {
   // 2) Firestore fallbacks (if RTDB missing)
   if (!user || Object.keys(user).length === 0) {
     try {
-      const fsUser = await firestore.collection('users').doc(uid).get();
+      const fsUser = await withTimeout(
+        firestore.collection('users').doc(uid).get(),
+        3000,
+        `FS users/${uid}`
+      );
       if (fsUser.exists) user = fsUser.data() || {};
-    } catch (_) {}
+    } catch (e) { console.warn('FS user read timeout/fail:', e.message); }
   }
   if (!posts || Object.keys(posts).length === 0) {
     try {
-      const fsPosts = await firestore.collection('users').doc(uid).collection('posts').get();
+      const fsPosts = await withTimeout(
+        firestore.collection('users').doc(uid).collection('posts').get(),
+        3000,
+        `FS users/${uid}/posts`
+      );
       if (!fsPosts.empty) {
         posts = {};
         fsPosts.forEach(d => { posts[d.id] = d.data(); });
       }
-    } catch (_) {}
+    } catch (e) { console.warn('FS posts read timeout/fail:', e.message); }
   }
   // (Badges also sometimes appear in FS; keep RTDB as source of truth per site)
 
@@ -313,19 +354,28 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'whoami') {
-      const ok = await safeDefer(interaction, { ephemeral: true });
-      if (!ok) {
-        // Fallback: we cannot respond to the interaction anymore
-        if (interaction.channel) {
-          await interaction.channel.send('Sorry, that timed out. Please run `/whoami` again.');
-        }
-        return;
-      }
-      const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-      await safeEdit(interaction, {
-          content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
-      });
+    const ok = await safeDefer(interaction, { ephemeral: true });
+    if (!ok) {
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/whoami` again.');
       return;
+    }
+
+    console.time(`whoami:${interaction.id}`);
+    let kcUid = null;
+    try {
+      kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+      await finalRespond(
+        interaction,
+        { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` },
+        'The whoami reply expired. Please try again.'
+      );
+    } catch (e) {
+      console.error('whoami error:', e);
+      await finalRespond(interaction, { content: 'Something went wrong.' }, 'whoami failed, please try again.');
+    } finally {
+      console.timeEnd(`whoami:${interaction.id}`);
+    }
+    return;
   }
 
   if (interaction.commandName === 'dumpme') {
@@ -384,32 +434,26 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'badges') {
-    try {
-      const ok = await safeDefer(interaction); // public
-      if (!ok) {
-        if (interaction.channel) {
-          await interaction.channel.send('Sorry, that timed out. Please run `/badges` again.');
-        }
-        return;
-      }
+    const ok = await safeDefer(interaction); // public
+    if (!ok) {
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/badges` again.');
+      return;
+    }
 
+    console.time(`badges:${interaction.id}`);
+    try {
       const discordId = interaction.user.id;
       const kcUid = await getKCUidForDiscord(discordId);
+
       if (!kcUid) {
-        return safeEdit(interaction, { content: 'I can’t find your KC account. Use `/link` to connect it first.' });
+        return finalRespond(interaction, { content: 'I can’t find your KC account. Use `/link` to connect it first.' },
+          'I couldn’t find your KC account. Use `/link` to connect it first.');
       }
 
-      let profile;
-      try {
-        profile = await getKCProfile(kcUid);
-      } catch (e) {
-        console.error('getKCProfile threw:', e);
-        return safeEdit(interaction, { content: 'Profile lookup failed (see logs).' });
-      }
-      
+      const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
+
       if (!profile) {
-        console.warn('badges: empty profile for', kcUid);
-        return safeEdit(interaction, { content: 'No profile data found.' });
+        return finalRespond(interaction, { content: 'No profile data found.' }, 'No profile data found.');
       }
 
       const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
@@ -418,10 +462,9 @@ client.on('interactionCreate', async (interaction) => {
       const bonusVal    = clampStr(profile.bonus, 1024, '—');
       const streakVal   = clampStr(profile.streak, 1024, '—');
       const postsVal    = clampStr(profile.postsText, 1024);
-      
-      // Use the requester's *Discord* avatar (short CDN URL)
+
       const discordAvatar = interaction.user.displayAvatarURL({ extension: 'png', size: 128 });
-      
+
       const embed = new EmbedBuilder()
         .setTitle(title)
         .setThumbnail(discordAvatar)
@@ -433,23 +476,24 @@ client.on('interactionCreate', async (interaction) => {
           { name: 'Posts',  value: postsVal,  inline: false },
         );
 
-      // Tint the embed with the user’s chosen name colour (or gradient’s first colour)
       if (profile.embedColor) embed.setColor(profile.embedColor);
 
-      return safeEdit(interaction, { embeds: [embed] });
+      await finalRespond(
+        interaction,
+        { embeds: [embed] },
+        'Your `/badges` reply expired — please run it again.'
+      );
     } catch (err) {
       console.error('badges command error:', err);
       console.error('raw error body:', err?.rawError);
       console.error('raw errors tree:', err?.rawError?.errors);
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply('Something went wrong (see logs).');
-        } else {
-          await interaction.reply({ content: 'Something went wrong (see logs).', ephemeral: true });
-        }
-      } catch (e) {
-        console.error('failed to send error reply:', e);
-      }
+      await finalRespond(
+        interaction,
+        { content: 'Something went wrong (see logs).' },
+        'Something went wrong running `/badges`. Please try again.'
+      );
+    } finally {
+      console.timeEnd(`badges:${interaction.id}`);
     }
     return;
   }
