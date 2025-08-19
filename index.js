@@ -182,16 +182,57 @@ async function getKCProfile(uid) {
     }
   }
 
-  // Badges summary (covers common fields)
+  // ----- Badges summary (robust across common shapes) -----
   const badgeLines = [];
-  if (badges.offence || badges.bestOffence)
-    badgeLines.push(`🏹 Best Offence x${badges.offence ?? badges.bestOffence}`);
-  if (badges.defence || badges.bestDefence)
-    badgeLines.push(`🛡️ Best Defence x${badges.defence ?? badges.bestDefence}`);
-  if (badges.overall || badges.overallWins)
-    badgeLines.push(`🌟 Overall Winner x${badges.overall ?? badges.overallWins}`);
-  if (user.diamondMember === true || badges.diamond === true)
-    badgeLines.push('💎 Diamond Member');
+
+  // 1) Trophy/counter-style badges (either RTDB or Firestore)
+  const offenceCount = badges.offence ?? badges.bestOffence ?? badges.offense; // spelling variants
+  const defenceCount = badges.defence ?? badges.bestDefence ?? badges.defense;
+  const overallCount = badges.overall ?? badges.overallWins ?? badges.totalWins;
+
+  if (Number.isFinite(offenceCount) && offenceCount > 0) {
+    badgeLines.push(`🏹 Best Offence x${offenceCount}`);
+  }
+  if (Number.isFinite(defenceCount) && defenceCount > 0) {
+    badgeLines.push(`🛡️ Best Defence x${defenceCount}`);
+  }
+  if (Number.isFinite(overallCount) && overallCount > 0) {
+    badgeLines.push(`🌟 Overall Winner x${overallCount}`);
+  }
+
+  // 2) “Membership/flag” style badges (booleans or array of strings)
+  // Try a user.badges object/array first (many sites store “Verified”, “Diamond”, etc. here).
+  const pretty = (k) => {
+    const map = {
+      verified: '✅ Verified',
+      diamond: '💎 Diamond User',
+      diamondmember: '💎 Diamond User',
+      emerald: '💚 Emerald User',
+      emeraldmember: '💚 Emerald User',
+      mrupdater: '👑 mr updater',
+      updater: '👑 mr updater',
+      vl: '🏎️ VL »»',
+      vip: '⭐ VIP',
+    };
+    const key = String(k).toLowerCase().replace(/\s+/g, '');
+    return map[key] || `• ${k}`;
+  };
+
+  if (Array.isArray(user.badges)) {
+    for (const k of user.badges) badgeLines.push(pretty(k));
+  } else if (user.badges && typeof user.badges === 'object') {
+    for (const [k, v] of Object.entries(user.badges)) {
+      if (v === true || v === 'true' || v === 1) badgeLines.push(pretty(k));
+    }
+  }
+
+  // 3) Common single-field flags on user or badges
+  if (user.diamondMember === true || badges.diamond === true) badgeLines.push('💎 Diamond User');
+  if (user.verified === true || badges.verified === true) badgeLines.push('✅ Verified');
+  if (user.emeraldMember === true || badges.emerald === true) badgeLines.push('💚 Emerald User');
+
+  // Final text
+  const badgesText = badgeLines.length ? [...new Set(badgeLines)].join('\n') : 'No badges yet.';
 
 
   return {
@@ -200,7 +241,7 @@ async function getKCProfile(uid) {
     avatar,
     bonus,
     streak,
-    badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
+    badgesText,
     postsText: contentUnlocked ? (postLines.length ? postLines.join('\n') : '—') : '—',
   };
 }
