@@ -14,6 +14,7 @@ const {
   Routes,
   REST,
   EmbedBuilder,
+  InteractionResponseFlags,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -258,29 +259,32 @@ client.on('interactionCreate', async (interaction) => {
       const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
       return interaction.reply({
         content: `Click to link your account:\n${url}`,
-        ephemeral: true,
+        flags: 64, // 64 is the flag for EPHEMERAL
       });
     }
 
     if (interaction.commandName === 'whoami') {
-        await interaction.reply({
-            content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${await getKCUidForDiscord(interaction.user.id) || 'not linked'}\``,
-            ephemeral: true
+        // Defer reply to prevent timeout if database is slow
+        await interaction.deferReply({ flags: 64 }); // Ephemeral defer
+        const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+        await interaction.editReply({
+            content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
         });
         return;
     }
 
     if (interaction.commandName === 'badges') {
-      await interaction.deferReply({ ephemeral: false });
+      await interaction.deferReply({ ephemeral: false }); // Public reply
 
       const discordId = interaction.user.id;
 
       // 1) Resolve KC uid from RTDB mapping
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
+        // The ephemeral status is inherited from deferReply, but we want this error to be private.
+        // We edit the original deferred reply to show the error.
         return interaction.editReply({
           content: 'I can’t find your KC account. Use `/link` to connect it first.',
-          ephemeral: true,
         });
       }
 
@@ -303,10 +307,15 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (err) {
     console.error('Command error:', err);
-    if (interaction.deferred || interaction.replied) {
-      return interaction.editReply({ content: 'Something went wrong.' });
+    try {
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ content: 'Something went wrong.' });
+        } else {
+            await interaction.reply({ content: 'Something went wrong.', flags: 64 });
+        }
+    } catch (e) {
+        console.error('Failed to send error reply:', e);
     }
-    return interaction.reply({ content: 'Something went wrong.', ephemeral: true });
   }
 });
 
