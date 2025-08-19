@@ -90,7 +90,7 @@ client.on('interactionCreate', async interaction => {
         // Use a transient reply so only the user sees the link
         ephemeral: true,
       });
-    } else if (interaction.commandName === 'badges') {
+      } else if (interaction.commandName === 'badges_old') {
       // Find the user by discordId
       const snap = await db
         .collection('users')
@@ -134,7 +134,93 @@ client.on('interactionCreate', async interaction => {
         // Only visible to the invoking user
         ephemeral: true,
       });
-    } else if (interaction.commandName === 'unlink') {
+      } else if (interaction.commandName === 'badges') {
+        // Find the KC user document by the Discord snowflake and build a public profile embed
+        const snap = await db
+          .collection('users')
+          .where('discordId', '==', interaction.user.id)
+          .limit(1)
+          .get();
+        if (snap.empty) {
+          // If no linked account is found, reply privately to avoid channel clutter
+          await interaction.reply({
+            content: 'Not linked yet. Use /link to connect your account.',
+            ephemeral: true,
+          });
+          return;
+        }
+        const doc = snap.docs[0];
+        const data = doc.data();
+        const name = data.displayName || data.username || 'KC Player';
+        // Build a list of badge descriptions based off the KC profile
+        const badgeList = [];
+        // Verified status
+        if (data.isVerified || data.verified || data.emailVerified) {
+          badgeList.push('✅ Verified');
+        }
+        // Skilled badges: offence/defence/overall counts
+        if (data.badges) {
+          if (data.badges.offence && data.badges.offence > 0) {
+            badgeList.push(`🏹 Best Offence x${data.badges.offence}`);
+          }
+          if (data.badges.defence && data.badges.defence > 0) {
+            badgeList.push(`🛡️ Best Defence x${data.badges.defence}`);
+          }
+          if (data.badges.overall && data.badges.overall > 0) {
+            badgeList.push(`🏆 Overall Winner x${data.badges.overall}`);
+          }
+        }
+        // Unlockable codes: diamond, emerald, and any other truthy flags
+        if (data.codesUnlocked && typeof data.codesUnlocked === 'object') {
+          if (data.codesUnlocked.diamond) badgeList.push('💎 Diamond User');
+          if (data.codesUnlocked.emerald) badgeList.push('🟩 Emerald User');
+          Object.entries(data.codesUnlocked).forEach(([key, val]) => {
+            if (val && !['diamond', 'emerald'].includes(key)) {
+              badgeList.push(`🧩 ${key}`);
+            }
+          });
+        }
+        const badgeFieldValue = badgeList.length
+          ? badgeList.join('\n')
+          : 'No badges yet.';
+        // Bonus and streak values
+        const bonusValue = Number.isFinite(data.customBonus)
+          ? data.customBonus
+          : Number.isFinite(data.bonus)
+          ? data.bonus
+          : 0;
+        const streakValue = Number.isFinite(data.loginStreak) ? data.loginStreak : 0;
+        // About Me description
+        const aboutText = data.aboutMe || 'No "About Me" set.';
+        // Build the embed using KC profile fields
+        const embed = new EmbedBuilder()
+          .setTitle(`${name} — KC Profile`)
+          .setDescription(aboutText)
+          .addFields(
+            { name: 'Badges', value: badgeFieldValue, inline: false },
+            { name: 'Bonus', value: String(bonusValue), inline: true },
+            {
+              name: 'Streak',
+              value: streakValue
+                ? `🔥 ${streakValue} day${streakValue === 1 ? '' : 's'}`
+                : '—',
+              inline: true,
+            },
+          );
+        // Prefer KC avatar URL if present and not a data URL; fallback to Discord avatar
+        if (
+          data.avatar &&
+          typeof data.avatar === 'string' &&
+          !data.avatar.startsWith('data:')
+        ) {
+          embed.setThumbnail(data.avatar);
+        } else if (data.discordAvatarURL) {
+          embed.setThumbnail(data.discordAvatarURL);
+        }
+        await interaction.reply({
+          embeds: [embed],
+        });
+      } else if (interaction.commandName === 'unlink') {
       // Find the user by discordId and remove Discord fields
       const snap = await db
         .collection('users')
