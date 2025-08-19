@@ -2,7 +2,9 @@
 // Discord.js v14 + Firebase Admin (Realtime Database)
 // Commands: /link (DMs auth link), /badges (public profile embed)
 
-require('dotenv').config();
+// Make dotenv optional (used locally, ignored on Render if not installed)
+try { require('dotenv').config(); } catch (_) {}
+
 
 const {
   Client,
