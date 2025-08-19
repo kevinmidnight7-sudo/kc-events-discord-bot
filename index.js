@@ -26,12 +26,17 @@ if (process.env.FB_SERVICE_ACCOUNT_JSON) {
 } else {
   throw new Error('Missing FB_SERVICE_ACCOUNT_JSON or FB_SERVICE_ACCOUNT_PATH environment variable');
 }
-admin.initializeApp({
-  credential,
-  storageBucket: process.env.FB_STORAGE_BUCKET,
-});
-const db = admin.firestore();
-const bucket = admin.storage().bucket();
+    admin.initializeApp({
+      credential,
+      storageBucket: process.env.FB_STORAGE_BUCKET,
+      // Provide a Realtime Database URL if available. Without this, admin.database()
+      // will attempt to infer the URL from the service account project ID.
+      databaseURL: process.env.FB_DATABASE_URL,
+    });
+    const db = admin.firestore();
+    const bucket = admin.storage().bucket();
+    // Reference to the Firebase Realtime Database (used for KC profiles and links)
+    const rtdb = admin.database();
 
 // Define slash commands
 const commands = [
@@ -135,64 +140,90 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true,
       });
       } else if (interaction.commandName === 'badges') {
-        // Find the KC user document by the Discord snowflake and build a public profile embed
-        const snap = await db
-          .collection('users')
-          .where('discordId', '==', interaction.user.id)
-          .limit(1)
-          .get();
-        if (snap.empty) {
-          // If no linked account is found, reply privately to avoid channel clutter
+        // Build a public KC Events profile embed using Realtime Database and mapping from Discord ID to KC UID
+        // Look up the KC user UID via the discordLinks mapping in the Realtime Database
+        const linkSnap = await rtdb.ref(`discordLinks/${interaction.user.id}`).once('value');
+        if (!linkSnap.exists() || !linkSnap.val() || !linkSnap.val().uid) {
           await interaction.reply({
             content: 'Not linked yet. Use /link to connect your account.',
+            // Only visible to the invoking user to avoid clutter
             ephemeral: true,
           });
           return;
         }
-        const doc = snap.docs[0];
-        const data = doc.data();
-        const name = data.displayName || data.username || 'KC Player';
-        // Build a list of badge descriptions based off the KC profile
+        const kcUid = linkSnap.val().uid;
+        // Fetch KC profile, badges and posts from the Realtime Database. The website stores
+        // profile information under users/{uid}, badge counts under badges/{uid}, and posts
+        // under users/{uid}/posts.
+        const [userSnap, badgeSnap, postsSnap] = await Promise.all([
+          rtdb.ref(`users/${kcUid}`).once('value'),
+          rtdb.ref(`badges/${kcUid}`).once('value'),
+          rtdb.ref(`users/${kcUid}/posts`).once('value'),
+        ]);
+        const userData = userSnap.val() || {};
+        const badgeCounts = badgeSnap.val() || {};
+        const postsData = postsSnap.val() || {};
+
+        // Determine the display name. Fall back to Discord username if no KC name set
+        const name = userData.displayName || userData.username || interaction.user.username || 'KC Player';
+        // Compose badge list: verified status, skilled badges, and unlockable codes
         const badgeList = [];
-        // Verified status
-        if (data.isVerified || data.verified || data.emailVerified) {
+        // Verified: check user flags that indicate verification (isVerified, verified, emailVerified)
+        if (userData.isVerified || userData.verified || userData.emailVerified) {
           badgeList.push('✅ Verified');
         }
-        // Skilled badges: offence/defence/overall counts
-        if (data.badges) {
-          if (data.badges.offence && data.badges.offence > 0) {
-            badgeList.push(`🏹 Best Offence x${data.badges.offence}`);
-          }
-          if (data.badges.defence && data.badges.defence > 0) {
-            badgeList.push(`🛡️ Best Defence x${data.badges.defence}`);
-          }
-          if (data.badges.overall && data.badges.overall > 0) {
-            badgeList.push(`🏆 Overall Winner x${data.badges.overall}`);
-          }
-        }
-        // Unlockable codes: diamond, emerald, and any other truthy flags
-        if (data.codesUnlocked && typeof data.codesUnlocked === 'object') {
-          if (data.codesUnlocked.diamond) badgeList.push('💎 Diamond User');
-          if (data.codesUnlocked.emerald) badgeList.push('🟩 Emerald User');
-          Object.entries(data.codesUnlocked).forEach(([key, val]) => {
+        // Badge counts: check both badgeCounts and userData.badges for offence/defence/overall
+        const offenceCount = (badgeCounts.offence || (userData.badges && userData.badges.offence) || 0);
+        const defenceCount = (badgeCounts.defence || (userData.badges && userData.badges.defence) || 0);
+        const overallCount = (badgeCounts.overall || (userData.badges && userData.badges.overall) || 0);
+        if (offenceCount > 0) badgeList.push(`🏹 Best Offence x${offenceCount}`);
+        if (defenceCount > 0) badgeList.push(`🛡️ Best Defence x${defenceCount}`);
+        if (overallCount > 0) badgeList.push(`🏆 Overall Winner x${overallCount}`);
+        // Unlockable codes (diamond, emerald and any other custom codes)
+        if (userData.codesUnlocked && typeof userData.codesUnlocked === 'object') {
+          if (userData.codesUnlocked.diamond) badgeList.push('💎 Diamond User');
+          if (userData.codesUnlocked.emerald) badgeList.push('🟩 Emerald User');
+          // Include all other truthy codes
+          Object.entries(userData.codesUnlocked).forEach(([key, val]) => {
             if (val && !['diamond', 'emerald'].includes(key)) {
-              badgeList.push(`🧩 ${key}`);
+              // Capitalize the key for display if needed
+              const label = key
+                .split(/[_-]/)
+                .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+                .join(' ');
+              badgeList.push(`🧩 ${label}`);
             }
           });
         }
-        const badgeFieldValue = badgeList.length
-          ? badgeList.join('\n')
-          : 'No badges yet.';
-        // Bonus and streak values
-        const bonusValue = Number.isFinite(data.customBonus)
-          ? data.customBonus
-          : Number.isFinite(data.bonus)
-          ? data.bonus
+        const badgeFieldValue = badgeList.length ? badgeList.join('\n') : 'No badges yet.';
+        // Bonus and streak fields. If customBonus exists, use it; fallback to bonus; else 0
+        const bonusValue = Number.isFinite(userData.customBonus)
+          ? userData.customBonus
+          : Number.isFinite(userData.bonus)
+          ? userData.bonus
           : 0;
-        const streakValue = Number.isFinite(data.loginStreak) ? data.loginStreak : 0;
-        // About Me description
-        const aboutText = data.aboutMe || 'No "About Me" set.';
-        // Build the embed using KC profile fields
+        const streakValue = Number.isFinite(userData.loginStreak) ? userData.loginStreak : 0;
+        // About me
+        const aboutText = userData.aboutMe || 'No "About Me" set.';
+        // Build posts summary if posts exist
+        let postsFieldValue = null;
+        const postLines = [];
+        if (postsData && typeof postsData === 'object') {
+          Object.values(postsData).forEach(post => {
+            if (post && post.type === 'youtube' && post.ytId) {
+              const url = `https://youtu.be/${post.ytId}`;
+              postLines.push(`[YouTube](${url})`);
+            } else if (post && post.type === 'tiktok' && post.videoId) {
+              // Construct a TikTok link. We don’t know the username, so link directly via video id.
+              const url = `https://www.tiktok.com/@/video/${post.videoId}`;
+              postLines.push(`[TikTok](${url})`);
+            }
+          });
+          if (postLines.length > 0) {
+            postsFieldValue = postLines.join('\n');
+          }
+        }
+        // Build the embed for the KC profile
         const embed = new EmbedBuilder()
           .setTitle(`${name} — KC Profile`)
           .setDescription(aboutText)
@@ -207,15 +238,19 @@ client.on('interactionCreate', async interaction => {
               inline: true,
             },
           );
-        // Prefer KC avatar URL if present and not a data URL; fallback to Discord avatar
+        // If posts exist and user has at least one post, include a posts field
+        if (postsFieldValue) {
+          embed.addFields({ name: 'Posts', value: postsFieldValue, inline: false });
+        }
+        // Set thumbnail: prefer KC avatar if not data URI; fallback to Discord avatar
         if (
-          data.avatar &&
-          typeof data.avatar === 'string' &&
-          !data.avatar.startsWith('data:')
+          userData.avatar &&
+          typeof userData.avatar === 'string' &&
+          !userData.avatar.startsWith('data:')
         ) {
-          embed.setThumbnail(data.avatar);
-        } else if (data.discordAvatarURL) {
-          embed.setThumbnail(data.discordAvatarURL);
+          embed.setThumbnail(userData.avatar);
+        } else if (userData.discordAvatarURL) {
+          embed.setThumbnail(userData.discordAvatarURL);
         }
         await interaction.reply({
           embeds: [embed],
