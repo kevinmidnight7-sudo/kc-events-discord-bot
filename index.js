@@ -26,8 +26,8 @@ const KC_BADGE_ICONS = {
   defence: 'https://kevinmidnight7-sudo.github.io/messageboardkc/blue.png',
   overall: 'https://kevinmidnight7-sudo.github.io/messageboardkc/kcevents.png',
   verified: 'https://kevinmidnight7-sudo.github.io/messageboardkc/verified.png',
-  diamond: 'https://kevinmidnight7-sudo.github.io/messageboardkc/diamond2.png',
-  emerald: 'https://cdn.discordapp.com/emojis/1381097372930543776.webp?size=128'
+  diamond: 'https://kevinmidnight7-sudo.github.io/messageboardkc/diamondicon.png',
+  emerald: 'https://kevinmidnight7-sudo.github.io/messageboardkc/emeraldicon.png'
 };
 
 // Parse #RRGGBB -> int for embed.setColor
