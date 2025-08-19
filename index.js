@@ -78,6 +78,41 @@ admin.initializeApp({
 const rtdb = admin.database();
 
 // ---------- Helpers ----------
+function isUnknownInteraction(err) {
+  return err?.code === 10062 || err?.rawError?.code === 10062;
+}
+
+async function safeDefer(interaction, opts = {}) {
+  // If we’re already acknowledged, skip
+  if (interaction.deferred || interaction.replied) return true;
+
+  // If the token is about to expire, bail (prevents 10062)
+  const age = Date.now() - interaction.createdTimestamp;
+  if (age > 2500) return false;
+
+  try {
+    await interaction.deferReply(opts);
+    return true;
+  } catch (err) {
+    if (isUnknownInteraction(err)) return false;
+    throw err;
+  }
+}
+
+async function safeEdit(interaction, data) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(data);
+    } else {
+      // still allowed to reply (not acknowledged yet)
+      return await interaction.reply({ ...data, ephemeral: true });
+    }
+  } catch (err) {
+    if (isUnknownInteraction(err)) return null;
+    throw err;
+  }
+}
+
 function extractYouTubeAndTikTokLinks(str = '') {
   const urls = [];
   const rx = /(https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=[\w-]+|youtu\.be\/[\w-]+|tiktok\.com\/@[A-Za-z0-9_.-]+\/video\/\d+))/gi;
@@ -278,19 +313,32 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'whoami') {
-      await interaction.deferReply({ ephemeral: true });
+      const ok = await safeDefer(interaction, { ephemeral: true });
+      if (!ok) {
+        // Fallback: we cannot respond to the interaction anymore
+        if (interaction.channel) {
+          await interaction.channel.send('Sorry, that timed out. Please run `/whoami` again.');
+        }
+        return;
+      }
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-      await interaction.editReply({
+      await safeEdit(interaction, {
           content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
       });
       return;
   }
 
   if (interaction.commandName === 'dumpme') {
-    await interaction.deferReply({ ephemeral: true });
+    const ok = await safeDefer(interaction, { ephemeral: true });
+    if (!ok) {
+      if (interaction.channel) {
+        await interaction.channel.send('Sorry, that timed out. Please run `/dumpme` again.');
+      }
+      return;
+    }
     const discordId = interaction.user.id;
     const uid = await getKCUidForDiscord(discordId);
-    if (!uid) return interaction.editReply('Not linked. Run `/link` first.');
+    if (!uid) return safeEdit(interaction, { content: 'Not linked. Run `/link` first.' });
 
     try {
       const [userRT, badgesRT, postsRT] = await Promise.all([
@@ -328,22 +376,27 @@ client.on('interactionCreate', async (interaction) => {
         }
       };
 
-      return interaction.editReply('```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```');
+      return safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
     } catch (e) {
       console.error('dumpme error:', e);
-      return interaction.editReply('Error reading data (see logs).');
+      return safeEdit(interaction, { content: 'Error reading data (see logs).' });
     }
   }
 
   if (interaction.commandName === 'badges') {
     try {
-      await interaction.deferReply(); // public
+      const ok = await safeDefer(interaction); // public
+      if (!ok) {
+        if (interaction.channel) {
+          await interaction.channel.send('Sorry, that timed out. Please run `/badges` again.');
+        }
+        return;
+      }
 
       const discordId = interaction.user.id;
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        console.warn('badges: no mapping for', discordId);
-        return interaction.editReply('I can’t find your KC account. Use `/link` to connect it first.');
+        return safeEdit(interaction, { content: 'I can’t find your KC account. Use `/link` to connect it first.' });
       }
 
       let profile;
@@ -351,12 +404,12 @@ client.on('interactionCreate', async (interaction) => {
         profile = await getKCProfile(kcUid);
       } catch (e) {
         console.error('getKCProfile threw:', e);
-        return interaction.editReply('Profile lookup failed (see logs).');
+        return safeEdit(interaction, { content: 'Profile lookup failed (see logs).' });
       }
       
       if (!profile) {
         console.warn('badges: empty profile for', kcUid);
-        return interaction.editReply('No profile data found.');
+        return safeEdit(interaction, { content: 'No profile data found.' });
       }
 
       const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
@@ -383,7 +436,7 @@ client.on('interactionCreate', async (interaction) => {
       // Tint the embed with the user’s chosen name colour (or gradient’s first colour)
       if (profile.embedColor) embed.setColor(profile.embedColor);
 
-      return interaction.editReply({ embeds: [embed] });
+      return safeEdit(interaction, { embeds: [embed] });
     } catch (err) {
       console.error('badges command error:', err);
       console.error('raw error body:', err?.rawError);
@@ -405,6 +458,22 @@ client.on('interactionCreate', async (interaction) => {
 // ---------- Startup ----------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+});
+
+process.on('unhandledRejection', (err) => {
+  if (isUnknownInteraction(err)) {
+    console.warn('Ignored Unknown interaction (token expired).');
+    return;
+  }
+  console.error('unhandledRejection:', err);
+});
+
+client.on('error', (err) => {
+  if (isUnknownInteraction(err)) {
+    console.warn('Client error: Unknown interaction (token expired).');
+    return;
+  }
+  console.error('Client error:', err);
 });
 
 (async () => {
