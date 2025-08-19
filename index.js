@@ -1,6 +1,6 @@
 // index.js
 // Discord.js v14 + Firebase Admin (Realtime Database & Firestore)
-// Commands: /link (DMs auth link), /badges (public profile embed), /whoami (debug)
+// Commands: /link (DMs auth link), /badges (public profile embed), /whoami (debug), /dumpme (debug)
 
 // Make dotenv optional (used locally, ignored on Render if not installed)
 try { require('dotenv').config(); } catch (_) {}
@@ -14,7 +14,6 @@ const {
   Routes,
   REST,
   EmbedBuilder,
-  InteractionResponseFlags,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -185,10 +184,15 @@ async function getKCProfile(uid) {
 
   // Badges summary (covers common fields)
   const badgeLines = [];
-  if (badges.offence) badgeLines.push(`🏹 Best Offence x${badges.offence}`);
-  if (badges.defence) badgeLines.push(`🛡️ Best Defence x${badges.defence}`);
-  if (badges.overall)  badgeLines.push(`🌟 Overall Winner x${badges.overall}`);
-  if (user.diamondMember === true || badges.diamond === true) badgeLines.push('💎 Diamond Member');
+  if (badges.offence || badges.bestOffence)
+    badgeLines.push(`🏹 Best Offence x${badges.offence ?? badges.bestOffence}`);
+  if (badges.defence || badges.bestDefence)
+    badgeLines.push(`🛡️ Best Defence x${badges.defence ?? badges.bestDefence}`);
+  if (badges.overall || badges.overallWins)
+    badgeLines.push(`🌟 Overall Winner x${badges.overall ?? badges.overallWins}`);
+  if (user.diamondMember === true || badges.diamond === true)
+    badgeLines.push('💎 Diamond Member');
+
 
   return {
     displayName,
@@ -219,13 +223,16 @@ const badgesCmd = new SlashCommandBuilder()
   .setName('badges')
   .setDescription('Show your KC Events profile');
 
-// Add command:
 const whoamiCmd = new SlashCommandBuilder()
   .setName('whoami')
   .setDescription('Show your Discord ID and resolved KC UID');
 
+const dumpCmd = new SlashCommandBuilder()
+  .setName('dumpme')
+  .setDescription('Debug: dump raw keys for your mapped KC UID');
+
 // Register (include it in commands array)
-const commandsJson = [linkCmd, badgesCmd, whoamiCmd].map(c => c.toJSON());
+const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd].map(c => c.toJSON());
 
 
 // ---------- Register commands on startup ----------
@@ -253,66 +260,119 @@ async function registerCommands() {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  try {
-    if (interaction.commandName === 'link') {
-      const start = process.env.AUTH_BRIDGE_START_URL;
-      const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-      return interaction.reply({ content: `Click to link your account:\n${url}`, ephemeral: true });
-    }
+  if (interaction.commandName === 'link') {
+    const start = process.env.AUTH_BRIDGE_START_URL;
+    const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
+    return interaction.reply({ content: `Click to link your account:\n${url}`, ephemeral: true });
+  }
 
-    if (interaction.commandName === 'whoami') {
-        // Defer reply to prevent timeout if database is slow
-        await interaction.deferReply({ ephemeral: true }); // valid in v14
-        const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-        await interaction.editReply({
-            content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
-        });
-        return;
-    }
+  if (interaction.commandName === 'whoami') {
+      await interaction.deferReply({ ephemeral: true });
+      const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+      await interaction.editReply({
+          content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
+      });
+      return;
+  }
 
-    if (interaction.commandName === 'badges') {
-      await interaction.deferReply(); // default is public; safe & simple
+  if (interaction.commandName === 'dumpme') {
+    await interaction.deferReply({ ephemeral: true });
+    const discordId = interaction.user.id;
+    const uid = await getKCUidForDiscord(discordId);
+    if (!uid) return interaction.editReply('Not linked. Run `/link` first.');
+
+    try {
+      const [userRT, badgesRT, postsRT] = await Promise.all([
+        rtdb.ref(`users/${uid}`).get(),
+        rtdb.ref(`badges/${uid}`).get(),
+        rtdb.ref(`users/${uid}/posts`).get(),
+      ]);
+
+      const firestore = admin.firestore();
+      const [userFS, postsFS] = await Promise.all([
+        firestore.collection('users').doc(uid).get(),
+        firestore.collection('users').doc(uid).collection('posts').get(),
+      ]);
+
+      const brief = (val) => {
+        const v = val && typeof val.val === 'function' ? val.val() : val;
+        if (!v || typeof v !== 'object') return v ?? null;
+        const keys = Object.keys(v);
+        const sample = {};
+        for (const k of keys.slice(0, 8)) sample[k] = v[k];
+        return { keys, sample };
+      };
+
+      const payload = {
+        uid,
+        rtdb: {
+          user: brief(userRT),
+          badges: brief(badgesRT),
+          postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0,
+        },
+        firestore: {
+          userExists: userFS.exists,
+          userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [],
+          postsCount: postsFS.size,
+        }
+      };
+
+      return interaction.editReply('```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```');
+    } catch (e) {
+      console.error('dumpme error:', e);
+      return interaction.editReply('Error reading data (see logs).');
+    }
+  }
+
+  if (interaction.commandName === 'badges') {
+    try {
+      await interaction.deferReply(); // public
 
       const discordId = interaction.user.id;
-
-      // 1) Resolve KC uid from RTDB mapping
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        // The ephemeral status is inherited from deferReply, but we want this error to be private.
-        // We edit the original deferred reply to show the error.
-        return interaction.editReply({
-          content: 'I can’t find your KC account. Use `/link` to connect it first.',
-        });
+        console.warn('badges: no mapping for', discordId);
+        return interaction.editReply('I can’t find your KC account. Use `/link` to connect it first.');
       }
 
-      // 2) Load profile data from RTDB/Firestore
-      const p = await getKCProfile(kcUid);
+      let profile;
+      try {
+        profile = await getKCProfile(kcUid);
+      } catch (e) {
+        console.error('getKCProfile threw:', e);
+        return interaction.editReply('Profile lookup failed (see logs).');
+      }
 
-      // 3) Build public embed
+      if (!profile) {
+        console.warn('badges: empty profile for', kcUid);
+        return interaction.editReply('No profile data found.');
+      }
+
       const embed = new EmbedBuilder()
-        .setTitle(`${p.displayName} — KC Profile`)
-        .setThumbnail(p.avatar)
-        .setDescription(p.about)
+        .setTitle(`${profile.displayName} — KC Profile`)
+        .setThumbnail(profile.avatar)
+        .setDescription(profile.about)
         .addFields(
-          { name: 'Badges', value: p.badgesText, inline: false },
-          { name: 'Bonus',  value: String(p.bonus), inline: true },
-          { name: 'Streak', value: p.streak,        inline: true },
-          { name: 'Posts',  value: p.postsText,     inline: false },
+          { name: 'Badges', value: profile.badgesText || '—', inline: false },
+          { name: 'Bonus',  value: String(profile.bonus ?? '—'), inline: true },
+          { name: 'Streak', value: profile.streak || '—', inline: true },
+          { name: 'Posts',  value: profile.postsText || '—', inline: false },
         );
 
-      return interaction.editReply({ embeds: [embed] }); // PUBLIC
-    }
-  } catch (err) {
-    console.error('Command error:', err);
-    try {
+      return interaction.editReply({ embeds: [embed] });
+    } catch (err) {
+      console.error('badges command error:', err);
+      try {
         if (interaction.deferred || interaction.replied) {
-            await interaction.editReply({ content: 'Something went wrong.' });
+          await interaction.editReply('Something went wrong (see logs).');
         } else {
-            await interaction.reply({ content: 'Something went wrong.', flags: 64 });
+          await interaction.reply({ content: 'Something went wrong (see logs).', ephemeral: true });
         }
-    } catch (e) {
-        console.error('Failed to send error reply:', e);
+      } catch (e) {
+        console.error('failed to send error reply:', e);
+      }
     }
+    return;
   }
 });
 
