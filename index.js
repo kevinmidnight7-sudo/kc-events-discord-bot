@@ -14,6 +14,9 @@ const {
   Routes,
   REST,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -26,8 +29,26 @@ const KC_BADGE_ICONS = {
   defence: 'https://kevinmidnight7-sudo.github.io/messageboardkc/blue.png',
   overall: 'https://kevinmidnight7-sudo.github.io/messageboardkc/kcevents.png',
   verified: 'https://kevinmidnight7-sudo.github.io/messageboardkc/verified.png',
-  diamond: 'https://kevinmidnight7-sudo.github.io/messageboardkc/diamondicon.png',
-  emerald: 'https://kevinmidnight7-sudo.github.io/messageboardkc/emeraldicon.png'
+  diamond: 'https://kevinmidnight7-sudo.github.io/messageboardkc/diamond2.png',
+  emerald: 'https://cdn.discordapp.com/emojis/1381097372930543776.webp?size=128'
+};
+
+const EMOJI = {
+  offence:  '<:kc_offence:123456789012345678>',
+  defence:  '<:kc_defence:123456789012345679>',
+  overall:  '<:kc_overall:123456789012345680>',
+  verified: '<:kc_verified:123456789012345681>',
+  diamond:  '<:kc_diamond:123456789012345682>',
+  emerald:  '<:kc_emerald:123456789012345683>',
+};
+
+const LB = {
+  CATS: [
+    { key: 'overall', label: 'Overall Winner' },
+    { key: 'offence', label: 'Best Offence' },
+    { key: 'defence', label: 'Best Defence' },
+  ],
+  PAGE_SIZE: 10,
 };
 
 // Parse #RRGGBB -> int for embed.setColor
@@ -142,15 +163,49 @@ async function finalRespond(interaction, data, fallbackText = null) {
   }
 }
 
-function extractYouTubeAndTikTokLinks(str = '') {
-  const urls = [];
-  const rx = /(https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=[\w-]+|youtu\.be\/[\w-]+|tiktok\.com\/@[A-Za-z0-9_.-]+\/video\/\d+))/gi;
-  let m;
-  while ((m = rx.exec(str)) !== null) {
-    urls.push(m[1]);
-    if (urls.length >= 3) break;
-  }
-  return urls;
+async function loadLeaderboardData() {
+  const [usersSnap, badgesSnap] = await Promise.all([
+    rtdb.ref('users').get(),
+    rtdb.ref('badges').get(),
+  ]);
+  const users = usersSnap.val() || {};
+  const badges = badgesSnap.val() || {};
+  return Object.entries(users).map(([uid, u]) => {
+    const b = badges[uid] || {};
+    return {
+      name: u.displayName || u.email || '(unknown)',
+      colour: u.profileCustomization?.nameColor || null,
+      overall: parseInt(b.overall  || 0),
+      offence: parseInt(b.offence  || 0),
+      defence: parseInt(b.defence  || 0),
+    };
+  });
+}
+
+function buildLbEmbed(rows, catIdx, page) {
+  const cat = LB.CATS[catIdx];
+  const start = page * LB.PAGE_SIZE;
+  const slice = rows
+    .sort((a,b) => (b[cat.key]||0) - (a[cat.key]||0))
+    .slice(start, start + LB.PAGE_SIZE);
+
+  const lines = slice.map((r, i) => {
+    const rank = start + i + 1;
+    return `**${rank}.** ${r.name} — \`${r[cat.key] || 0}\``;
+  });
+  const embed = new EmbedBuilder()
+    .setTitle(`Leaderboard — ${cat.label}`)
+    .setDescription(lines.join('\n') || '_No data_');
+  return embed;
+}
+
+function lbRow(catIdx, page) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`lb:cat:${(catIdx+2)%3}:${page}`).setLabel('◀ Category').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`lb:page:${catIdx}:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`lb:page:${catIdx}:${page+1}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`lb:cat:${(catIdx+1)%3}:${page}`).setLabel('Category ▶').setStyle(ButtonStyle.Secondary),
+  );
 }
 
 async function getKCUidForDiscord(discordId) {
@@ -272,13 +327,21 @@ async function getKCProfile(uid) {
   const hasEmerald = !!codesUnlocked.emerald;
 
   // Convert to human lines (we’ll keep emojis inside Discord text)
+  const e = EMOJI;
   const badgeLines = [];
-  if (isVerified)                       badgeLines.push('✅ Verified');
-  if (counts.offence > 0)               badgeLines.push(`🏹 Best Offence x${counts.offence}`);
-  if (counts.defence > 0)               badgeLines.push(`🛡️ Best Defence x${counts.defence}`);
-  if (counts.overall > 0)               badgeLines.push(`🌟 Overall Winner x${counts.overall}`);
-  if (hasDiamond)                        badgeLines.push('💎 Diamond User');
-  if (hasEmerald)                        badgeLines.push('🟩 Emerald User');
+  if (isVerified)                  badgeLines.push(`${e.verified ?? '✅'} Verified`);
+  if (counts.offence > 0)          badgeLines.push(`${e.offence ?? '🏹'} Best Offence x${counts.offence}`);
+  if (counts.defence > 0)          badgeLines.push(`${e.defence ?? '🛡️'} Best Defence x${counts.defence}`);
+  if (counts.overall > 0)          badgeLines.push(`${e.overall  ?? '🌟'} Overall Winner x${counts.overall}`);
+  if (hasDiamond)                  badgeLines.push(`${e.diamond ?? '💎'} Diamond User`);
+  if (hasEmerald)                  badgeLines.push(`${e.emerald ?? '🟩'} Emerald User`);
+
+  const customBadges = user.customBadges || {};
+  for (const key of Object.keys(customBadges)) {
+    const b = customBadges[key] || {};
+    const piece = [b.emoji, b.label].filter(Boolean).join(' ');
+    if (piece) badgeLines.push(piece);
+  }
 
   return {
     displayName,
@@ -308,7 +371,12 @@ const linkCmd = new SlashCommandBuilder()
 
 const badgesCmd = new SlashCommandBuilder()
   .setName('badges')
-  .setDescription('Show your KC Events profile');
+  .setDescription('Show a KC Events profile')
+  .addUserOption(opt =>
+    opt.setName('user')
+      .setDescription('Show someone else')
+      .setRequired(false)
+  );
 
 const whoamiCmd = new SlashCommandBuilder()
   .setName('whoami')
@@ -318,8 +386,12 @@ const dumpCmd = new SlashCommandBuilder()
   .setName('dumpme')
   .setDescription('Debug: dump raw keys for your mapped KC UID');
 
+const lbCmd = new SlashCommandBuilder()
+  .setName('leaderboard')
+  .setDescription('Show the live KC Events leaderboard');
+
 // Register (include it in commands array)
-const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd].map(c => c.toJSON());
+const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd].map(c => c.toJSON());
 
 
 // ---------- Register commands on startup ----------
@@ -345,6 +417,23 @@ async function registerCommands() {
 
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
+
+  if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
+    // customId format: lb:type:catIdx:page
+    const [, type, catStr, pageStr] = interaction.customId.split(':');
+    const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
+    const page = Math.max(0, parseInt(pageStr,10) || 0);
+
+    // Find the rows. If message belongs to a previous interaction, rebuild:
+    let rows;
+    const cache = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
+    if (Array.isArray(cache)) rows = cache;
+    else rows = await loadLeaderboardData();
+
+    const embed = buildLbEmbed(rows, catIdx, page);
+    return interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === 'link') {
@@ -433,6 +522,16 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  if (interaction.commandName === 'leaderboard') {
+    const ok = await safeDefer(interaction); // public
+    if (!ok) return;
+    const rows = await loadLeaderboardData();
+    const catIdx = 0, page = 0;
+    const embed = buildLbEmbed(rows, catIdx, page);
+    return safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
+      .then(msg => { /* store rows in memory for button handler */ interaction.client.lbCache ??= new Map(); interaction.client.lbCache.set(interaction.id, rows); });
+  }
+
   if (interaction.commandName === 'badges') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
@@ -442,12 +541,17 @@ client.on('interactionCreate', async (interaction) => {
 
     console.time(`badges:${interaction.id}`);
     try {
-      const discordId = interaction.user.id;
-      const kcUid = await getKCUidForDiscord(discordId);
+      // target: provided user or self
+      const target = interaction.options.getUser('user') || interaction.user;
+      const discordId = target.id;
 
+      const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        return finalRespond(interaction, { content: 'I can’t find your KC account. Use `/link` to connect it first.' },
-          'I couldn’t find your KC account. Use `/link` to connect it first.');
+        return safeEdit(interaction, {
+          content: target.id === interaction.user.id
+            ? 'I can’t find your KC account. Use `/link` to connect it first.'
+            : `I can’t find a KC account linked to **${target.tag}**.`
+        });
       }
 
       const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
@@ -478,9 +582,16 @@ client.on('interactionCreate', async (interaction) => {
 
       if (profile.embedColor) embed.setColor(profile.embedColor);
 
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel('Full Profile')
+          .setURL('https://kcevents.uk/#loginpage') // or append ?uid=${kcUid} if you want
+      );
+
       await finalRespond(
         interaction,
-        { embeds: [embed] },
+        { embeds: [embed], components: [row] },
         'Your `/badges` reply expired — please run it again.'
       );
     } catch (err) {
