@@ -109,7 +109,7 @@ async function safeDefer(interaction, opts = {}) {
 
   // If the token is about to expire, bail (prevents 10062)
   const age = Date.now() - interaction.createdTimestamp;
-  if (age > 2500) return false;
+  if (age > 4500) return false;   // still under Discord’s 3s defer window in most cases, but friendlier if the event loop is briefly busy
 
   try {
     await interaction.deferReply(opts);
@@ -146,6 +146,12 @@ function withTimeout(promise, ms, label = 'operation') {
   ]);
 }
 
+function watchdog(ms, onTimeout) {
+  let done = false;
+  const t = setTimeout(() => { if (!done) onTimeout(); }, ms);
+  return () => { done = true; clearTimeout(t); };
+}
+
 // Always produce a user-visible message even if interaction token expired
 async function finalRespond(interaction, data, fallbackText = null) {
   try {
@@ -165,15 +171,17 @@ async function finalRespond(interaction, data, fallbackText = null) {
 
 async function loadLeaderboardData() {
   const [usersSnap, badgesSnap] = await Promise.all([
-    rtdb.ref('users').get(),
-    rtdb.ref('badges').get(),
+    withTimeout(rtdb.ref('users').get(), 3000, 'RTDB users'),
+    withTimeout(rtdb.ref('badges').get(), 3000, 'RTDB badges'),
   ]);
-  const users = usersSnap.val() || {};
-  const badges = badgesSnap.val() || {};
+
+  const users  = (usersSnap && usersSnap.exists())  ? usersSnap.val()  : {};
+  const badges = (badgesSnap && badgesSnap.exists()) ? badgesSnap.val() : {};
+
   return Object.entries(users).map(([uid, u]) => {
     const b = badges[uid] || {};
     return {
-      name: u.displayName || u.email || '(unknown)',
+      name:   u.displayName || u.email || '(unknown)',
       colour: u.profileCustomization?.nameColor || null,
       overall: parseInt(b.overall  || 0),
       offence: parseInt(b.offence  || 0),
@@ -417,18 +425,22 @@ async function registerCommands() {
 
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
+  try {
+    const tag = interaction.user?.tag ?? 'unknown';
+    const name = interaction.isChatInputCommand() ? interaction.commandName : interaction.customId;
+    console.log(`[INT] ${name} from ${tag} (${interaction.user?.id}) at ${new Date().toISOString()}`);
+  } catch (_) {}
 
   if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
-    // customId format: lb:type:catIdx:page
     const [, type, catStr, pageStr] = interaction.customId.split(':');
     const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
-    const page = Math.max(0, parseInt(pageStr,10) || 0);
+    const page   = Math.max(0, parseInt(pageStr,10) || 0);
 
-    // Find the rows. If message belongs to a previous interaction, rebuild:
-    let rows;
-    const cache = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
-    if (Array.isArray(cache)) rows = cache;
-    else rows = await loadLeaderboardData();
+    let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
+    if (!Array.isArray(rows)) {
+      console.log('[LB] cache miss, reloading data');
+      rows = await loadLeaderboardData();
+    }
 
     const embed = buildLbEmbed(rows, catIdx, page);
     return interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
@@ -444,15 +456,21 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'whoami') {
     const ok = await safeDefer(interaction, { ephemeral: true });
+    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
       if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/whoami` again.');
       return;
     }
+    const done = watchdog(5000, () => {
+      finalRespond(interaction,
+        { content: 'Still working… one moment please.' },
+        'Reply expired while working. Please try again.');
+    });
 
     console.time(`whoami:${interaction.id}`);
-    let kcUid = null;
     try {
-      kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+      console.log('[INT] whoami -> getKCUidForDiscord');
+      const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
       await finalRespond(
         interaction,
         { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` },
@@ -462,6 +480,7 @@ client.on('interactionCreate', async (interaction) => {
       console.error('whoami error:', e);
       await finalRespond(interaction, { content: 'Something went wrong.' }, 'whoami failed, please try again.');
     } finally {
+      done();
       console.timeEnd(`whoami:${interaction.id}`);
     }
     return;
@@ -469,6 +488,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'dumpme') {
     const ok = await safeDefer(interaction, { ephemeral: true });
+    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
       if (interaction.channel) {
         await interaction.channel.send('Sorry, that timed out. Please run `/dumpme` again.');
@@ -524,36 +544,62 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'leaderboard') {
     const ok = await safeDefer(interaction); // public
+    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) return;
-    const rows = await loadLeaderboardData();
-    const catIdx = 0, page = 0;
-    const embed = buildLbEmbed(rows, catIdx, page);
-    return safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
-      .then(msg => { /* store rows in memory for button handler */ interaction.client.lbCache ??= new Map(); interaction.client.lbCache.set(interaction.id, rows); });
+
+    const done = watchdog(5000, () => {
+      finalRespond(interaction,
+        { content: 'Still working… one moment please.' },
+        'Reply expired while working. Please try again.');
+    });
+
+    try {
+      console.log('[INT] leaderboard -> loadLeaderboardData');
+      const rows = await loadLeaderboardData();
+      const catIdx = 0, page = 0;
+      const embed = buildLbEmbed(rows, catIdx, page);
+      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
+        .then(msg => { /* store rows in memory for button handler */ interaction.client.lbCache ??= new Map(); interaction.client.lbCache.set(interaction.id, rows); });
+    } catch (e) {
+        console.error('leaderboard error:', e);
+        await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
+    } finally {
+        done();
+    }
+    return;
   }
 
   if (interaction.commandName === 'badges') {
     const ok = await safeDefer(interaction); // public
+    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
       if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/badges` again.');
       return;
     }
+    
+    const done = watchdog(5000, () => {
+      finalRespond(interaction,
+        { content: 'Still working… one moment please.' },
+        'Reply expired while working. Please try again.');
+    });
 
     console.time(`badges:${interaction.id}`);
     try {
       // target: provided user or self
       const target = interaction.options.getUser('user') || interaction.user;
       const discordId = target.id;
-
+      
+      console.log('[INT] badges -> getKCUidForDiscord');
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        return safeEdit(interaction, {
+        return finalRespond(interaction, {
           content: target.id === interaction.user.id
             ? 'I can’t find your KC account. Use `/link` to connect it first.'
             : `I can’t find a KC account linked to **${target.tag}**.`
-        });
+        }, 'Could not find a linked KC account.');
       }
-
+      
+      console.log('[INT] badges -> getKCProfile');
       const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
 
       if (!profile) {
@@ -567,7 +613,7 @@ client.on('interactionCreate', async (interaction) => {
       const streakVal   = clampStr(profile.streak, 1024, '—');
       const postsVal    = clampStr(profile.postsText, 1024);
 
-      const discordAvatar = interaction.user.displayAvatarURL({ extension: 'png', size: 128 });
+      const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
 
       const embed = new EmbedBuilder()
         .setTitle(title)
@@ -586,7 +632,7 @@ client.on('interactionCreate', async (interaction) => {
         new ButtonBuilder()
           .setStyle(ButtonStyle.Link)
           .setLabel('Full Profile')
-          .setURL('https://kcevents.uk/#loginpage') // or append ?uid=${kcUid} if you want
+          .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
       );
 
       await finalRespond(
@@ -604,6 +650,7 @@ client.on('interactionCreate', async (interaction) => {
         'Something went wrong running `/badges`. Please try again.'
       );
     } finally {
+      done();
       console.timeEnd(`badges:${interaction.id}`);
     }
     return;
