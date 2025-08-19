@@ -1,6 +1,6 @@
 // index.js
-// Discord.js v14 + Firebase Admin (Realtime Database)
-// Commands: /link (DMs auth link), /badges (public profile embed)
+// Discord.js v14 + Firebase Admin (Realtime Database & Firestore)
+// Commands: /link (DMs auth link), /badges (public profile embed), /whoami (debug)
 
 // Make dotenv optional (used locally, ignored on Render if not installed)
 try { require('dotenv').config(); } catch (_) {}
@@ -73,19 +73,90 @@ async function getKCUidForDiscord(discordId) {
 }
 
 async function getKCProfile(uid) {
-  const [userSnap, badgeSnap, postsSnap] = await Promise.all([
+  const firestore = admin.firestore();
+
+  // --- 1) Try RTDB first ---
+  const [userSnapRT, badgeSnapRT, postsSnapRT] = await Promise.all([
     rtdb.ref(`users/${uid}`).get(),
     rtdb.ref(`badges/${uid}`).get(),
-    rtdb.ref(`users/${uid}/posts`).get(), // posts live under users/<uid>/posts per your rules
+    rtdb.ref(`users/${uid}/posts`).get(),
   ]);
 
-  const user = userSnap.val() || {};
-  const badges = badgeSnap.val() || {};
-  const posts = postsSnap.val() || {};
+  let user = userSnapRT.val();
+  let badges = badgeSnapRT.val();
+  let posts  = postsSnapRT.val();
 
-  const contentUnlocked = !!(user.codesUnlocked && user.codesUnlocked.content === true);
+  // --- 2) If RTDB user is missing or empty, try Firestore fallbacks ---
+  if (!user || Object.keys(user).length === 0) {
+    try {
+      const fsUser = await firestore.collection('users').doc(uid).get();
+      if (fsUser.exists) user = fsUser.data();
+    } catch (e) {
+      console.warn('FS user read failed:', e);
+    }
+  }
 
-  // Posts (only if unlocked)
+  if (!badges || Object.keys(badges).length === 0) {
+    try {
+      // common FS layouts: badges/{uid} or badges/users/{uid}
+      const fs1 = await firestore.collection('badges').doc(uid).get();
+      if (fs1.exists) badges = fs1.data();
+      else {
+        const fs2 = await firestore.collection('badges').doc('users').collection('users').doc(uid).get();
+        if (fs2.exists) badges = fs2.data();
+      }
+    } catch (e) {
+      console.warn('FS badges read failed:', e);
+    }
+  }
+
+  if (!posts || Object.keys(posts).length === 0) {
+    try {
+      // try Firestore posts: users/{uid}/posts
+      const fsPosts = await firestore.collection('users').doc(uid).collection('posts').get();
+      if (!fsPosts.empty) {
+        posts = {};
+        fsPosts.forEach(d => { posts[d.id] = d.data(); });
+      }
+    } catch (e) {
+      console.warn('FS posts read failed:', e);
+    }
+  }
+
+  // still allow empty objects to avoid crashes
+  user = user || {};
+  badges = badges || {};
+  posts = posts || {};
+
+  // field name differences
+  // RTDB uses "about"; some sites use "aboutMe" or "bio" in FS
+  const about =
+    user.about ??
+    user.aboutMe ??
+    user.bio ??
+    'No "About Me" set.';
+
+  const displayName =
+    user.displayName ??
+    user.name ??
+    user.username ??
+    'Anonymous User';
+
+  const avatar =
+    user.avatar ??
+    user.photoURL ??
+    'https://kevinmidnight7-sudo.github.io/messageboardkc/1.png';
+
+  const bonus = user.bonus || 0;
+  const streak = Number.isFinite(user.loginStreak) ? String(user.loginStreak) : '—';
+
+  // content unlock flag can be in different shapes; try a few
+  const contentUnlocked =
+    !!(user.codesUnlocked?.content) ||
+    !!user.postsUnlocked ||
+    !!user.canPost;
+
+  // Posts (YouTube/TikTok only) — latest 3
   let postLines = [];
   if (contentUnlocked && posts) {
     const list = Object.entries(posts)
@@ -96,12 +167,10 @@ async function getKCProfile(uid) {
       const type = (p?.type || '').toLowerCase();
       const cap = p?.caption || '';
       const links = new Set();
-
-      if (p?.url) links.add(p.url); // if your post model has explicit url
+      if (p?.url) links.add(p.url);
 
       for (const u of extractYouTubeAndTikTokLinks(cap)) links.add(u);
 
-      // add labels if type hints are present but no URL found
       if (links.size === 0) {
         if (type.includes('youtube')) links.add('YouTube');
         if (type.includes('tiktok')) links.add('TikTok');
@@ -113,24 +182,24 @@ async function getKCProfile(uid) {
     }
   }
 
-  // Badges summary
+  // Badges summary (covers common fields)
   const badgeLines = [];
   if (badges.offence) badgeLines.push(`🏹 Best Offence x${badges.offence}`);
   if (badges.defence) badgeLines.push(`🛡️ Best Defence x${badges.defence}`);
   if (badges.overall)  badgeLines.push(`🌟 Overall Winner x${badges.overall}`);
-  if (user.diamondMember === true) badgeLines.push('💎 Diamond Member');
-  // If you add emerald or others in RTDB, add similar lines here
+  if (user.diamondMember === true || badges.diamond === true) badgeLines.push('💎 Diamond Member');
 
   return {
-    displayName: user.displayName || 'Anonymous User',
-    about: user.about || 'No "About Me" set.',
-    avatar: user.avatar || 'https://kevinmidnight7-sudo.github.io/messageboardkc/1.png',
-    bonus: user.bonus || 0,
-    streak: Number.isFinite(user.loginStreak) ? String(user.loginStreak) : '—',
+    displayName,
+    about,
+    avatar,
+    bonus,
+    streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
     postsText: contentUnlocked ? (postLines.length ? postLines.join('\n') : '—') : '—',
   };
 }
+
 
 // ---------- Discord Client ----------
 const client = new Client({
@@ -149,7 +218,14 @@ const badgesCmd = new SlashCommandBuilder()
   .setName('badges')
   .setDescription('Show your KC Events profile');
 
-const commandsJson = [linkCmd, badgesCmd].map(c => c.toJSON());
+// Add command:
+const whoamiCmd = new SlashCommandBuilder()
+  .setName('whoami')
+  .setDescription('Show your Discord ID and resolved KC UID');
+
+// Register (include it in commands array)
+const commandsJson = [linkCmd, badgesCmd, whoamiCmd].map(c => c.toJSON());
+
 
 // ---------- Register commands on startup ----------
 async function registerCommands() {
@@ -186,19 +262,29 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
+    if (interaction.commandName === 'whoami') {
+        await interaction.reply({
+            content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${await getKCUidForDiscord(interaction.user.id) || 'not linked'}\``,
+            ephemeral: true
+        });
+        return;
+    }
+
     if (interaction.commandName === 'badges') {
+      await interaction.deferReply({ ephemeral: false });
+
       const discordId = interaction.user.id;
 
       // 1) Resolve KC uid from RTDB mapping
       const kcUid = await getKCUidForDiscord(discordId);
       if (!kcUid) {
-        return interaction.reply({
+        return interaction.editReply({
           content: 'I can’t find your KC account. Use `/link` to connect it first.',
           ephemeral: true,
         });
       }
 
-      // 2) Load profile data from RTDB
+      // 2) Load profile data from RTDB/Firestore
       const p = await getKCProfile(kcUid);
 
       // 3) Build public embed
@@ -213,7 +299,7 @@ client.on('interactionCreate', async (interaction) => {
           { name: 'Posts',  value: p.postsText,     inline: false },
         );
 
-      return interaction.reply({ embeds: [embed] }); // PUBLIC
+      return interaction.editReply({ embeds: [embed] }); // PUBLIC
     }
   } catch (err) {
     console.error('Command error:', err);
