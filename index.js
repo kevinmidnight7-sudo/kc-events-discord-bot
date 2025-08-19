@@ -257,15 +257,12 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'link') {
       const start = process.env.AUTH_BRIDGE_START_URL;
       const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-      return interaction.reply({
-        content: `Click to link your account:\n${url}`,
-        flags: 64, // 64 is the flag for EPHEMERAL
-      });
+      return interaction.reply({ content: `Click to link your account:\n${url}`, ephemeral: true });
     }
 
     if (interaction.commandName === 'whoami') {
         // Defer reply to prevent timeout if database is slow
-        await interaction.deferReply({ flags: 64 }); // Ephemeral defer
+        await interaction.deferReply({ ephemeral: true }); // valid in v14
         const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
         await interaction.editReply({
             content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``,
@@ -274,7 +271,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'badges') {
-      await interaction.deferReply({ ephemeral: false }); // Public reply
+      await interaction.deferReply(); // default is public; safe & simple
 
       const discordId = interaction.user.id;
 
