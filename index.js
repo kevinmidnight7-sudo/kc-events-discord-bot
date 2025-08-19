@@ -72,6 +72,13 @@ async function getKCUidForDiscord(discordId) {
   return uid || null;
 }
 
+function clampStr(val, max, fallback = '—') {
+  if (val == null) return fallback;
+  const s = String(val);
+  if (s.length === 0) return fallback;
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 async function getKCProfile(uid) {
   const firestore = admin.firestore();
 
@@ -383,26 +390,39 @@ client.on('interactionCreate', async (interaction) => {
         console.error('getKCProfile threw:', e);
         return interaction.editReply('Profile lookup failed (see logs).');
       }
+      
+      // Prefer Discord avatar to avoid very long KC URLs
+      // (discord.js v14 – displayAvatarURL() returns a safe CDN URL)
+      const discordAvatar = interaction.user.displayAvatarURL({ size: 256 });
 
       if (!profile) {
         console.warn('badges: empty profile for', kcUid);
         return interaction.editReply('No profile data found.');
       }
 
+      const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
+      const description = clampStr(profile.about, 4096);
+      const badgesVal   = clampStr(profile.badgesText, 1024);
+      const bonusVal    = clampStr(profile.bonus, 1024, '—');
+      const streakVal   = clampStr(profile.streak, 1024, '—');
+      const postsVal    = clampStr(profile.postsText, 1024);
+      
       const embed = new EmbedBuilder()
-        .setTitle(`${profile.displayName} — KC Profile`)
-        .setThumbnail(profile.avatar)
-        .setDescription(profile.about)
+        .setTitle(title)
+        .setThumbnail(discordAvatar)
+        .setDescription(description)
         .addFields(
-          { name: 'Badges', value: profile.badgesText || '—', inline: false },
-          { name: 'Bonus',  value: String(profile.bonus ?? '—'), inline: true },
-          { name: 'Streak', value: profile.streak || '—', inline: true },
-          { name: 'Posts',  value: profile.postsText || '—', inline: false },
+          { name: 'Badges', value: badgesVal, inline: false },
+          { name: 'Bonus',  value: bonusVal,  inline: true  },
+          { name: 'Streak', value: streakVal, inline: true  },
+          { name: 'Posts',  value: postsVal,  inline: false },
         );
 
       return interaction.editReply({ embeds: [embed] });
     } catch (err) {
       console.error('badges command error:', err);
+      console.error('raw error body:', err?.rawError);
+      console.error('raw errors tree:', err?.rawError?.errors);
       try {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply('Something went wrong (see logs).');
