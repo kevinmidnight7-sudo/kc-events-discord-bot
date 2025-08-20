@@ -103,13 +103,22 @@ function isUnknownInteraction(err) {
   return err?.code === 10062 || err?.rawError?.code === 10062;
 }
 
+// New helper to catch all expired token errors
+function isExpiredToken(err) {
+  return (
+    err?.code === 10062 || // Unknown interaction
+    err?.code === 50027 || // Invalid Webhook Token
+    err?.status === 401    // Unauthorized (same effect)
+  );
+}
+
 async function safeDefer(interaction, { ephemeral = false } = {}) {
   // Already acknowledged? nothing to do.
   if (interaction.deferred || interaction.replied) return true;
 
-  // Discord requires an ACK within ~3s. Aim to defer ASAP (<2s guard).
+  // Discord requires an ACK within ~3s. Aim to defer ASAP (<2.8s guard).
   const ageMs = Date.now() - interaction.createdTimestamp;
-  if (ageMs > 2000) return false;
+  if (ageMs > 2800) return false;
 
   try {
     // use flags instead of deprecated "ephemeral" option
@@ -117,8 +126,8 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
     await interaction.deferReply(opts);
     return true;
   } catch (err) {
-    // "Unknown interaction" means token already expired – caller will fallback.
-    if (err?.code === 10062 || err?.rawError?.code === 10062) return false;
+    // "Unknown interaction" or other token errors mean it already expired – caller will fallback.
+    if (isExpiredToken(err) || err?.rawError?.code === 10062) return false;
     throw err;
   }
 }
@@ -132,7 +141,7 @@ async function safeEdit(interaction, data) {
       return await interaction.reply({ ...data, ephemeral: true });
     }
   } catch (err) {
-    if (isUnknownInteraction(err)) return null;
+    if (isExpiredToken(err)) return null;
     throw err;
   }
 }
@@ -167,7 +176,7 @@ async function finalRespond(interaction, data, fallbackText = null) {
     return await interaction.reply(payload);
   } catch (err) {
     // If editReply failed because the token is invalid (likely >15 mins passed)
-    if (isUnknownInteraction(err)) {
+    if (isExpiredToken(err)) {
       console.warn(`[finalRespond] editReply failed for ${interaction.id}, attempting followup.`);
       try {
         // followUp can be used to send a new message after the token expires.
@@ -865,7 +874,11 @@ client.on('interactionCreate', async (interaction) => {
       const catIdx = 0, page = 0;
       const embed = buildLbEmbed(rows, catIdx, page);
       await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
-        .then(msg => { /* store rows in memory for button handler */ interaction.client.msgCache ??= new Map(); interaction.client.msgCache.set(interaction.id, rows); });
+        .then(msg => { 
+            /* store rows in memory for button handler */ 
+            interaction.client.lbCache ??= new Map(); 
+            interaction.client.lbCache.set(interaction.id, rows); 
+        });
     } catch (e) {
         console.error('leaderboard error:', e);
         await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
@@ -1047,16 +1060,16 @@ client.once('ready', () => {
 });
 
 process.on('unhandledRejection', (err) => {
-  if (isUnknownInteraction(err)) {
-    console.warn('Ignored Unknown interaction (token expired).');
+  if (isExpiredToken(err)) {
+    console.warn('Ignored expired token error (unhandledRejection).');
     return;
   }
   console.error('unhandledRejection:', err);
 });
 
 client.on('error', (err) => {
-  if (isUnknownInteraction(err)) {
-    console.warn('Client error: Unknown interaction (token expired).');
+  if (isExpiredToken(err)) {
+    console.warn('Client error: Ignored expired token error.');
     return;
   }
   console.error('Client error:', err);
