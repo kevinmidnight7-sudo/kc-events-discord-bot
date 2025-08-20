@@ -116,19 +116,13 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
   // Already acknowledged? nothing to do.
   if (interaction.deferred || interaction.replied) return true;
 
-  // Discord requires an ACK within ~3s. Aim to defer ASAP (<2.8s guard).
-  const ageMs = Date.now() - interaction.createdTimestamp;
-  if (ageMs > 2800) return false;
-
   try {
-    // use flags instead of deprecated "ephemeral" option
     const opts = ephemeral ? { flags: 64 } : {};
     await interaction.deferReply(opts);
     return true;
   } catch (err) {
-    // "Unknown interaction" or other token errors mean it already expired – caller will fallback.
-    if (isExpiredToken(err) || err?.rawError?.code === 10062) return false;
-    throw err;
+    // If we couldn't defer, the token is already expired.
+    return false;
   }
 }
 
@@ -240,12 +234,16 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
   const usersSnap = await withTimeout(rtdb.ref('users').get(), 5000, 'RTDB users');
   const users = usersSnap.exists() ? usersSnap.val() : {};
   const results = [];
+  const started = Date.now();
+  let totalPostsSeen = 0;
 
   const tasks = Object.keys(users).map(async uid => {
+    if (Date.now() - started > 4500 || totalPostsSeen > 500) return;
     const postsSnap = await withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`);
     if (!postsSnap.exists()) return;
 
     postsSnap.forEach(p => {
+      if (Date.now() - started > 4500 || totalPostsSeen > 500) return;
       const post = p.val() || {};
       if (post.draft) return; // skip drafts
       if (post.publishAt && Date.now() < post.publishAt) return; // skip scheduled future posts
@@ -266,6 +264,7 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
         comments,
         score,
       });
+      totalPostsSeen++;
     });
   });
 
@@ -310,7 +309,7 @@ async function fetchLatestMessages(limit = 10) {
 function buildMessagesEmbed(list, userNames = {}) {
   const lines = list.map((m, i) => {
     const who = userNames[m.uid] || m.user || '(unknown)';
-    const txt = (m.text || '').toString().slice(0, 140);
+    const txt = (m.text || '').toString().slice(0, 140).replace(/\s+/g, ' ');
     const replies = m.replies ? Object.keys(m.replies).length : 0;
     return `**${i + 1}. ${who}** — ${txt || '—'}\nReplies: **${replies}**`;
   });
@@ -439,7 +438,7 @@ async function loadLeaderboardData() {
 function buildLbEmbed(rows, catIdx, page) {
   const cat = LB.CATS[catIdx];
   const start = page * LB.PAGE_SIZE;
-  const slice = rows
+  const slice = [...rows]
     .sort((a,b) => (b[cat.key]||0) - (a[cat.key]||0))
     .slice(start, start + LB.PAGE_SIZE);
 
@@ -570,7 +569,7 @@ async function getKCProfile(uid) {
   }
   const postsField =
     !contentUnlocked
-      ? 'Posts locked.'
+      ? 'Posts locked. Unlock posting on your profile.'
       : (Object.keys(posts).length === 0 ? 'This user has no posts.' : (postLines.join('\n') || 'This user has no posts.'));
 
   // Badges summary – same three counted on site + verified/diamond/emerald
@@ -703,7 +702,7 @@ client.on('interactionCreate', async (interaction) => {
       return finalRespond(interaction, { content: 'That leaderboard page is stale. Run `/leaderboard` again.' },
                           'Leaderboard interaction expired. Run `/leaderboard` again.');
     }
-    const [, type, catStr, pageStr] = interaction.customId.split(':');
+    const [, , catStr, pageStr] = interaction.customId.split(':');
     const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
     const page   = Math.max(0, parseInt(pageStr,10) || 0);
 
@@ -735,7 +734,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (action === 'view') {
-      const idx = parseInt(parts[2] || '0', 10);
+      const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
       const msg = cache.list[idx];
       const embed = buildRepliesEmbed(msg, cache.nameMap);
       return interaction.update({ embeds: [embed], components: [repliesNavRow(idx)] });
@@ -784,12 +783,11 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'whoami') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/whoami` again.');
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
       return;
     }
-    const done = watchdog(5000, () => {
+    const done = watchdog(2500, () => {
       finalRespond(interaction,
         { content: 'Still working… one moment please.' },
         'Reply expired while working. Please try again.');
@@ -816,11 +814,8 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'dumpme') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
-      if (interaction.channel) {
-        await interaction.channel.send('Sorry, that timed out. Please run `/dumpme` again.');
-      }
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
       return;
     }
     const discordId = interaction.user.id;
@@ -873,10 +868,12 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'leaderboard') {
     const ok = await safeDefer(interaction); // public
-    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
-    if (!ok) return;
+    if (!ok) {
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      return;
+    }
 
-    const done = watchdog(5000, () => {
+    const done = watchdog(2500, () => {
       finalRespond(interaction,
         { content: 'Still working… one moment please.' },
         'Reply expired while working. Please try again.');
@@ -888,7 +885,7 @@ client.on('interactionCreate', async (interaction) => {
       const catIdx = 0, page = 0;
       const embed = buildLbEmbed(rows, catIdx, page);
       await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
-        .then(msg => { 
+        .then(() => { 
             /* store rows in memory for button handler */ 
             interaction.client.lbCache ??= new Map(); 
             interaction.client.lbCache.set(interaction.id, rows); 
@@ -904,7 +901,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'clips') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) return;
+    if (!ok) {
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      return;
+    }
 
     const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
     try {
@@ -944,7 +944,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'messages') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) return;
+    if (!ok) {
+        if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+        return;
+    }
 
     try {
       const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
@@ -963,7 +966,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'votingscores') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) return;
+    if (!ok) {
+        if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+        return;
+    }
 
     try {
       const scores = await loadVoteScores();
@@ -980,13 +986,12 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'badges') {
     const ok = await safeDefer(interaction); // public
-    console.log(`[INT] ${interaction.commandName} deferred ok=${ok}`);
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run `/badges` again.');
+      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
       return;
     }
     
-    const done = watchdog(5000, () => {
+    const done = watchdog(2500, () => {
       finalRespond(interaction,
         { content: 'Still working… one moment please.' },
         'Reply expired while working. Please try again.');
