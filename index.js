@@ -175,6 +175,209 @@ async function finalRespond(interaction, data, fallbackText = null) {
   }
 }
 
+// ----- Shared helpers for new commands -----
+function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
+
+function countReactions(reactionsObj = {}) {
+  // reactions: { "😀": { uid:true, ... }, "🔥": { uid:true }, ... }
+  let n = 0;
+  for (const emo of Object.keys(reactionsObj || {})) {
+    n += Object.keys(reactionsObj[emo] || {}).length;
+  }
+  return n;
+}
+
+function countComments(commentsObj = {}) {
+  // comments: { commentId: { text, uid, time, replies:{ replyId:{...} } } }
+  let n = 0;
+  for (const cid of Object.keys(commentsObj || {})) {
+    n += 1;
+    const r = commentsObj[cid]?.replies || {};
+    n += Object.keys(r).length;
+  }
+  return n;
+}
+
+// Map of uid -> displayName/email for quick lookups
+async function getAllUserNames() {
+  const snap = await withTimeout(rtdb.ref('users').get(), 4000, 'RTDB users');
+  const out = {};
+  if (snap.exists()) {
+    const all = snap.val() || {};
+    for (const uid of Object.keys(all)) {
+      const u = all[uid] || {};
+      out[uid] = u.displayName || u.email || '(unknown)';
+    }
+  }
+  return out;
+}
+
+// Gather all posts across users; return an array of {ownerUid, postId, data, score, reacts, comments}
+async function fetchAllPosts({ platform = 'all' } = {}) {
+  const usersSnap = await withTimeout(rtdb.ref('users').get(), 5000, 'RTDB users');
+  const users = usersSnap.exists() ? usersSnap.val() : {};
+  const results = [];
+
+  const tasks = Object.keys(users).map(async uid => {
+    const postsSnap = await withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`);
+    if (!postsSnap.exists()) return;
+
+    postsSnap.forEach(p => {
+      const post = p.val() || {};
+      if (post.draft) return; // skip drafts
+      if (post.publishAt && Date.now() < post.publishAt) return; // skip scheduled future posts
+
+      const type = (post.type || '').toLowerCase();
+      if (platform === 'youtube' && type !== 'youtube') return;
+      if (platform === 'tiktok' && type !== 'tiktok') return;
+
+      const reacts = countReactions(post.reactions || {});
+      const comments = countComments(post.comments || {});
+      const score = reacts + comments * 2; // simple “popular” score (same spirit as site)
+
+      results.push({
+        ownerUid: uid,
+        postId: p.key,
+        data: post,
+        reacts,
+        comments,
+        score,
+      });
+    });
+  });
+
+  await Promise.allSettled(tasks);
+  return results;
+}
+
+// Latest N messageboard messages
+async function fetchLatestMessages(limit = 10) {
+  const snap = await withTimeout(
+    rtdb.ref('messages').orderByChild('time').limitToLast(limit).get(),
+    5000,
+    'RTDB messages recent'
+  );
+  const arr = [];
+  if (snap.exists()) {
+    snap.forEach(c => {
+      const v = c.val() || {};
+      v.key = c.key;
+      arr.push(v);
+    });
+    arr.sort((a, b) => (b.time || 0) - (a.time || 0));
+  }
+  return arr;
+}
+
+// Build an embed showing a page of 10 messages (title, text, reply count)
+function buildMessagesEmbed(list, userNames = {}) {
+  const lines = list.map((m, i) => {
+    const who = userNames[m.uid] || m.user || '(unknown)';
+    const txt = (m.text || '').toString().slice(0, 140);
+    const replies = m.replies ? Object.keys(m.replies).length : 0;
+    return `**${i + 1}. ${who}** — ${txt || '—'}\nReplies: **${replies}**`;
+  });
+
+  return new EmbedBuilder()
+    .setTitle('Messageboard — latest 10')
+    .setDescription(lines.join('\n\n') || '_No messages yet_');
+}
+
+function messageIndexRows(count) {
+  // buttons 1..count (max 10), plus a Refresh row
+  const rows = [];
+  for (let i = 0; i < count; i += 5) {
+    const row = new ActionRowBuilder();
+    for (let j = i; j < Math.min(i + 5, count); j++) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`msg:view:${j}`)
+          .setLabel(String(j + 1))
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+    rows.push(row);
+  }
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('msg:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+    )
+  );
+  return rows;
+}
+
+function buildRepliesEmbed(message, userNames = {}) {
+  const who = userNames[message.uid] || message.user || '(unknown)';
+  const title = `Replies — ${who}: ${(message.text || '').toString().slice(0, 60)}`;
+  const replies = Object.entries(message.replies || {});
+  const lines = replies.map(([key, r]) => {
+    const name = userNames[r.uid] || r.user || '(unknown)';
+    return `• **${name}**: ${(r.text || '').toString().slice(0, 180)}`;
+  });
+
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(lines.join('\n') || '_No replies yet_');
+}
+
+function repliesNavRow(idx) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('msg:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`msg:refreshOne:${idx}`).setLabel('Refresh').setStyle(ButtonStyle.Primary)
+  );
+}
+
+// Votes -> scores
+async function loadVoteScores() {
+  const [cfgSnap, votesSnap] = await Promise.all([
+    withTimeout(rtdb.ref('config/liveLeaderboardEnabled').get(), 3000, 'RTDB config'),
+    withTimeout(rtdb.ref('votes').get(), 5000, 'RTDB votes'),
+  ]);
+
+  const live = cfgSnap.exists() ? cfgSnap.val() !== false : true;
+  const votes = votesSnap.exists() ? votesSnap.val() : {};
+
+  const off = {}, def = {};
+  for (const key of Object.keys(votes)) {
+    const v = votes[key] || {};
+    const o = normalize(v.bestOffence || '');
+    const d = normalize(v.bestDefence || '');
+    if (o) off[o] = (off[o] || 0) + 1;
+    if (d) def[d] = (def[d] || 0) + 1;
+  }
+
+  const usersSnap = await withTimeout(rtdb.ref('users').get(), 4000, 'RTDB users');
+  const users = usersSnap.exists() ? usersSnap.val() : {};
+  const normToDisplay = {};
+  for (const uid of Object.keys(users)) {
+    const name = users[uid]?.displayName || users[uid]?.email || '';
+    const k = normalize(name);
+    if (k && !normToDisplay[k]) normToDisplay[k] = name;
+  }
+
+  const sortPairs = obj =>
+    Object.entries(obj)
+      .map(([k, n]) => ({ name: normToDisplay[k] || k, count: n }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+  return { live, offence: sortPairs(off), defence: sortPairs(def) };
+}
+
+function buildVoteEmbed(scores) {
+  const offLines = scores.offence.map((x, i) => `**${i + 1}. ${x.name}** — \`${x.count}\``).join('\n') || '_No votes yet_';
+  const defLines = scores.defence.map((x, i) => `**${i + 1}. ${x.name}** — \`${x.count}\``).join('\n') || '_No votes yet_';
+
+  const e = new EmbedBuilder()
+    .setTitle(`Live Voting Scores ${scores.live ? '' : '(offline)'}`)
+    .addFields(
+      { name: 'Best Offence', value: offLines, inline: false },
+      { name: 'Best Defence', value: defLines, inline: false },
+    );
+
+  return e;
+}
+
 async function loadLeaderboardData() {
   const [usersSnap, badgesSnap] = await Promise.all([
     withTimeout(rtdb.ref('users').get(), 3000, 'RTDB users'),
@@ -306,14 +509,7 @@ async function getKCProfile(uid) {
   const codesUnlocked = user.codesUnlocked || {};
   const contentUnlocked = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
 
-  // Compile recent post links (YouTube/TikTok)
-  const extractYouTubeAndTikTokLinks = (str = '') => {
-    const urls = [];
-    const rx = /(https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=[\w-]+|youtu\.be\/[\w-]+|tiktok\.com\/@[A-Za-z0-9_.-]+\/video\/\d+))/gi;
-    let m; while ((m = rx.exec(str)) && urls.length < 3) urls.push(m[1]);
-    return urls;
-  };
-
+  // Build at most 3 post lines as:  • "Caption" — <link>
   let postLines = [];
   if (contentUnlocked && posts) {
     const list = Object.entries(posts)
@@ -321,14 +517,24 @@ async function getKCProfile(uid) {
       .slice(0, 3);
 
     for (const [, p] of list) {
-      const cap = p?.caption || '';
-      const links = new Set();
-      if (p?.url) links.add(p.url);
-      for (const u of extractYouTubeAndTikTokLinks(cap)) links.add(u);
-      if (links.size) postLines.push(`• ${[...links].join(' • ')}`);
-      if (postLines.length >= 3) break;
+      const cap = (p?.caption || '').trim();
+      let link = '';
+
+      if (p?.type === 'youtube' && p?.ytId) {
+        link = `https://youtu.be/${p.ytId}`;
+      } else if (p?.type === 'tiktok' && p?.videoId) {
+        // We only store videoId, so use TikTok’s embed URL which always works.
+        link = `https://www.tiktok.com/embed/v2/${p.videoId}`;
+      }
+
+      const capPretty = cap ? `"${cap.slice(0, 80)}"` : '(no caption)';
+      postLines.push(`• ${capPretty}${link ? ` — ${link}` : ''}`);
     }
   }
+  const postsField =
+    !contentUnlocked
+      ? 'Posts locked.'
+      : (Object.keys(posts).length === 0 ? 'This user has no posts.' : (postLines.join('\n') || 'This user has no posts.'));
 
   // Badges summary – same three counted on site + verified/diamond/emerald
   const counts = {
@@ -363,7 +569,7 @@ async function getKCProfile(uid) {
     bonus,
     streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
-    postsText: contentUnlocked ? (postLines.length ? postLines.join('\n') : '—') : '—',
+    postsText: postsField,
     // embed colour preference: nameColor > gradient first colour > default
     embedColor: hexToInt(nameColor) || hexToInt(gradientColor) || null,
   };
@@ -404,8 +610,26 @@ const lbCmd = new SlashCommandBuilder()
   .setName('leaderboard')
   .setDescription('Show the live KC Events leaderboard');
 
+const clipsCmd = new SlashCommandBuilder()
+  .setName('clips')
+  .setDescription('Top 5 most popular clips')
+  .addStringOption(o =>
+    o.setName('platform')
+     .setDescription('Filter by platform')
+     .addChoices({ name:'All', value:'all' }, { name:'YouTube', value:'youtube' }, { name:'TikTok', value:'tiktok' })
+     .setRequired(false)
+  );
+
+const messagesCmd = new SlashCommandBuilder()
+  .setName('messages')
+  .setDescription('Show the latest 10 messageboard posts');
+
+const votingCmd = new SlashCommandBuilder()
+  .setName('votingscores')
+  .setDescription('Show current live voting scores (Offence/Defence)');
+
 // Register (include it in commands array)
-const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd].map(c => c.toJSON());
+const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd].map(c => c.toJSON());
 
 
 // ---------- Register commands on startup ----------
@@ -455,6 +679,62 @@ client.on('interactionCreate', async (interaction) => {
     const embed = buildLbEmbed(rows, catIdx, page);
     await interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
     return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('msg:')) {
+    const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
+    const action = parts[1];
+
+    // Find cached data from the originating slash interaction
+    const key = interaction.message.interaction?.id || '';
+    interaction.client.msgCache ??= new Map();
+    let cache = interaction.client.msgCache.get(key);
+
+    // If cache missing, reload latest
+    if (!cache) {
+      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      cache = { list, nameMap };
+      interaction.client.msgCache.set(key, cache);
+    }
+
+    if (action === 'view') {
+      const idx = parseInt(parts[2] || '0', 10);
+      const msg = cache.list[idx];
+      const embed = buildRepliesEmbed(msg, cache.nameMap);
+      return interaction.update({ embeds: [embed], components: [repliesNavRow(idx)] });
+    }
+
+    if (action === 'back') {
+      const embed = buildMessagesEmbed(cache.list, cache.nameMap);
+      return interaction.update({ embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
+    }
+
+    if (action === 'refresh') {
+      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      interaction.client.msgCache.set(key, { list, nameMap });
+      const embed = buildMessagesEmbed(list, nameMap);
+      return interaction.update({ embeds: [embed], components: messageIndexRows(list.length || 0) });
+    }
+
+    if (action === 'refreshOne') {
+      const idx = parseInt(parts[2] || '0', 10);
+      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      interaction.client.msgCache.set(key, { list, nameMap });
+      const msg = list[idx] || list[0];
+      const embed = buildRepliesEmbed(msg, nameMap);
+      return interaction.update({ embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+    }
+  }
+
+  if (interaction.isButton() && interaction.customId === 'votes:refresh') {
+    try {
+      const scores = await loadVoteScores();
+      const embed = buildVoteEmbed(scores);
+      return interaction.update({ embeds: [embed] });
+    } catch (e) {
+      console.error('votes refresh error:', e);
+      return interaction.reply({ content: 'Refresh failed.', ephemeral: true });
+    }
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -571,7 +851,7 @@ client.on('interactionCreate', async (interaction) => {
       const catIdx = 0, page = 0;
       const embed = buildLbEmbed(rows, catIdx, page);
       await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
-        .then(msg => { /* store rows in memory for button handler */ interaction.client.lbCache ??= new Map(); interaction.client.lbCache.set(interaction.id, rows); });
+        .then(msg => { /* store rows in memory for button handler */ interaction.client.msgCache ??= new Map(); interaction.client.msgCache.set(interaction.id, rows); });
     } catch (e) {
         console.error('leaderboard error:', e);
         await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
@@ -579,6 +859,82 @@ client.on('interactionCreate', async (interaction) => {
         done();
     }
     return;
+  }
+
+  if (interaction.commandName === 'clips') {
+    const ok = await safeDefer(interaction); // public
+    if (!ok) return;
+
+    const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
+    try {
+      const all = await fetchAllPosts({ platform });
+      if (!all.length) {
+        return finalRespond(interaction, { content: 'No clips found.' }, 'No clips found.');
+      }
+
+      // Sort by popularity score and take top 5
+      all.sort((a, b) => b.score - a.score);
+      const top = all.slice(0, 5);
+
+      const nameMap = await getAllUserNames();
+
+      const lines = top.map((p, i) => {
+        const d = p.data || {};
+        const who = nameMap[p.ownerUid] || '(unknown)';
+        const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
+        let link = '';
+        if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
+        else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
+
+        const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
+        return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
+        .setDescription(lines.join('\n\n'));
+
+      return finalRespond(interaction, { embeds: [embed] }, 'The reply expired—try `/clips` again.');
+    } catch (e) {
+      console.error('clips error:', e);
+      return finalRespond(interaction, { content: 'Something went wrong.' }, 'clips failed, please try again.');
+    }
+  }
+
+  if (interaction.commandName === 'messages') {
+    const ok = await safeDefer(interaction); // public
+    if (!ok) return;
+
+    try {
+      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      const embed = buildMessagesEmbed(list, nameMap);
+
+      // Cache for the buttons handler
+      interaction.client.msgCache ??= new Map();
+      interaction.client.msgCache.set(interaction.id, { list, nameMap });
+
+      return safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+    } catch (e) {
+      console.error('messages error:', e);
+      return finalRespond(interaction, { content: 'Something went wrong.' }, 'messages failed, please try again.');
+    }
+  }
+
+  if (interaction.commandName === 'votingscores') {
+    const ok = await safeDefer(interaction); // public
+    if (!ok) return;
+
+    try {
+      const scores = await loadVoteScores();
+      const embed = buildVoteEmbed(scores);
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+      );
+      return safeEdit(interaction, { embeds: [embed], components: [row] });
+    } catch (e) {
+      console.error('votingscores error:', e);
+      return finalRespond(interaction, { content: 'Something went wrong.' }, 'votingscores failed, please try again.');
+    }
   }
 
   if (interaction.commandName === 'badges') {
