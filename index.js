@@ -265,6 +265,40 @@ async function clearKCAvatar(uid) {
   } catch (_) {}
 }
 
+function parseVideoLink(link='') {
+  link = String(link).trim();
+
+  // YouTube ID
+  const yt = link.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?.*v=|embed\/|v\/|shorts\/))([\w-]{11})/);
+  if (yt) return { type: 'youtube', ytId: yt[1] };
+
+  // TikTok video ID
+  const tt = link.match(/tiktok\.com\/.*\/video\/(\d+)/);
+  if (tt) return { type: 'tiktok', videoId: tt[1] };
+
+  return null;
+}
+
+async function postingUnlocked(uid) {
+  // same idea as your site: emerald/diamond/content OR explicit flags
+  try {
+    const snap = await withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`);
+    const u = snap.exists() ? (snap.val() || {}) : {};
+    const codes = u.codesUnlocked || {};
+    return !!(codes.emerald || codes.diamond || codes.content || u.postsUnlocked || u.canPost);
+  } catch {
+    return false;
+  }
+}
+
+// Optional: global flag like your site uses
+async function postsDisabledGlobally() {
+  try {
+    const s = await withTimeout(rtdb.ref('config/postsDisabled').get(), 2000, 'RTDB config/postsDisabled');
+    return !!s.val();
+  } catch { return false; }
+}
+
 // ----- Shared helpers for new commands -----
 function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
 
@@ -759,15 +793,23 @@ const avatarCmd = new SlashCommandBuilder()
 
 const postCmd = new SlashCommandBuilder()
   .setName('post')
-  .setDescription('Create a new post (YouTube/TikTok)')
-  .addStringOption(option =>
-    option.setName('caption')
-      .setDescription('The caption for your post')
-      .setRequired(true))
-  .addStringOption(option =>
-    option.setName('link')
-      .setDescription('YouTube or TikTok link')
-      .setRequired(true));
+  .setDescription('Create a YouTube or TikTok post on your KC profile')
+  .addStringOption(o =>
+    o.setName('link')
+     .setDescription('YouTube or TikTok link')
+     .setRequired(true))
+  .addStringOption(o =>
+    o.setName('caption')
+     .setDescription('Caption (max 140 chars)')
+     .setRequired(true))
+  .addBooleanOption(o =>
+    o.setName('draft')
+     .setDescription('Save as draft (default: false)')
+     .setRequired(false))
+  .addStringOption(o =>
+    o.setName('schedule_at')
+     .setDescription('Schedule publish time ISO (e.g. 2025-08-21T10:00)')
+     .setRequired(false));
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -1250,48 +1292,79 @@ client.on('interactionCreate', async (interaction) => {
   
   if (interaction.commandName === 'post') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) return;
-
+    if (!ok) {
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
+      return;
+    }
+  
     try {
-        const discordId = interaction.user.id;
-        const kcUid = await getKCUidForDiscord(discordId);
-        if (!kcUid) {
-            return await finalRespond(interaction, { content: '❌ You must link your account first with `/link`.', ephemeral: true });
-        }
-
-        const profile = await getKCProfile(kcUid);
-        if (!profile || !profile.postingUnlocked) {
-            return await finalRespond(interaction, { content: "❌ You don’t have posting unlocked. Unlock Emerald to use this feature.", ephemeral: true });
-        }
-
-        const caption = interaction.options.getString('caption');
-        const link = interaction.options.getString('link');
-
-        // Basic validation for link
-        if (!link.startsWith('http://') && !link.startsWith('https://')) {
-             return await finalRespond(interaction, { content: "❌ Please provide a valid link (starting with http:// or https://).", ephemeral: true });
-        }
-
-        // Send to website API
-        await fetch(`${process.env.WEBSITE_URL}/api/post`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                userId: profile.id,
-                caption,
-                link
-            })
-        });
-
-        // Use finalRespond for the public success message
-        await finalRespond(interaction, {
-            content: `✅ Post created!\n**Caption:** ${caption}\n**Link:** ${link}`,
-            ephemeral: false // This should be a public confirmation
-        });
-
+      // Must be linked
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) {
+        await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
+        return;
+      }
+  
+      // Global stop switch
+      if (await postsDisabledGlobally()) {
+        await safeEdit(interaction, { content: '🚫 Posting is currently disabled by admins.' });
+        return;
+      }
+  
+      // Must have posting unlocked (emerald/diamond/content etc.)
+      const allowed = await postingUnlocked(uid);
+      if (!allowed) {
+        await safeEdit(interaction, { content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
+        return;
+      }
+  
+      // Inputs
+      const link = interaction.options.getString('link') || '';
+      const caption = (interaction.options.getString('caption') || '').slice(0, 140);
+      const draft = !!interaction.options.getBoolean('draft');
+      const scheduleAtIso = interaction.options.getString('schedule_at') || '';
+      const parsed = parseVideoLink(link);
+  
+      if (!parsed) {
+        await safeEdit(interaction, { content: 'Invalid link. Please provide a YouTube or TikTok link.' });
+        return;
+      }
+  
+      // Build post payload (mirror site)
+      const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
+  
+      const postData = {
+        ...parsed,
+        caption,
+        createdAt: admin.database.ServerValue.TIMESTAMP,
+        createdBy: uid,
+        draft: !!draft,
+        publishAt: Number.isFinite(publishAt) ? publishAt : null,
+      };
+  
+      // Create a new post id and write
+      const ref = rtdb.ref(`users/${uid}/posts`).push();
+      const postId = ref.key;
+      await withTimeout(ref.set(postData), 4000, `write post ${postId}`);
+  
+      // Public confirmation (non-ephemeral) with a small summary
+      await finalRespond(
+        interaction,
+        {
+          content: [
+            '✅ **Post created!**',
+            `• **Type:** ${postData.type}`,
+            `• **Caption:** ${caption || '(none)'}`,
+            publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
+          ].join('\n'),
+          ephemeral: false
+        },
+        'Your `/post` reply expired — please run it again.'
+      );
     } catch (e) {
-        console.error('post command error:', e);
-        await finalRespond(interaction, { content: '❌ There was an error creating your post.', ephemeral: true });
+      console.error('post command error:', e);
+      await finalRespond(interaction, { content: 'Something went wrong creating the post.' }, 'Post failed, please try again.');
     }
     return;
   }
