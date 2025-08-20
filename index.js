@@ -117,8 +117,7 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
   if (interaction.deferred || interaction.replied) return true;
 
   try {
-    const opts = ephemeral ? { flags: 64 } : {};
-    await interaction.deferReply(opts);
+    await interaction.deferReply({ ephemeral });
     return true;
   } catch (err) {
     // If we couldn't defer, the token is already expired.
@@ -131,14 +130,13 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
     } else {
-      return await interaction.reply({ ...data, flags: (data?.flags ?? (data?.ephemeral ? 64 : 0)) });
+      return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
     }
   } catch (err) {
     if (isExpiredToken(err)) {
       try {
-        // send a follow-up (ephemeral if original wasn’t ephemeral we make this one ephemeral)
-        const ephemeral = data?.flags === 64 || data?.ephemeral === true;
-        return await interaction.followUp(ephemeral ? data : { ...data, ephemeral: true });
+        // send a follow-up, always ephemeral to avoid spamming
+        return await interaction.followUp({ ...data, ephemeral: true });
       } catch {
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
@@ -174,20 +172,15 @@ async function finalRespond(interaction, data, fallbackText = null) {
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
     }
-    // brand new reply (use flags for ephemeral)
-    const isEphemeral = data?.flags === 64 || data?.ephemeral === true;
-    const payload = isEphemeral ? { ...data, flags: 64 } : data;
-    return await interaction.reply(payload);
+    // brand new reply
+    return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
   } catch (err) {
     // If editReply failed because the token is invalid (likely >15 mins passed)
     if (isExpiredToken(err)) {
       console.warn(`[finalRespond] editReply failed for ${interaction.id}, attempting followup.`);
       try {
         // followUp can be used to send a new message after the token expires.
-        // Make it ephemeral to avoid spamming the channel if the original was public.
-        const isEphemeral = data?.flags === 64 || data?.ephemeral === true;
-        const payload = isEphemeral ? data : { ...data, ephemeral: true };
-        return await interaction.followUp(payload);
+        return await interaction.followUp({ ...data, ephemeral: true });
       } catch (followUpErr) {
         console.error('[finalRespond] FollowUp also failed:', followUpErr);
         // As a last resort, send a message to the channel if we have a fallback.
@@ -710,84 +703,87 @@ client.on('interactionCreate', async (interaction) => {
   } catch (_) {}
 
   if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
-    try { await interaction.deferUpdate(); } catch (_) {}
-    const [, , catStr, pageStr] = interaction.customId.split(':');
-    const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
-    const page   = Math.max(0, parseInt(pageStr,10) || 0);
+    try {
+      await interaction.deferUpdate();
+      const [, , catStr, pageStr] = interaction.customId.split(':');
+      const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
+      const page   = Math.max(0, parseInt(pageStr,10) || 0);
 
-    let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
-    if (!Array.isArray(rows)) {
-      console.log('[LB] cache miss, reloading data');
-      rows = await loadLeaderboardData();
+      let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
+      if (!Array.isArray(rows)) {
+        console.log('[LB] cache miss, reloading data');
+        rows = await loadLeaderboardData();
+      }
+
+      const embed = buildLbEmbed(rows, catIdx, page);
+      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
+    } catch (e) {
+      console.error('lb button error:', e);
+      await safeEdit(interaction, { content: 'Sorry — leaderboard couldn’t refresh right now.', components: [] });
     }
-
-    const embed = buildLbEmbed(rows, catIdx, page);
-    await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
     return;
   }
 
   if (interaction.isButton() && interaction.customId.startsWith('msg:')) {
-    try { await interaction.deferUpdate(); } catch (_) {}
-    const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
-    const action = parts[1];
+    try {
+      await interaction.deferUpdate();
+      const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
+      const action = parts[1];
 
-    // Find cached data from the originating slash interaction
-    const key = interaction.message.interaction?.id || '';
-    interaction.client.msgCache ??= new Map();
-    let cache = interaction.client.msgCache.get(key);
+      // Find cached data from the originating slash interaction
+      const key = interaction.message.interaction?.id || '';
+      interaction.client.msgCache ??= new Map();
+      let cache = interaction.client.msgCache.get(key);
 
-    // If cache missing, reload latest
-    if (!cache) {
-      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-      cache = { list, nameMap };
-      interaction.client.msgCache.set(key, cache);
+      // If cache missing, reload latest
+      if (!cache) {
+        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+        cache = { list, nameMap };
+        interaction.client.msgCache.set(key, cache);
+      }
+
+      if (action === 'view') {
+        const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
+        const msg = cache.list[idx];
+        const embed = buildRepliesEmbed(msg, cache.nameMap);
+        await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
+      } else if (action === 'back') {
+        const embed = buildMessagesEmbed(cache.list, cache.nameMap);
+        await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
+      } else if (action === 'refresh') {
+        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+        interaction.client.msgCache.set(key, { list, nameMap });
+        const embed = buildMessagesEmbed(list, nameMap);
+        await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+      } else if (action === 'refreshOne') {
+        const idx = parseInt(parts[2] || '0', 10);
+        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+        interaction.client.msgCache.set(key, { list, nameMap });
+        const msg = list[idx] || list[0];
+        const embed = buildRepliesEmbed(msg, nameMap);
+        await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+      }
+    } catch (e) {
+      console.error('msg button error:', e);
+      await safeEdit(interaction, { content: 'Sorry — messages couldn’t refresh right now.', components: [] });
     }
-
-    if (action === 'view') {
-      const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
-      const msg = cache.list[idx];
-      const embed = buildRepliesEmbed(msg, cache.nameMap);
-      await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
-      return;
-    }
-
-    if (action === 'back') {
-      const embed = buildMessagesEmbed(cache.list, cache.nameMap);
-      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
-      return;
-    }
-
-    if (action === 'refresh') {
-      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-      interaction.client.msgCache.set(key, { list, nameMap });
-      const embed = buildMessagesEmbed(list, nameMap);
-      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
-      return;
-    }
-
-    if (action === 'refreshOne') {
-      const idx = parseInt(parts[2] || '0', 10);
-      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-      interaction.client.msgCache.set(key, { list, nameMap });
-      const msg = list[idx] || list[0];
-      const embed = buildRepliesEmbed(msg, nameMap);
-      await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
-      return;
-    }
+    return;
   }
 
   if (interaction.isButton() && interaction.customId === 'votes:refresh') {
-    try { await interaction.deferUpdate(); } catch (_) {}
     try {
+      await interaction.deferUpdate();
       const scores = await loadVoteScores();
       const embed = buildVoteEmbed(scores);
-      await safeEdit(interaction, { embeds: [embed] });
-      return;
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+      );
+      await safeEdit(interaction, { embeds: [embed], components: [row] });
     } catch (e) {
       console.error('votes refresh error:', e);
-      await safeEdit(interaction, { content: 'Refresh failed.', ephemeral: true });
-      return;
+      await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
     }
+    return;
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -795,7 +791,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'link') {
     const start = process.env.AUTH_BRIDGE_START_URL;
     const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-    return interaction.reply({ content: `Click to link your account:\n${url}`, flags: 64 });
+    return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
   }
 
   if (interaction.commandName === 'whoami') {
@@ -806,7 +802,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     const done = watchdog(2500, () => {
       finalRespond(interaction,
-        { content: 'Still working… one moment please.' },
+        { content: 'Still working… one moment please.', ephemeral: true },
         'Reply expired while working. Please try again.');
     });
 
@@ -816,12 +812,12 @@ client.on('interactionCreate', async (interaction) => {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
       await finalRespond(
         interaction,
-        { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` },
+        { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``, ephemeral: true },
         'The whoami reply expired. Please try again.'
       );
     } catch (e) {
       console.error('whoami error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong.' }, 'whoami failed, please try again.');
+      await finalRespond(interaction, { content: 'Something went wrong.', ephemeral: true }, 'whoami failed, please try again.');
     } finally {
       done();
       console.timeEnd(`whoami:${interaction.id}`);
@@ -835,21 +831,30 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
       return;
     }
-    const discordId = interaction.user.id;
-    const uid = await getKCUidForDiscord(discordId);
-    if (!uid) return safeEdit(interaction, { content: 'Not linked. Run `/link` first.' });
+    const done = watchdog(2500, () => {
+      finalRespond(interaction,
+        { content: 'Still working… one moment please.', ephemeral: true },
+        'Reply expired while working. Please try again.');
+    });
 
     try {
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) {
+        await safeEdit(interaction, { content: 'Not linked. Run `/link` first.', ephemeral: true });
+        return;
+      }
+
       const [userRT, badgesRT, postsRT] = await Promise.all([
-        rtdb.ref(`users/${uid}`).get(),
-        rtdb.ref(`badges/${uid}`).get(),
-        rtdb.ref(`users/${uid}/posts`).get(),
+        withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
+        withTimeout(rtdb.ref(`badges/${uid}`).get(), 4000, `RTDB badges/${uid}`),
+        withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`),
       ]);
 
       const firestore = admin.firestore();
       const [userFS, postsFS] = await Promise.all([
-        firestore.collection('users').doc(uid).get(),
-        firestore.collection('users').doc(uid).collection('posts').get(),
+        withTimeout(firestore.collection('users').doc(uid).get(), 4000, `FS users/${uid}`),
+        withTimeout(firestore.collection('users').doc(uid).collection('posts').get(), 4000, `FS users/${uid}/posts`),
       ]);
 
       const brief = (val) => {
@@ -875,10 +880,12 @@ client.on('interactionCreate', async (interaction) => {
         }
       };
 
-      await safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
+      await safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```', ephemeral: true });
     } catch (e) {
       console.error('dumpme error:', e);
-      await safeEdit(interaction, { content: 'Error reading data (see logs).' });
+      await safeEdit(interaction, { content: 'Error reading data (see logs).', ephemeral: true });
+    } finally {
+      done();
     }
     return;
   }
