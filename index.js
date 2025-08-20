@@ -34,12 +34,12 @@ const KC_BADGE_ICONS = {
 };
 
 const EMOJI = {
-  offence:  '<:red:1407696672229818579>',
-  defence:  '<:blue:1407696743474139260>',
-  overall:  '<:gold:1407696766719234119>',
-  verified: '<:Verified:1407697810866045008>',
-  diamond:  '<:diamondi:1407696929059635212>',
-  emerald:  '<:emeraldi:1407696908033593365>',
+  offence:  '<:kc_offence:123456789012345678>',
+  defence:  '<:kc_defence:123456789012345679>',
+  overall:  '<:kc_overall:123456789012345680>',
+  verified: '<:kc_verified:123456789012345681>',
+  diamond:  '<:kc_diamond:123456789012345682>',
+  emerald:  '<:kc_emerald:123456789012345683>',
 };
 
 const LB = {
@@ -126,16 +126,26 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
   }
 }
 
-async function safeEdit(interaction, data) {
+async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
     } else {
-      // still allowed to reply (not acknowledged yet)
-      return await interaction.reply({ ...data, ephemeral: true });
+      return await interaction.reply({ ...data, flags: (data?.flags ?? (data?.ephemeral ? 64 : 0)) });
     }
   } catch (err) {
-    if (isExpiredToken(err)) return null;
+    if (isExpiredToken(err)) {
+      try {
+        // send a follow-up (ephemeral if original wasn’t ephemeral we make this one ephemeral)
+        const ephemeral = data?.flags === 64 || data?.ephemeral === true;
+        return await interaction.followUp(ephemeral ? data : { ...data, ephemeral: true });
+      } catch {
+        if (interaction.channel && fallbackText) {
+          try { await interaction.channel.send(fallbackText); } catch {}
+        }
+      }
+      return null;
+    }
     throw err;
   }
 }
@@ -307,16 +317,18 @@ async function fetchLatestMessages(limit = 10) {
 
 // Build an embed showing a page of 10 messages (title, text, reply count)
 function buildMessagesEmbed(list, userNames = {}) {
-  const lines = list.map((m, i) => {
-    const who = userNames[m.uid] || m.user || '(unknown)';
-    const txt = (m.text || '').toString().slice(0, 140).replace(/\s+/g, ' ');
-    const replies = m.replies ? Object.keys(m.replies).length : 0;
-    return `**${i + 1}. ${who}** — ${txt || '—'}\nReplies: **${replies}**`;
-  });
+  const desc = list
+    .map((m, i) => {
+      const who = userNames[m.uid] || m.user || '(unknown)';
+      const text = m.text?.length > 100 ? m.text.slice(0, 100) + '…' : m.text;
+      return `**${i + 1}. ${who}**\n— ${text || '_no text_'}\nReplies: **${m.replies ? Object.keys(m.replies).length : 0}**`;
+    })
+    .join('\n\n');
 
   return new EmbedBuilder()
     .setTitle('Messageboard — latest 10')
-    .setDescription(lines.join('\n\n') || '_No messages yet_');
+    .setDescription(desc || 'No messages yet.')
+    .setColor(0x2b2d31);
 }
 
 function messageIndexRows(count) {
@@ -698,10 +710,7 @@ client.on('interactionCreate', async (interaction) => {
   } catch (_) {}
 
   if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
-    if (!interaction.message?.editable && !interaction.deferred && !interaction.replied) {
-      return finalRespond(interaction, { content: 'That leaderboard page is stale. Run `/leaderboard` again.' },
-                          'Leaderboard interaction expired. Run `/leaderboard` again.');
-    }
+    try { await interaction.deferUpdate(); } catch (_) {}
     const [, , catStr, pageStr] = interaction.customId.split(':');
     const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
     const page   = Math.max(0, parseInt(pageStr,10) || 0);
@@ -713,11 +722,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const embed = buildLbEmbed(rows, catIdx, page);
-    await interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
+    await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
     return;
   }
 
   if (interaction.isButton() && interaction.customId.startsWith('msg:')) {
+    try { await interaction.deferUpdate(); } catch (_) {}
     const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
     const action = parts[1];
 
@@ -737,19 +747,22 @@ client.on('interactionCreate', async (interaction) => {
       const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
       const msg = cache.list[idx];
       const embed = buildRepliesEmbed(msg, cache.nameMap);
-      return interaction.update({ embeds: [embed], components: [repliesNavRow(idx)] });
+      await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
+      return;
     }
 
     if (action === 'back') {
       const embed = buildMessagesEmbed(cache.list, cache.nameMap);
-      return interaction.update({ embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
+      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
+      return;
     }
 
     if (action === 'refresh') {
       const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
       interaction.client.msgCache.set(key, { list, nameMap });
       const embed = buildMessagesEmbed(list, nameMap);
-      return interaction.update({ embeds: [embed], components: messageIndexRows(list.length || 0) });
+      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+      return;
     }
 
     if (action === 'refreshOne') {
@@ -758,18 +771,22 @@ client.on('interactionCreate', async (interaction) => {
       interaction.client.msgCache.set(key, { list, nameMap });
       const msg = list[idx] || list[0];
       const embed = buildRepliesEmbed(msg, nameMap);
-      return interaction.update({ embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+      await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+      return;
     }
   }
 
   if (interaction.isButton() && interaction.customId === 'votes:refresh') {
+    try { await interaction.deferUpdate(); } catch (_) {}
     try {
       const scores = await loadVoteScores();
       const embed = buildVoteEmbed(scores);
-      return interaction.update({ embeds: [embed] });
+      await safeEdit(interaction, { embeds: [embed] });
+      return;
     } catch (e) {
       console.error('votes refresh error:', e);
-      return interaction.reply({ content: 'Refresh failed.', ephemeral: true });
+      await safeEdit(interaction, { content: 'Refresh failed.', ephemeral: true });
+      return;
     }
   }
 
@@ -884,12 +901,9 @@ client.on('interactionCreate', async (interaction) => {
       const rows = await loadLeaderboardData();
       const catIdx = 0, page = 0;
       const embed = buildLbEmbed(rows, catIdx, page);
-      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] })
-        .then(() => { 
-            /* store rows in memory for button handler */ 
-            interaction.client.lbCache ??= new Map(); 
-            interaction.client.lbCache.set(interaction.id, rows); 
-        });
+      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
+      interaction.client.lbCache ??= new Map(); 
+      interaction.client.lbCache.set(interaction.id, rows);
     } catch (e) {
         console.error('leaderboard error:', e);
         await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
@@ -910,7 +924,8 @@ client.on('interactionCreate', async (interaction) => {
     try {
       const all = await fetchAllPosts({ platform });
       if (!all.length) {
-        return finalRespond(interaction, { content: 'No clips found.' }, 'No clips found.');
+        await safeEdit(interaction, { content: 'No clips found.' });
+        return;
       }
 
       // Sort by popularity score and take top 5
@@ -935,11 +950,12 @@ client.on('interactionCreate', async (interaction) => {
         .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
         .setDescription(lines.join('\n\n'));
 
-      return finalRespond(interaction, { embeds: [embed] }, 'The reply expired—try `/clips` again.');
+      await safeEdit(interaction, { embeds: [embed] }, 'The reply expired—try `/clips` again.');
     } catch (e) {
       console.error('clips error:', e);
-      return finalRespond(interaction, { content: 'Something went wrong.' }, 'clips failed, please try again.');
+      await finalRespond(interaction, { content: 'Something went wrong.' }, 'clips failed, please try again.');
     }
+    return;
   }
 
   if (interaction.commandName === 'messages') {
@@ -957,11 +973,12 @@ client.on('interactionCreate', async (interaction) => {
       interaction.client.msgCache ??= new Map();
       interaction.client.msgCache.set(interaction.id, { list, nameMap });
 
-      return safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
     } catch (e) {
       console.error('messages error:', e);
-      return finalRespond(interaction, { content: 'Something went wrong.' }, 'messages failed, please try again.');
+      await finalRespond(interaction, { content: 'Something went wrong.' }, 'messages failed, please try again.');
     }
+    return;
   }
 
   if (interaction.commandName === 'votingscores') {
@@ -977,11 +994,12 @@ client.on('interactionCreate', async (interaction) => {
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
       );
-      return safeEdit(interaction, { embeds: [embed], components: [row] });
+      await safeEdit(interaction, { embeds: [embed], components: [row] });
     } catch (e) {
       console.error('votingscores error:', e);
-      return finalRespond(interaction, { content: 'Something went wrong.' }, 'votingscores failed, please try again.');
+      await finalRespond(interaction, { content: 'Something went wrong.' }, 'votingscores failed, please try again.');
     }
+    return;
   }
 
   if (interaction.commandName === 'badges') {
