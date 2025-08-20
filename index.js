@@ -34,12 +34,12 @@ const KC_BADGE_ICONS = {
 };
 
 const EMOJI = {
-  offence:  '<:kc_offence:123456789012345678>',
-  defence:  '<:kc_defence:123456789012345679>',
-  overall:  '<:kc_overall:123456789012345680>',
-  verified: '<:kc_verified:123456789012345681>',
-  diamond:  '<:kc_diamond:123456789012345682>',
-  emerald:  '<:kc_emerald:123456789012345683>',
+  offence:  '<:red:1407696672229818579>',
+  defence:  '<:blue:1407696743474139260>',
+  overall:  '<:gold:1407696766719234119>',
+  verified: '<:Verified:1407697810866045008>',
+  diamond:  '<:diamondi:1407696929059635212>',
+  emerald:  '<:emeraldi:1407696908033593365>',
 };
 
 const LB = {
