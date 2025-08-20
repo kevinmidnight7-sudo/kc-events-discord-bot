@@ -23,16 +23,6 @@ const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 
-// --- KC badge icons (same as site) ---
-const KC_BADGE_ICONS = {
-  offence: 'https://kevinmidnight7-sudo.github.io/messageboardkc/red.png',
-  defence: 'https://kevinmidnight7-sudo.github.io/messageboardkc/blue.png',
-  overall: 'https://kevinmidnight7-sudo.github.io/messageboardkc/kcevents.png',
-  verified: 'https://kevinmidnight7-sudo.github.io/messageboardkc/verified.png',
-  diamond: 'https://kevinmidnight7-sudo.github.io/messageboardkc/diamondi.png',
-  emerald: 'https://kevinmidnight7-sudo.github.io/messageboardkc/emeraldi.png'
-};
-
 const EMOJI = {
   offence:  '<:red:1407696672229818579>',
   defence:  '<:blue:1407696743474139260>',
@@ -103,6 +93,8 @@ function isUnknownInteraction(err) {
   return err?.code === 10062 || err?.rawError?.code === 10062;
 }
 
+function isPermsError(err) { return err?.code === 50013; }
+
 // New helper to catch all expired token errors
 function isExpiredToken(err) {
   return (
@@ -113,6 +105,8 @@ function isExpiredToken(err) {
 }
 
 async function safeDefer(interaction, { ephemeral = false } = {}) {
+  const age = Date.now() - interaction.createdTimestamp;
+  if (age > 2500) return false;
   if (interaction.deferred || interaction.replied) return true;
   try {
     await interaction.deferReply({ ephemeral });
@@ -136,7 +130,7 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
       return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
     }
   } catch (err) {
-    if (isExpiredToken(err)) {
+    if (isExpiredToken(err) || isPermsError(err)) {
       try {
         // send a follow-up, always ephemeral to avoid spamming
         return await interaction.followUp({ ...data, ephemeral: true });
@@ -178,8 +172,8 @@ async function finalRespond(interaction, data, fallbackText = null) {
     // brand new reply
     return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
   } catch (err) {
-    // If editReply failed because the token is invalid (likely >15 mins passed)
-    if (isExpiredToken(err)) {
+    // If editReply failed because the token is invalid, perms are missing, etc.
+    if (isExpiredToken(err) || isPermsError(err)) {
       console.warn(`[finalRespond] editReply failed for ${interaction.id}, attempting followup.`);
       try {
         // followUp can be used to send a new message after the token expires.
@@ -198,11 +192,12 @@ async function finalRespond(interaction, data, fallbackText = null) {
   }
 }
 
-function progressKick(interaction, ms = 2000, text = 'Still working… one moment please.') {
+function progressKick(interaction, ms = 2000, text = 'Still working…') {
   const cancel = watchdog(ms, () => {
-    finalRespond(interaction, { content: text, ephemeral: Boolean(interaction.ephemeral) }, text);
+    // always ephemeral so we don’t spam channels if something stalls
+    finalRespond(interaction, { content: text, ephemeral: true }, text);
   });
-  return cancel; // call cancel() when your real reply finishes
+  return cancel;
 }
 
 async function hasEmerald(uid) {
@@ -247,19 +242,20 @@ async function setKCAvatar(uid, url) {
 }
 
 async function clearKCAvatar(uid) {
-  // RTDB: remove override fields; your site falls back to default
+  const { FieldValue } = admin.firestore;
+  // RTDB: remove override fields by setting to null
   await rtdb.ref(`users/${uid}`).update({
     avatar: null,
     photoURL: null,
-    avatarSource: admin.database.ServerValue.DELETE || null, // harmless if not supported
+    avatarSource: null,
     avatarUpdatedAt: Date.now(),
   });
   // Firestore (best-effort)
   try {
     await admin.firestore().collection('users').doc(uid).set({
-      avatar: admin.firestore.FieldValue.delete?.() ?? null,
-      photoURL: admin.firestore.FieldValue.delete?.() ?? null,
-      avatarSource: admin.firestore.FieldValue.delete?.() ?? null,
+      avatar: FieldValue.delete(),
+      photoURL: FieldValue.delete(),
+      avatarSource: FieldValue.delete(),
       avatarUpdatedAt: Date.now(),
     }, { merge: true });
   } catch (_) {}
@@ -655,11 +651,11 @@ async function getKCProfile(uid) {
 
   // Posts visible if content unlocked (diamond/emerald codes or explicit content)
   const codesUnlocked = user.codesUnlocked || {};
-  const postingUnlocked = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
+  const postingAllowed = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
 
   // Build at most 3 post lines as:  • "Caption" — <link>
   let postLines = [];
-  if (postingUnlocked && posts) {
+  if (postingAllowed && posts) {
     const list = Object.entries(posts)
       .sort((a, b) => (b[1]?.createdAt || 0) - (a[1]?.createdAt || 0))
       .slice(0, 3);
@@ -680,7 +676,7 @@ async function getKCProfile(uid) {
     }
   }
   const postsField =
-    !postingUnlocked
+    !postingAllowed
       ? 'Posts locked. Unlock posting on your profile.'
       : (Object.keys(posts).length === 0 ? 'This user has no posts.' : (postLines.join('\n') || 'This user has no posts.'));
 
@@ -719,7 +715,7 @@ async function getKCProfile(uid) {
     streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
     postsText: postsField,
-    postingUnlocked, // Pass this through for the /post command check
+    postingUnlocked: postingAllowed, // Pass this through for the /post command check
     // embed colour preference: nameColor > gradient first colour > default
     embedColor: hexToInt(nameColor) || hexToInt(gradientColor) || null,
   };
@@ -1349,19 +1345,16 @@ client.on('interactionCreate', async (interaction) => {
       await withTimeout(ref.set(postData), 4000, `write post ${postId}`);
   
       // Public confirmation (non-ephemeral) with a small summary
-      await finalRespond(
-        interaction,
-        {
-          content: [
-            '✅ **Post created!**',
-            `• **Type:** ${postData.type}`,
-            `• **Caption:** ${caption || '(none)'}`,
-            publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
-          ].join('\n'),
-          ephemeral: false
-        },
-        'Your `/post` reply expired — please run it again.'
-      );
+      await safeEdit(interaction, { content: '✅ Post saved. Sending summary…', ephemeral: true });
+      await interaction.followUp({
+        content: [
+          '✅ **Post created!**',
+          `• **Type:** ${postData.type}`,
+          `• **Caption:** ${caption || '(none)'}`,
+          publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
+        ].join('\n'),
+        ephemeral: false
+      });
     } catch (e) {
       console.error('post command error:', e);
       await finalRespond(interaction, { content: 'Something went wrong creating the post.' }, 'Post failed, please try again.');
