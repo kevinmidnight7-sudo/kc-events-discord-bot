@@ -41,6 +41,13 @@ const LB = {
   PAGE_SIZE: 10,
 };
 
+const DEFAULT_EMBED_COLOR = 0x2b2d31;
+
+// Simple in-memory cache for frequently accessed, non-critical data
+const globalCache = {
+  userNames: { data: {}, fetchedAt: 0 },
+};
+
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
   if (!hex || typeof hex !== 'string') return null;
@@ -106,7 +113,7 @@ function isExpiredToken(err) {
 
 async function safeDefer(interaction, { ephemeral = false } = {}) {
   const age = Date.now() - interaction.createdTimestamp;
-  if (age > 2500) return false;
+  if (age > 2900) return false;
   if (interaction.deferred || interaction.replied) return true;
   try {
     await interaction.deferReply({ ephemeral });
@@ -117,6 +124,7 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
       await interaction.deferReply({ ephemeral: true });
       return true;
     } catch (e2) {
+      console.warn(`[safeDefer] All defer attempts failed for interaction ${interaction.id}`);
       return false;
     }
   }
@@ -192,7 +200,7 @@ async function finalRespond(interaction, data, fallbackText = null) {
   }
 }
 
-function progressKick(interaction, ms = 2000, text = 'Still working…') {
+function progressKick(interaction, ms = 2900, text = 'Still working…') {
   const cancel = watchdog(ms, () => {
     // always ephemeral so we don’t spam channels if something stalls
     finalRespond(interaction, { content: text, ephemeral: true }, text);
@@ -320,6 +328,12 @@ function countComments(commentsObj = {}) {
 
 // Map of uid -> displayName/email for quick lookups
 async function getAllUserNames() {
+  const CACHE_DURATION = 60 * 1000; // 60 seconds
+  const now = Date.now();
+  if (now - globalCache.userNames.fetchedAt < CACHE_DURATION) {
+    return globalCache.userNames.data;
+  }
+
   const snap = await withTimeout(rtdb.ref('users').get(), 4000, 'RTDB users');
   const out = {};
   if (snap.exists()) {
@@ -329,6 +343,8 @@ async function getAllUserNames() {
       out[uid] = u.displayName || u.email || '(unknown)';
     }
   }
+  globalCache.userNames.data = out;
+  globalCache.userNames.fetchedAt = now;
   return out;
 }
 
@@ -424,7 +440,8 @@ function buildMessagesEmbed(list, userNames = {}) {
   return new EmbedBuilder()
     .setTitle('Messageboard — latest 10')
     .setDescription(desc || 'No messages yet.')
-    .setColor(0x2b2d31);
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /messages' });
 }
 
 function messageIndexRows(count) {
@@ -461,7 +478,9 @@ function buildRepliesEmbed(message, userNames = {}) {
 
   return new EmbedBuilder()
     .setTitle(title)
-    .setDescription(lines.join('\n') || '_No replies yet_');
+    .setDescription(lines.join('\n') || '_No replies yet_')
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /messages' });
 }
 
 function repliesNavRow(idx) {
@@ -517,7 +536,9 @@ function buildVoteEmbed(scores) {
     .addFields(
       { name: 'Best Offence', value: offLines, inline: false },
       { name: 'Best Defence', value: defLines, inline: false },
-    );
+    )
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /votingscores' });
 
   return e;
 }
@@ -556,7 +577,9 @@ function buildLbEmbed(rows, catIdx, page) {
   });
   const embed = new EmbedBuilder()
     .setTitle(`Leaderboard — ${cat.label}`)
-    .setDescription(lines.join('\n') || '_No data_');
+    .setDescription(lines.join('\n') || '_No data_')
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /leaderboard' });
   return embed;
 }
 
@@ -641,7 +664,6 @@ async function getKCProfile(uid) {
     user.username ??
     'Anonymous User';
 
-  const bonus = user.bonus || 0;
   const streak = Number.isFinite(user.loginStreak) ? String(user.loginStreak) : '—';
 
   // Profile customization colour (tint embed)
@@ -711,7 +733,6 @@ async function getKCProfile(uid) {
     id: uid, // Pass the UID through
     displayName,
     about,
-    bonus,
     streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
     postsText: postsField,
@@ -935,6 +956,15 @@ client.on('interactionCreate', async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
+  const handleDeferFailure = async () => {
+    console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+    try {
+        await interaction.reply({ content: 'Sorry, that timed out. Please run the command again.', ephemeral: true });
+    } catch {
+        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
+    }
+  };
+
   if (interaction.commandName === 'link') {
     const start = process.env.AUTH_BRIDGE_START_URL;
     const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
@@ -943,12 +973,8 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'whoami') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
-    const cancelProgress = progressKick(interaction);
+    if (!ok) return handleDeferFailure();
+    const cancelProgress = progressKick(interaction, 4000);
 
     try {
       console.log('[INT] whoami -> getKCUidForDiscord');
@@ -969,12 +995,8 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'dumpme') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
-    const cancelProgress = progressKick(interaction);
+    if (!ok) return handleDeferFailure();
+    const cancelProgress = progressKick(interaction, 4000);
 
     try {
       const discordId = interaction.user.id;
@@ -1031,11 +1053,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'leaderboard') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
+    if (!ok) return handleDeferFailure();
     const cancelProgress = progressKick(interaction);
 
     try {
@@ -1057,11 +1075,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'clips') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
+    if (!ok) return handleDeferFailure();
     const cancelProgress = progressKick(interaction);
 
     try {
@@ -1092,7 +1106,9 @@ client.on('interactionCreate', async (interaction) => {
 
       const embed = new EmbedBuilder()
         .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
-        .setDescription(lines.join('\n\n'));
+        .setDescription(lines.join('\n\n'))
+        .setColor(DEFAULT_EMBED_COLOR)
+        .setFooter({ text: 'KC Bot • /clips' });
 
       await safeEdit(interaction, { embeds: [embed] }, 'The reply expired—try `/clips` again.');
     } catch (e) {
@@ -1106,11 +1122,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'messages') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) {
-        console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-        return;
-    }
+    if (!ok) return handleDeferFailure();
     const cancelProgress = progressKick(interaction);
 
     try {
@@ -1133,11 +1145,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'votingscores') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) {
-        console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-        return;
-    }
+    if (!ok) return handleDeferFailure();
     const cancelProgress = progressKick(interaction);
 
     try {
@@ -1158,11 +1166,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'badges') {
     const ok = await safeDefer(interaction); // public
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
+    if (!ok) return handleDeferFailure();
     
     const cancelProgress = progressKick(interaction);
 
@@ -1206,9 +1210,9 @@ client.on('interactionCreate', async (interaction) => {
           { name: 'Badges', value: badgesVal, inline: false },
           { name: 'Streak', value: streakVal, inline: true  },
           { name: 'Posts',  value: postsVal,  inline: false },
-        );
-
-      if (profile.embedColor) embed.setColor(profile.embedColor);
+        )
+        .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
+        .setFooter({ text: 'KC Bot • /badges' });
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -1239,11 +1243,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'syncavatar') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) {
-      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
+    if (!ok) return handleDeferFailure();
 
     try {
       // 1) Must be linked
@@ -1288,10 +1288,7 @@ client.on('interactionCreate', async (interaction) => {
   
   if (interaction.commandName === 'post') {
     const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) {
-      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
-      return;
-    }
+    if (!ok) return handleDeferFailure();
   
     try {
       // Must be linked
