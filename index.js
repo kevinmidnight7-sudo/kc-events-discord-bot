@@ -166,11 +166,25 @@ async function finalRespond(interaction, data, fallbackText = null) {
     const payload = isEphemeral ? { ...data, flags: 64 } : data;
     return await interaction.reply(payload);
   } catch (err) {
-    // token expired? send a normal message so user still sees *something*
-    if ((err?.code === 10062 || err?.rawError?.code === 10062) && interaction.channel && fallbackText) {
-      try { await interaction.channel.send(fallbackText); } catch (_) {}
+    // If editReply failed because the token is invalid (likely >15 mins passed)
+    if (isUnknownInteraction(err)) {
+      console.warn(`[finalRespond] editReply failed for ${interaction.id}, attempting followup.`);
+      try {
+        // followUp can be used to send a new message after the token expires.
+        // Make it ephemeral to avoid spamming the channel if the original was public.
+        const isEphemeral = data?.flags === 64 || data?.ephemeral === true;
+        const payload = isEphemeral ? data : { ...data, ephemeral: true };
+        return await interaction.followUp(payload);
+      } catch (followUpErr) {
+        console.error('[finalRespond] FollowUp also failed:', followUpErr);
+        // As a last resort, send a message to the channel if we have a fallback.
+        if (interaction.channel && fallbackText) {
+          try { await interaction.channel.send(fallbackText); } catch (_) {}
+        }
+      }
       return null;
     }
+    // Re-throw other, unexpected errors
     throw err;
   }
 }
