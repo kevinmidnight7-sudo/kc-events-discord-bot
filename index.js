@@ -113,15 +113,18 @@ function isExpiredToken(err) {
 }
 
 async function safeDefer(interaction, { ephemeral = false } = {}) {
-  // Already acknowledged? nothing to do.
   if (interaction.deferred || interaction.replied) return true;
-
   try {
     await interaction.deferReply({ ephemeral });
     return true;
   } catch (err) {
-    // If we couldn't defer, the token is already expired.
-    return false;
+    // Retry as ephemeral (often succeeds even if channel send perms are missing)
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      return true;
+    } catch (e2) {
+      return false;
+    }
   }
 }
 
@@ -193,6 +196,73 @@ async function finalRespond(interaction, data, fallbackText = null) {
     // Re-throw other, unexpected errors
     throw err;
   }
+}
+
+function progressKick(interaction, ms = 2000, text = 'Still working… one moment please.') {
+  const cancel = watchdog(ms, () => {
+    finalRespond(interaction, { content: text, ephemeral: Boolean(interaction.ephemeral) }, text);
+  });
+  return cancel; // call cancel() when your real reply finishes
+}
+
+async function hasEmerald(uid) {
+  // Prefer RTDB; fall back to Firestore if needed
+  try {
+    const snap = await rtdb.ref(`users/${uid}/codesUnlocked`).get();
+    const codes = snap.exists() ? (snap.val() || {}) : {};
+    if (codes.emerald === true || codes.diamond === true || codes.content === true) return true;
+  } catch (_) {}
+
+  try {
+    const fsDoc = await admin.firestore().collection('users').doc(uid).get();
+    if (fsDoc.exists) {
+      const u = fsDoc.data() || {};
+      // a few fallbacks seen in your data
+      if (u.codesUnlocked?.emerald === true || u.codesUnlocked?.diamond === true || u.postsUnlocked === true || u.canPost === true) {
+        return true;
+      }
+    }
+  } catch (_) {}
+
+  return false;
+}
+
+async function setKCAvatar(uid, url) {
+  // RTDB
+  await rtdb.ref(`users/${uid}`).update({
+    avatar: url,
+    photoURL: url,
+    avatarSource: 'discord',
+    avatarUpdatedAt: Date.now(),
+  });
+  // Firestore (best-effort)
+  try {
+    await admin.firestore().collection('users').doc(uid).set({
+      avatar: url,
+      photoURL: url,
+      avatarSource: 'discord',
+      avatarUpdatedAt: Date.now(),
+    }, { merge: true });
+  } catch (_) {}
+}
+
+async function clearKCAvatar(uid) {
+  // RTDB: remove override fields; your site falls back to default
+  await rtdb.ref(`users/${uid}`).update({
+    avatar: null,
+    photoURL: null,
+    avatarSource: admin.database.ServerValue.DELETE || null, // harmless if not supported
+    avatarUpdatedAt: Date.now(),
+  });
+  // Firestore (best-effort)
+  try {
+    await admin.firestore().collection('users').doc(uid).set({
+      avatar: admin.firestore.FieldValue.delete?.() ?? null,
+      photoURL: admin.firestore.FieldValue.delete?.() ?? null,
+      avatarSource: admin.firestore.FieldValue.delete?.() ?? null,
+      avatarUpdatedAt: Date.now(),
+    }, { merge: true });
+  } catch (_) {}
 }
 
 // ----- Shared helpers for new commands -----
@@ -669,8 +739,24 @@ const votingCmd = new SlashCommandBuilder()
   .setName('votingscores')
   .setDescription('Show current live voting scores (Offence/Defence)');
 
+const avatarCmd = new SlashCommandBuilder()
+  .setName('syncavatar')
+  .setDescription('Use your Discord avatar on KC (Emerald users)')
+  .addStringOption(o =>
+    o.setName('action')
+     .setDescription('Choose what to do')
+     .addChoices(
+       { name: 'Set (use Discord avatar)', value: 'set' },
+       { name: 'Revert (remove override)', value: 'revert' },
+     )
+     .setRequired(true)
+  );
+
 // Register (include it in commands array)
-const commandsJson = [linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd].map(c => c.toJSON());
+const commandsJson = [
+  linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
+  avatarCmd
+].map(c => c.toJSON());
 
 
 // ---------- Register commands on startup ----------
@@ -705,6 +791,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
     try {
       await interaction.deferUpdate();
+      const cancel = progressKick(interaction, 2000, 'Refreshing…');
       const [, , catStr, pageStr] = interaction.customId.split(':');
       const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
       const page   = Math.max(0, parseInt(pageStr,10) || 0);
@@ -717,6 +804,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const embed = buildLbEmbed(rows, catIdx, page);
       await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
+      cancel();
     } catch (e) {
       console.error('lb button error:', e);
       await safeEdit(interaction, { content: 'Sorry — leaderboard couldn’t refresh right now.', components: [] });
@@ -727,6 +815,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId.startsWith('msg:')) {
     try {
       await interaction.deferUpdate();
+      const cancel = progressKick(interaction, 2000, 'Refreshing…');
       const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
       const action = parts[1];
 
@@ -763,6 +852,7 @@ client.on('interactionCreate', async (interaction) => {
         const embed = buildRepliesEmbed(msg, nameMap);
         await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
       }
+      cancel();
     } catch (e) {
       console.error('msg button error:', e);
       await safeEdit(interaction, { content: 'Sorry — messages couldn’t refresh right now.', components: [] });
@@ -773,12 +863,14 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId === 'votes:refresh') {
     try {
       await interaction.deferUpdate();
+      const cancel = progressKick(interaction, 2000, 'Refreshing…');
       const scores = await loadVoteScores();
       const embed = buildVoteEmbed(scores);
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
       );
       await safeEdit(interaction, { embeds: [embed], components: [row] });
+      cancel();
     } catch (e) {
       console.error('votes refresh error:', e);
       await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
@@ -797,16 +889,12 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'whoami') {
     const ok = await safeDefer(interaction, { ephemeral: true });
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
       return;
     }
-    const done = watchdog(2500, () => {
-      finalRespond(interaction,
-        { content: 'Still working… one moment please.', ephemeral: true },
-        'Reply expired while working. Please try again.');
-    });
+    const cancelProgress = progressKick(interaction);
 
-    console.time(`whoami:${interaction.id}`);
     try {
       console.log('[INT] whoami -> getKCUidForDiscord');
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
@@ -819,8 +907,7 @@ client.on('interactionCreate', async (interaction) => {
       console.error('whoami error:', e);
       await finalRespond(interaction, { content: 'Something went wrong.', ephemeral: true }, 'whoami failed, please try again.');
     } finally {
-      done();
-      console.timeEnd(`whoami:${interaction.id}`);
+      cancelProgress();
     }
     return;
   }
@@ -828,14 +915,11 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'dumpme') {
     const ok = await safeDefer(interaction, { ephemeral: true });
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
       return;
     }
-    const done = watchdog(2500, () => {
-      finalRespond(interaction,
-        { content: 'Still working… one moment please.', ephemeral: true },
-        'Reply expired while working. Please try again.');
-    });
+    const cancelProgress = progressKick(interaction);
 
     try {
       const discordId = interaction.user.id;
@@ -885,7 +969,7 @@ client.on('interactionCreate', async (interaction) => {
       console.error('dumpme error:', e);
       await safeEdit(interaction, { content: 'Error reading data (see logs).', ephemeral: true });
     } finally {
-      done();
+      cancelProgress();
     }
     return;
   }
@@ -893,15 +977,11 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'leaderboard') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
       return;
     }
-
-    const done = watchdog(2500, () => {
-      finalRespond(interaction,
-        { content: 'Still working… one moment please.' },
-        'Reply expired while working. Please try again.');
-    });
+    const cancelProgress = progressKick(interaction);
 
     try {
       console.log('[INT] leaderboard -> loadLeaderboardData');
@@ -915,7 +995,7 @@ client.on('interactionCreate', async (interaction) => {
         console.error('leaderboard error:', e);
         await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
     } finally {
-        done();
+        cancelProgress();
     }
     return;
   }
@@ -923,12 +1003,14 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'clips') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
       return;
     }
+    const cancelProgress = progressKick(interaction);
 
-    const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
     try {
+      const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
       const all = await fetchAllPosts({ platform });
       if (!all.length) {
         await safeEdit(interaction, { content: 'No clips found.' });
@@ -961,6 +1043,8 @@ client.on('interactionCreate', async (interaction) => {
     } catch (e) {
       console.error('clips error:', e);
       await finalRespond(interaction, { content: 'Something went wrong.' }, 'clips failed, please try again.');
+    } finally {
+      cancelProgress();
     }
     return;
   }
@@ -968,9 +1052,11 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'messages') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
-        if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+        console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
         return;
     }
+    const cancelProgress = progressKick(interaction);
 
     try {
       const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
@@ -984,6 +1070,8 @@ client.on('interactionCreate', async (interaction) => {
     } catch (e) {
       console.error('messages error:', e);
       await finalRespond(interaction, { content: 'Something went wrong.' }, 'messages failed, please try again.');
+    } finally {
+      cancelProgress();
     }
     return;
   }
@@ -991,9 +1079,11 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'votingscores') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
-        if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+        console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
         return;
     }
+    const cancelProgress = progressKick(interaction);
 
     try {
       const scores = await loadVoteScores();
@@ -1005,6 +1095,8 @@ client.on('interactionCreate', async (interaction) => {
     } catch (e) {
       console.error('votingscores error:', e);
       await finalRespond(interaction, { content: 'Something went wrong.' }, 'votingscores failed, please try again.');
+    } finally {
+      cancelProgress();
     }
     return;
   }
@@ -1012,17 +1104,13 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'badges') {
     const ok = await safeDefer(interaction); // public
     if (!ok) {
-      if (interaction.channel) await interaction.channel.send('Sorry, that timed out. Please run the command again.');
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
       return;
     }
     
-    const done = watchdog(2500, () => {
-      finalRespond(interaction,
-        { content: 'Still working… one moment please.' },
-        'Reply expired while working. Please try again.');
-    });
+    const cancelProgress = progressKick(interaction);
 
-    console.time(`badges:${interaction.id}`);
     try {
       // target: provided user or self
       const target = interaction.options.getUser('user') || interaction.user;
@@ -1091,8 +1179,56 @@ client.on('interactionCreate', async (interaction) => {
         'Something went wrong running `/badges`. Please try again.'
       );
     } finally {
-      done();
-      console.timeEnd(`badges:${interaction.id}`);
+      cancelProgress();
+    }
+    return;
+  }
+
+  if (interaction.commandName === 'syncavatar') {
+    const ok = await safeDefer(interaction, { ephemeral: true });
+    if (!ok) {
+      console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
+      if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
+      return;
+    }
+
+    try {
+      // 1) Must be linked
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) {
+        await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
+        return;
+      }
+
+      // 2) Must have Emerald (or higher) customisation
+      const allowed = await hasEmerald(uid);
+      if (!allowed) {
+        await safeEdit(interaction, { content: 'This feature requires Emerald/profile customisation.' });
+        return;
+      }
+
+      // 3) Action
+      const action = interaction.options.getString('action');
+
+      if (action === 'set') {
+        // Prefer PNG and a sensible size; 256 is plenty for your site
+        const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
+        await setKCAvatar(uid, url);
+        await safeEdit(interaction, { content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
+        return;
+      }
+
+      if (action === 'revert') {
+        await clearKCAvatar(uid);
+        await safeEdit(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
+        return;
+      }
+
+      await safeEdit(interaction, { content: 'Unknown action.' });
+    } catch (e) {
+      console.error('syncavatar error:', e);
+      await safeEdit(interaction, { content: 'Something went wrong updating your avatar.' });
     }
     return;
   }
