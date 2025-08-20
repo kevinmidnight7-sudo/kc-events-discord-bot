@@ -354,25 +354,28 @@ function snapshotToArray(snap) {
   return arr;
 }
 
-// Latest N messageboard messages
+// Latest N messageboard messages (defensive: over-fetch then trim)
 async function fetchLatestMessages(limit = 10) {
+  const OVERFETCH = Math.max(limit * 3, 30); // grab more, sort, then trim
   try {
     const snap = await withTimeout(
-      rtdb.ref('messages').orderByChild('time').limitToLast(limit).get(),
+      rtdb.ref('messages').orderByChild('time').limitToLast(OVERFETCH).get(),
       5000,
       'RTDB messages recent'
     );
-    return snapshotToArray(snap);
+    const arr = snapshotToArray(snap).slice(0, limit);
+    return arr;
   } catch (e) {
-    // fallback if index missing
     if (String(e?.message || '').includes('Index not defined')) {
-      console.warn('[fetchLatestMessages] Index missing, falling back to unordered query.');
+      console.warn('[fetchLatestMessages] Index missing, using unordered fallback.');
       const snap = await withTimeout(
-        rtdb.ref('messages').limitToLast(limit).get(),
+        rtdb.ref('messages').limitToLast(OVERFETCH).get(),
         5000,
         'RTDB messages fallback'
       );
-      return snapshotToArray(snap);
+      // sort by time desc if present, else by key desc, then trim
+      const arr = snapshotToArray(snap).slice(0, limit);
+      return arr;
     }
     throw e;
   }
@@ -618,11 +621,11 @@ async function getKCProfile(uid) {
 
   // Posts visible if content unlocked (diamond/emerald codes or explicit content)
   const codesUnlocked = user.codesUnlocked || {};
-  const contentUnlocked = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
+  const postingUnlocked = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
 
   // Build at most 3 post lines as:  • "Caption" — <link>
   let postLines = [];
-  if (contentUnlocked && posts) {
+  if (postingUnlocked && posts) {
     const list = Object.entries(posts)
       .sort((a, b) => (b[1]?.createdAt || 0) - (a[1]?.createdAt || 0))
       .slice(0, 3);
@@ -643,7 +646,7 @@ async function getKCProfile(uid) {
     }
   }
   const postsField =
-    !contentUnlocked
+    !postingUnlocked
       ? 'Posts locked. Unlock posting on your profile.'
       : (Object.keys(posts).length === 0 ? 'This user has no posts.' : (postLines.join('\n') || 'This user has no posts.'));
 
@@ -675,12 +678,14 @@ async function getKCProfile(uid) {
   }
 
   return {
+    id: uid, // Pass the UID through
     displayName,
     about,
     bonus,
     streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
     postsText: postsField,
+    postingUnlocked, // Pass this through for the /post command check
     // embed colour preference: nameColor > gradient first colour > default
     embedColor: hexToInt(nameColor) || hexToInt(gradientColor) || null,
   };
@@ -752,10 +757,22 @@ const avatarCmd = new SlashCommandBuilder()
      .setRequired(true)
   );
 
+const postCmd = new SlashCommandBuilder()
+  .setName('post')
+  .setDescription('Create a new post (YouTube/TikTok)')
+  .addStringOption(option =>
+    option.setName('caption')
+      .setDescription('The caption for your post')
+      .setRequired(true))
+  .addStringOption(option =>
+    option.setName('link')
+      .setDescription('YouTube or TikTok link')
+      .setRequired(true));
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
-  avatarCmd
+  avatarCmd, postCmd
 ].map(c => c.toJSON());
 
 
@@ -1138,7 +1155,6 @@ client.on('interactionCreate', async (interaction) => {
       const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
       const description = clampStr(profile.about, 4096);
       const badgesVal   = clampStr(profile.badgesText, 1024);
-      const bonusVal    = clampStr(profile.bonus, 1024, '—');
       const streakVal   = clampStr(profile.streak, 1024, '—');
       const postsVal    = clampStr(profile.postsText, 1024);
 
@@ -1150,7 +1166,6 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(description)
         .addFields(
           { name: 'Badges', value: badgesVal, inline: false },
-          { name: 'Bonus',  value: bonusVal,  inline: true  },
           { name: 'Streak', value: streakVal, inline: true  },
           { name: 'Posts',  value: postsVal,  inline: false },
         );
@@ -1229,6 +1244,54 @@ client.on('interactionCreate', async (interaction) => {
     } catch (e) {
       console.error('syncavatar error:', e);
       await safeEdit(interaction, { content: 'Something went wrong updating your avatar.' });
+    }
+    return;
+  }
+  
+  if (interaction.commandName === 'post') {
+    const ok = await safeDefer(interaction, { ephemeral: true });
+    if (!ok) return;
+
+    try {
+        const discordId = interaction.user.id;
+        const kcUid = await getKCUidForDiscord(discordId);
+        if (!kcUid) {
+            return await finalRespond(interaction, { content: '❌ You must link your account first with `/link`.', ephemeral: true });
+        }
+
+        const profile = await getKCProfile(kcUid);
+        if (!profile || !profile.postingUnlocked) {
+            return await finalRespond(interaction, { content: "❌ You don’t have posting unlocked. Unlock Emerald to use this feature.", ephemeral: true });
+        }
+
+        const caption = interaction.options.getString('caption');
+        const link = interaction.options.getString('link');
+
+        // Basic validation for link
+        if (!link.startsWith('http://') && !link.startsWith('https://')) {
+             return await finalRespond(interaction, { content: "❌ Please provide a valid link (starting with http:// or https://).", ephemeral: true });
+        }
+
+        // Send to website API
+        await fetch(`${process.env.WEBSITE_URL}/api/post`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: profile.id,
+                caption,
+                link
+            })
+        });
+
+        // Use finalRespond for the public success message
+        await finalRespond(interaction, {
+            content: `✅ Post created!\n**Caption:** ${caption}\n**Link:** ${link}`,
+            ephemeral: false // This should be a public confirmation
+        });
+
+    } catch (e) {
+        console.error('post command error:', e);
+        await finalRespond(interaction, { content: '❌ There was an error creating your post.', ephemeral: true });
     }
     return;
   }
