@@ -273,23 +273,37 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
   return results;
 }
 
-// Latest N messageboard messages
-async function fetchLatestMessages(limit = 10) {
-  const snap = await withTimeout(
-    rtdb.ref('messages').orderByChild('time').limitToLast(limit).get(),
-    5000,
-    'RTDB messages recent'
-  );
+function snapshotToArray(snap) {
   const arr = [];
-  if (snap.exists()) {
-    snap.forEach(c => {
-      const v = c.val() || {};
-      v.key = c.key;
-      arr.push(v);
-    });
+  if (snap?.exists()) {
+    snap.forEach(c => arr.push({ key: c.key, ...(c.val() || {}) }));
     arr.sort((a, b) => (b.time || 0) - (a.time || 0));
   }
   return arr;
+}
+
+// Latest N messageboard messages
+async function fetchLatestMessages(limit = 10) {
+  try {
+    const snap = await withTimeout(
+      rtdb.ref('messages').orderByChild('time').limitToLast(limit).get(),
+      5000,
+      'RTDB messages recent'
+    );
+    return snapshotToArray(snap);
+  } catch (e) {
+    // fallback if index missing
+    if (String(e?.message || '').includes('Index not defined')) {
+      console.warn('[fetchLatestMessages] Index missing, falling back to unordered query.');
+      const snap = await withTimeout(
+        rtdb.ref('messages').limitToLast(limit).get(),
+        5000,
+        'RTDB messages fallback'
+      );
+      return snapshotToArray(snap);
+    }
+    throw e;
+  }
 }
 
 // Build an embed showing a page of 10 messages (title, text, reply count)
