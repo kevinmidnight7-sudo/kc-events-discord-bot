@@ -78,9 +78,9 @@ const globalCache = {
   userNames: { data: {}, fetchedAt: 0 },
 };
 
-const isEphemeralCommand = (name) => new Set([
-  'whoami', 'dumpme', 'syncavatar', 'post', 'postmessage', 'link'
-]).has(name);
+// only these will be private
+const isEphemeralCommand = (name) =>
+  new Set(['whoami', 'dumpme']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -148,12 +148,14 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
     } else {
-      return await interaction.reply(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
+      return await interaction.reply(data);
     }
   } catch (err) {
     if (isExpiredToken(err) || isPermsError(err)) {
       try {
-        return await interaction.followUp(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
+        // IMPORTANT: do NOT force ephemeral here
+        // If you want a followUp to be ephemeral, pass flags: 64 in `data`.
+        return await interaction.followUp(data);
       } catch {
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
@@ -407,10 +409,23 @@ async function fetchLatestMessages(limit = 10) {
 function buildMessagesEmbed(list, userNames = {}) {
   const desc = list
     .map((m, i) => {
-      const who = m.user || userNames[m.uid] || m.username || m.displayName || '(unknown)';
-      const text = m.text?.length > 100 ? m.text.slice(0, 100) + '…' : m.text;
-      const when = m.time ? new Date(m.time).toLocaleString() : '';
-      return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${m.replies ? Object.keys(m.replies).length : 0}**`;
+      const who =
+        m.user ||
+        userNames[m.uid] ||
+        m.username ||
+        m.displayName ||
+        m.name ||
+        '(unknown)';
+
+      const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
+      const text = String(rawText).length > 100 ? String(rawText).slice(0, 100) + '…' : String(rawText) || null;
+
+      const whenMs = m.time ?? m.createdAt ?? m.timestamp ?? null;
+      const when = whenMs ? new Date(whenMs).toLocaleString() : '—';
+
+      const repliesCount = m.replies ? Object.keys(m.replies).length : 0;
+
+      return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${repliesCount}**`;
     })
     .join('\n\n');
 
@@ -450,21 +465,31 @@ function fmtTime(ms){
 }
 
 function buildMessageDetailEmbed(msg, nameMap = {}) {
-  const who = msg.user || nameMap[msg.uid] || msg.username || msg.displayName || '(unknown)';
+  const who =
+    msg.user ||
+    nameMap[msg.uid] ||
+    msg.username ||
+    msg.displayName ||
+    msg.name ||
+    '(unknown)';
+
+  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
+  const text = String(rawText) || '_no text_';
+
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
 
-  const e = new EmbedBuilder()
+  const whenMs = msg.time ?? msg.createdAt ?? msg.timestamp ?? null;
+
+  return new EmbedBuilder()
     .setTitle(`${who}`)
-    .setDescription((msg.text || '_no text_').toString().slice(0, 4096))
+    .setDescription(text.slice(0, 4096))
     .addFields(
       { name: 'Likes', value: String(likes), inline: true },
       { name: 'Replies', value: String(replies), inline: true },
     )
     .setColor(DEFAULT_EMBED_COLOR)
-    .setFooter({ text: `Posted ${fmtTime(msg.time)} • KC Bot • /messages` });
-
-  return e;
+    .setFooter({ text: `Posted ${whenMs ? new Date(whenMs).toLocaleString() : '—'} • KC Bot • /messages` });
 }
 
 function messageDetailRows(idx, list, path, hasReplies = true) {
@@ -503,13 +528,22 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
   const start = page*pageSize;
   const slice = children.slice(start, start+pageSize);
   const lines = slice.map((r,i)=>{
-    const who = r.user || nameMap[r.uid] || r.username || r.displayName || '(unknown)';
-    const txt = (r.text||'').toString().slice(0,120) || '(no text)';
+    const who =
+      r.user ||
+      nameMap[r.uid] ||
+      r.username ||
+      r.displayName ||
+      r.name ||
+      '(unknown)';
+    const raw = r.text ?? r.message ?? r.content ?? r.body ?? '';
+    const txt = String(raw).slice(0,120) || '(no text)';
     return `**${i+1}. ${who}** — ${txt}`;
   }).join('\n\n') || '_No replies yet_';
 
+  const parentWho = parent?.user || nameMap[parent?.uid] || parent?.username || parent?.displayName || parent?.name || '(unknown)';
+
   return new EmbedBuilder()
-    .setTitle(`Thread — ${nameMap[parent.uid]||parent.user||'(unknown)'}`)
+    .setTitle(`Thread — ${parentWho}`)
     .setDescription(lines)
     .setColor(DEFAULT_EMBED_COLOR)
     .setFooter({ text: `KC Bot • /messages` });
@@ -929,15 +963,12 @@ client.on('interactionCreate', async (interaction) => {
 
   // Acknowledge chat input commands fast (3-second rule)
   if (interaction.isChatInputCommand()) {
-    // Decide if this command should be ephemeral
-    const eph = new Set(['whoami','dumpme','syncavatar','post','postmessage','badges','messages','votingscores','leaderboard']).has(interaction.commandName);
-
     // Special case: /link — reply immediately (no defer), then return.
     if (interaction.commandName === 'link') {
       try {
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-        await interaction.reply({ content: `Click to link your account: ${url}`, flags: EPHEMERAL_FLAG });
+        await interaction.reply({ content: `Click to link your account: ${url}` });
       } catch (err) {
         console.warn('[link reply failed]', err?.rawError || err);
       }
@@ -945,7 +976,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     try {
-      await interaction.deferReply(eph ? { ephemeral: true } : {});
+      await interaction.deferReply(isEphemeralCommand(interaction.commandName) ? { ephemeral: true } : {});
       console.log(`[ACK] /${interaction.commandName} deferred`);
     } catch (err) {
       console.warn('[deferReply failed]', err?.rawError || err);
