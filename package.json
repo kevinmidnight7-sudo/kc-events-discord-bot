@@ -1,18 +1,21 @@
 {
   "name": "kc-events-discord-bot",
   "version": "1.0.0",
+  "private": true,
   "description": "Discord bot for KC Events that links users via OAuth, shows badges and handles unlinking.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18 <23"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
+    "express": "^4.19.2",
     "firebase-admin": "^11.10.0",
-    "express": "^4.19.2"
+    "dotenv": "^16.4.5"
   }
 }
