@@ -39,6 +39,8 @@ const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 
+const EPHEMERAL_FLAG = 64; // Discord message flag for ephemeral
+
 const EMOJI = {
   offence:  '<:red:1407696672229818579>',
   defence:  '<:blue:1407696743474139260>',
@@ -63,6 +65,10 @@ const DEFAULT_EMBED_COLOR = 0x2b2d31;
 const globalCache = {
   userNames: { data: {}, fetchedAt: 0 },
 };
+
+const isEphemeralCommand = (name) => new Set([
+  'whoami', 'dumpme', 'syncavatar', 'post'
+]).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -112,13 +118,8 @@ admin.initializeApp({
 const rtdb = admin.database();
 
 // ---------- Helpers ----------
-function isUnknownInteraction(err) {
-  return err?.code === 10062 || err?.rawError?.code === 10062;
-}
-
 function isPermsError(err) { return err?.code === 50013; }
 
-// New helper to catch all expired token errors
 function isExpiredToken(err) {
   return (
     err?.code === 10062 || // Unknown interaction
@@ -130,15 +131,18 @@ function isExpiredToken(err) {
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
+      // After defer/reply, use editReply
       return await interaction.editReply(data);
     } else {
-      return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
+      // If not yet acknowledged, send a reply.
+      // If caller wants ephemeral, pass flags: 64 in data.
+      return await interaction.reply(data);
     }
   } catch (err) {
+    // Token expired / unknown interaction / perms issues: try followUp (supports flags)
     if (isExpiredToken(err) || isPermsError(err)) {
       try {
-        // send a follow-up, always ephemeral to avoid spamming
-        return await interaction.followUp({ ...data, ephemeral: true });
+        return await interaction.followUp(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
       } catch {
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
@@ -149,6 +153,7 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
     throw err;
   }
 }
+
 
 // --- Promise timeout wrapper so we never hang indefinitely
 function withTimeout(promise, ms, label = 'operation') {
@@ -909,11 +914,15 @@ client.on('interactionCreate', async (interaction) => {
       const start = process.env.AUTH_BRIDGE_START_URL;
       const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
       // This command is simple and doesn't need deferral
-      return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
+      return interaction.reply({ content: `Click to link your account: ${url}`, flags: EPHEMERAL_FLAG });
     }
 
     // Defer all other commands immediately
-    await interaction.deferReply({ ephemeral: ['whoami', 'dumpme', 'syncavatar', 'post'].includes(commandName) });
+    await interaction.deferReply(
+      isEphemeralCommand(commandName)
+        ? { flags: EPHEMERAL_FLAG }
+        : {}
+    );
 
     if (commandName === 'whoami') {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
@@ -1133,7 +1142,6 @@ client.on('interactionCreate', async (interaction) => {
             `• **Caption:** ${caption || '(none)'}`,
             publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
           ].join('\n'),
-          ephemeral: false
         });
     }
 
@@ -1144,7 +1152,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.replied || interaction.deferred) {
         await interaction.editReply({ content: msg, embeds: [], components: [] });
       } else {
-        await interaction.reply({ content: msg, ephemeral: true });
+        await interaction.reply({ content: msg, flags: EPHEMERAL_FLAG });
       }
     } catch (e) {
       console.error('Failed to send error reply:', e);
