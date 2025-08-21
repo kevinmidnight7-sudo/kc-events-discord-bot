@@ -363,71 +363,54 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
   return results;
 }
 
-function snapshotToArray(snap) {
-  const arr = [];
-  if (snap?.exists()) {
-    snap.forEach(c => arr.push({ key: c.key, ...(c.val() || {}) }));
-    arr.sort((a, b) => (b.time || 0) - (a.time || 0));
-  }
-  return arr;
-}
-
 // Latest N messageboard messages (defensive: over-fetch then trim)
 async function fetchLatestMessages(limit = 10) {
-  const OVERFETCH = Math.max(limit * 3, 30); // grab more, sort, then trim
-  try {
-    const snap = await withTimeout(
-      rtdb.ref('messages').orderByChild('time').limitToLast(OVERFETCH).get(),
-      5000,
-      'RTDB messages recent'
-    );
-    const arr = snapshotToArray(snap).slice(0, limit).map(m => ({
-      ...m,
-      path: `messages/${m.key}`,
-    }));
-    return arr;
-  } catch (e) {
-    if (String(e?.message || '').includes('Index not defined')) {
-      console.warn('[fetchLatestMessages] Index missing, using unordered fallback.');
-      const snap = await withTimeout(
-        rtdb.ref('messages').limitToLast(OVERFETCH).get(),
-        5000,
-        'RTDB messages fallback'
-      );
-      // sort by time desc if present, else by key desc, then trim
-      const arr = snapshotToArray(snap).slice(0, limit).map(m => ({
-        ...m,
-        path: `messages/${m.key}`,
-      }));
-      return arr;
-    }
-    throw e;
+  const OVERFETCH = Math.max(limit * 6, 60); // grab extra, then sort & trim
+  // 1) Read without orderByChild so we don't filter out items missing "time"
+  const snap = await withTimeout(
+    rtdb.ref('messages').limitToLast(OVERFETCH).get(),
+    5000,
+    'RTDB messages latest-by-key'
+  );
+
+  const list = [];
+  if (snap.exists()) {
+    snap.forEach(child => {
+      const v = child.val() || {};
+      // best-effort timestamp + text normalization
+      const when = v.time ?? v.createdAt ?? v.timestamp ?? v.ts ?? 0;
+      const text = v.text ?? v.message ?? v.content ?? v.body ?? '';
+      const who  = v.user ?? v.username ?? v.displayName ?? v.name ?? null;
+
+      list.push({
+        key: child.key,
+        path: `messages/${child.key}`,
+        // keep all original fields too
+        ...v,
+        // normalized helpers used by the embed
+        _when: Number(when) || 0,
+        _text: String(text),
+        _who:  who,
+      });
+    });
   }
+
+  // 2) Sort newest first using the normalized timestamp, then fallback to push-key recency
+  list.sort((a, b) => b._when - a._when);
+
+  // 3) Trim & return
+  return list.slice(0, limit);
 }
 
 // Build an embed showing a page of 10 messages (title, text, reply count)
-function buildMessagesEmbed(list, userNames = {}) {
-  const desc = list
-    .map((m, i) => {
-      const who =
-        m.user ||
-        userNames[m.uid] ||
-        m.username ||
-        m.displayName ||
-        m.name ||
-        '(unknown)';
-
-      const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
-      const text = String(rawText).length > 100 ? String(rawText).slice(0, 100) + '…' : String(rawText) || null;
-
-      const whenMs = m.time ?? m.createdAt ?? m.timestamp ?? null;
-      const when = whenMs ? new Date(whenMs).toLocaleString() : '—';
-
-      const repliesCount = m.replies ? Object.keys(m.replies).length : 0;
-
-      return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${repliesCount}**`;
-    })
-    .join('\n\n');
+function buildMessagesEmbed(list, nameMap = {}) {
+  const desc = list.map((m, i) => {
+    const who = m._who || nameMap[m.uid] || '(unknown)';
+    const when = m._when ? new Date(m._when).toLocaleString() : '—';
+    const text = m._text?.length > 100 ? m._text.slice(0, 100) + '…' : (m._text || null);
+    const replies = m.replies ? Object.keys(m.replies).length : 0;
+    return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${replies}**`;
+  }).join('\n\n');
 
   return new EmbedBuilder()
     .setTitle('Messageboard — latest 10')
@@ -465,31 +448,21 @@ function fmtTime(ms){
 }
 
 function buildMessageDetailEmbed(msg, nameMap = {}) {
-  const who =
-    msg.user ||
-    nameMap[msg.uid] ||
-    msg.username ||
-    msg.displayName ||
-    msg.name ||
-    '(unknown)';
-
-  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
-  const text = String(rawText) || '_no text_';
-
+  const who = msg._who || nameMap[msg.uid] || '(unknown)';
+  const when = msg._when ? new Date(msg._when).toLocaleString() : '—';
+  const text = msg._text || '_no text_';
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
 
-  const whenMs = msg.time ?? msg.createdAt ?? msg.timestamp ?? null;
-
   return new EmbedBuilder()
-    .setTitle(`${who}`)
+    .setTitle(who)
     .setDescription(text.slice(0, 4096))
     .addFields(
       { name: 'Likes', value: String(likes), inline: true },
       { name: 'Replies', value: String(replies), inline: true },
     )
     .setColor(DEFAULT_EMBED_COLOR)
-    .setFooter({ text: `Posted ${whenMs ? new Date(whenMs).toLocaleString() : '—'} • KC Bot • /messages` });
+    .setFooter({ text: `Posted ${when} • KC Bot • /messages` });
 }
 
 function messageDetailRows(idx, list, path, hasReplies = true) {
@@ -1416,12 +1389,14 @@ client.on('interactionCreate', async (interaction) => {
       const nameMap = await getAllUserNames();
       const userName = nameMap[uid] || interaction.user.username;
       const text = interaction.options.getString('text');
-
+      const now = Date.now();
+      
       const message = {
         text,
         uid,
         user: userName,
-        time: admin.database.ServerValue.TIMESTAMP,
+        time: now,
+        createdAt: now,
       };
 
       await rtdb.ref('messages').push(message);
