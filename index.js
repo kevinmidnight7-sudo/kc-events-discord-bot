@@ -33,6 +33,9 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -127,6 +130,9 @@ function isExpiredToken(err) {
     err?.status === 401    // Unauthorized (same effect)
   );
 }
+
+function encPath(p){ return String(p).replace(/\//g, '|'); }
+function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
@@ -368,7 +374,10 @@ async function fetchLatestMessages(limit = 10) {
       5000,
       'RTDB messages recent'
     );
-    const arr = snapshotToArray(snap).slice(0, limit);
+    const arr = snapshotToArray(snap).slice(0, limit).map(m => ({
+      ...m,
+      path: `messages/${m.key}`,
+    }));
     return arr;
   } catch (e) {
     if (String(e?.message || '').includes('Index not defined')) {
@@ -379,7 +388,10 @@ async function fetchLatestMessages(limit = 10) {
         'RTDB messages fallback'
       );
       // sort by time desc if present, else by key desc, then trim
-      const arr = snapshotToArray(snap).slice(0, limit);
+      const arr = snapshotToArray(snap).slice(0, limit).map(m => ({
+        ...m,
+        path: `messages/${m.key}`,
+      }));
       return arr;
     }
     throw e;
@@ -426,28 +438,100 @@ function messageIndexRows(count) {
   return rows;
 }
 
-function buildRepliesEmbed(message, userNames = {}) {
-  const who = userNames[message.uid] || message.user || '(unknown)';
-  const title = `Replies — ${who}: ${(message.text || '').toString().slice(0, 60)}`;
-  const replies = Object.entries(message.replies || {});
-  const lines = replies.map(([key, r]) => {
-    const name = userNames[r.uid] || r.user || '(unknown)';
-    return `• **${name}**: ${(r.text || '').toString().slice(0, 180)}`;
-  });
+function fmtTime(ms){
+  const d = new Date(ms || Date.now());
+  return d.toLocaleString();
+}
+
+function buildMessageDetailEmbed(msg, nameMap = {}) {
+  const who = nameMap[msg.uid] || msg.user || '(unknown)';
+  const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
+  const replies = msg.replies ? Object.keys(msg.replies).length : 0;
+
+  const e = new EmbedBuilder()
+    .setTitle(`${who}`)
+    .setDescription((msg.text || '_no text_').toString().slice(0, 4096))
+    .addFields(
+      { name: 'Likes', value: String(likes), inline: true },
+      { name: 'Replies', value: String(replies), inline: true },
+    )
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: `Posted ${fmtTime(msg.time)} • KC Bot • /messages` });
+
+  return e;
+}
+
+function messageDetailRows(idx, list, path) {
+  const max = list.length - 1;
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`msg:openIdx:${Math.max(idx-1,0)}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(idx<=0),
+      new ButtonBuilder().setCustomId(`msg:openIdx:${Math.min(idx+1,max)}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(idx>=max),
+      new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`msg:refreshOne:${idx}`).setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`msg:like:${encPath(path)}`).setLabel('❤️ Like/Unlike').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
+    ),
+  ];
+}
+
+async function loadNode(path) {
+  const snap = await withTimeout(rtdb.ref(path).get(), 4000, `RTDB ${path}`);
+  return snap.exists() ? { key: path.split('/').slice(-1)[0], path, ...(snap.val()||{}) } : null;
+}
+
+async function loadReplies(path) {
+  const snap = await withTimeout(rtdb.ref(`${path}/replies`).get(), 4000, `RTDB ${path}/replies`);
+  const list = [];
+  if (snap.exists()) {
+    snap.forEach(c => list.push({ key: c.key, path: `${path}/replies/${c.key}`, ...(c.val()||{}) }));
+    list.sort((a,b)=>(b.time||0)-(a.time||0));
+  }
+  return list;
+}
+
+function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
+  const start = page*pageSize;
+  const slice = children.slice(start, start+pageSize);
+  const lines = slice.map((r,i)=>{
+    const who = nameMap[r.uid] || r.user || '(unknown)';
+    const txt = (r.text||'').toString().slice(0,120) || '(no text)';
+    return `**${i+1}. ${who}** — ${txt}`;
+  }).join('\n\n') || '_No replies yet_';
 
   return new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(lines.join('\n') || '_No replies yet_')
+    .setTitle(`Thread — ${nameMap[parent.uid]||parent.user||'(unknown)'}`)
+    .setDescription(lines)
     .setColor(DEFAULT_EMBED_COLOR)
-    .setFooter({ text: 'KC Bot • /messages' });
+    .setFooter({ text: `KC Bot • /messages` });
 }
 
-function repliesNavRow(idx) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('msg:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`msg:refreshOne:${idx}`).setLabel('Refresh').setStyle(ButtonStyle.Primary)
-  );
+function threadRows(parentPath, children, page=0, pageSize=10) {
+  const maxPage = Math.max(0, Math.ceil(children.length/pageSize)-1);
+  const start = page*pageSize;
+  const rowNums = new ActionRowBuilder();
+  for (let i=0;i<Math.min(children.length-start,5);i++){
+    rowNums.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`msg:openChild:${encPath(children[start+i].path)}`)
+        .setLabel(String(i+1))
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return [
+    rowNums,
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
+      new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
+      new ButtonBuilder().setCustomId(`msg:openPath:${encPath(parentPath)}`).setLabel('Back to message').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
+
 
 // Votes -> scores
 async function loadVoteScores() {
@@ -846,45 +930,134 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (interaction.customId.startsWith('msg:')) {
+      const invokerId = interaction.message.interaction?.user?.id;
+      if (invokerId && invokerId !== interaction.user.id) {
+        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+      }
       try {
         await interaction.deferUpdate();
-        const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
-        const action = parts[1];
-
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
-        let cache = interaction.client.msgCache.get(key);
-
-        if (!cache) {
+        let state = interaction.client.msgCache.get(key);
+    
+        // If cache is gone (message aged out), rebuild it
+        if (!state) {
           const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-          cache = { list, nameMap };
-          interaction.client.msgCache.set(key, cache);
+          state = { list, nameMap };
+          interaction.client.msgCache.set(key, state);
         }
-
-        if (action === 'view') {
-          const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
-          const msg = cache.list[idx];
-          const embed = buildRepliesEmbed(msg, cache.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
-        } else if (action === 'back') {
-          const embed = buildMessagesEmbed(cache.list, cache.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
-        } else if (action === 'refresh') {
-          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-          interaction.client.msgCache.set(key, { list, nameMap });
-          const embed = buildMessagesEmbed(list, nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
-        } else if (action === 'refreshOne') {
-          const idx = parseInt(parts[2] || '0', 10);
-          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-          interaction.client.msgCache.set(key, { list, nameMap });
-          const msg = list[idx] || list[0];
-          const embed = buildRepliesEmbed(msg, nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+    
+        const [ns, action, a, b] = interaction.customId.split(':'); // msg:<action>:...
+    
+        // 1) Show detail for index from the list
+        if (action === 'view' || action === 'openIdx') {
+          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
+          const msg = state.list[idx];
+          const fresh = await loadNode(msg.path); // pull latest likes/replies counts
+          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
         }
+    
+        // 2) Back to index list
+        else if (action === 'back') {
+          const embed = buildMessagesEmbed(state.list, state.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
+        }
+    
+        // 3) Refresh a single detail (keep idx in button)
+        else if (action === 'refreshOne') {
+          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
+          const msg = state.list[idx];
+          const fresh = await loadNode(msg.path);
+          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
+        }
+    
+        // 4) Open detail by absolute path (used when coming “up” from a thread)
+        else if (action === 'openPath') {
+          const path = decPath(a);
+          const idx = state.list.findIndex(m=>m.path===path);
+          const base = idx>=0 ? state.list[idx] : await loadNode(path);
+          const fresh = await loadNode(path);
+          const embed = buildMessageDetailEmbed({ ...(base||{}), ...(fresh||{}) }, state.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path) });
+        }
+    
+        // 5) Thread view (pageable)
+        else if (action === 'thread') {
+          const path = decPath(a);
+          const page = parseInt(b||'0',10) || 0;
+          const parent = await loadNode(path);
+          const children = await loadReplies(path);
+          const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
+        }
+    
+        // 6) Open a child reply as its own message (so you can like/reply to replies)
+        else if (action === 'openChild') {
+          const path = decPath(a);
+          const node = await loadNode(path);
+          const embed = buildMessageDetailEmbed(node, state.nameMap);
+          // Build rows against this path, but Prev/Next don’t apply (we don’t know siblings from list); just show thread controls:
+          const rows = [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId(`msg:openPath:${encPath(path.split('/replies/').slice(0,-1).join('/replies/'))}`).setLabel('Up one level').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
+            ),
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`msg:like:${encPath(path)}`).setLabel('❤️ Like/Unlike').setStyle(ButtonStyle.Primary),
+              new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
+            ),
+          ];
+          await safeEdit(interaction, { embeds: [embed], components: rows });
+        }
+    
+        // 7) Like/unlike (mirrors website logic)
+        else if (action === 'like') {
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) return await safeEdit(interaction, { content: 'Link your KC account first with /link.', components: [] });
+    
+          const path = decPath(a);
+          // read if liked
+          const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
+          const wasLiked = likedSnap.exists();
+    
+          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
+          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
+    
+          // Refresh current node
+          const node = await loadNode(path);
+          const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
+          // If this was a list item, try to update cached copy too
+          if (state) {
+            const i = state.list.findIndex(m=>m.path===path);
+            if (i>=0) state.list[i] = { ...state.list[i], ...node };
+          }
+          await safeEdit(interaction, { embeds: [embed] });
+        }
+    
+        // 8) Reply — show a modal
+        else if (action === 'reply') {
+          const path = decPath(a);
+          const modal = new ModalBuilder()
+            .setCustomId(`msg:replyModal:${encPath(path)}`)
+            .setTitle('Reply to message');
+    
+          const input = new TextInputBuilder()
+            .setCustomId('replyText')
+            .setLabel('Your reply')
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(500);
+    
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          return await interaction.showModal(modal);
+        }
+    
       } catch (e) {
         console.error('msg button error:', e);
-        await safeEdit(interaction, { content: 'Sorry — messages couldn’t refresh right now.', components: [] });
+        await safeEdit(interaction, { content: 'Sorry — could not update messages right now.', components: [] });
       }
     }
     else if (interaction.customId === 'votes:refresh') {
@@ -902,6 +1075,37 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('msg:replyModal:')) {
+    try {
+      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
+      const path = decPath(interaction.customId.split(':')[2]);
+      const text = interaction.fields.getTextInputValue('replyText').trim();
+      if (!text) return interaction.editReply('Reply can’t be empty.');
+  
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+  
+      // Resolve a display name (same source your site uses)
+      let nameMap = await getAllUserNames();
+      const userName = nameMap[uid] || interaction.user.username;
+  
+      const reply = {
+        user: userName,
+        uid,
+        text,
+        time: admin.database.ServerValue.TIMESTAMP,
+      };
+  
+      await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
+  
+      await interaction.editReply('✅ Reply posted!');
+    } catch (e) {
+      console.error('reply modal error:', e);
+      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', flags: EPHEMERAL_FLAG });
+    }
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -1016,9 +1220,10 @@ client.on('interactionCreate', async (interaction) => {
     }
     else if (commandName === 'messages') {
         const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-        const embed = buildMessagesEmbed(list, nameMap);
         interaction.client.msgCache ??= new Map();
         interaction.client.msgCache.set(interaction.id, { list, nameMap });
+        // Show the list first (numbers 1..10 + Refresh) as you do today:
+        const embed = buildMessagesEmbed(list, nameMap);
         await interaction.editReply({ embeds: [embed], components: messageIndexRows(list.length || 0) });
     }
     else if (commandName === 'votingscores') {
