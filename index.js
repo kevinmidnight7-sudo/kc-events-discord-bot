@@ -146,18 +146,14 @@ function decPath(s){ return String(s).replace(/\|/g, '/'); }
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
-      // After defer/reply, use editReply
       return await interaction.editReply(data);
     } else {
-      // If not yet acknowledged, send a reply.
-      // If caller wants ephemeral, pass flags: 64 in data.
-      return await interaction.reply(data);
+      return await interaction.reply(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
     }
   } catch (err) {
-    // Token expired / unknown interaction / perms issues: try followUp (supports flags)
     if (isExpiredToken(err) || isPermsError(err)) {
       try {
-        return await interaction.followUp(data.ephemeral === undefined ? { ...data, ephemeral: true } : data);
+        return await interaction.followUp(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
       } catch {
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
@@ -924,22 +920,38 @@ async function registerCommands() {
 
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
-  try {
-    if (interaction.isChatInputCommand()) {
-      const eph = isEphemeralCommand(interaction.commandName);
-      await interaction.deferReply(eph ? { ephemeral: true } : {});
-      console.log(`[ACK] /${interaction.commandName} deferred`);
-    }
-  } catch (err) {
-    console.warn('[deferReply failed]', err?.rawError || err);
-    return; // if we didn’t ack, bail out — otherwise Discord shows “did not respond”
-  }
-
+  // Log first (non-blocking)
   try {
     const tag = interaction.user?.tag ?? 'unknown';
     const name = interaction.isChatInputCommand() ? interaction.commandName : interaction.customId;
     console.log(`[INT] ${name} from ${tag} (${interaction.user?.id}) at ${new Date().toISOString()}`);
   } catch (_) {}
+
+  // Acknowledge chat input commands fast (3-second rule)
+  if (interaction.isChatInputCommand()) {
+    // Decide if this command should be ephemeral
+    const eph = new Set(['whoami','dumpme','syncavatar','post','postmessage','badges','messages','votingscores','leaderboard']).has(interaction.commandName);
+
+    // Special case: /link — reply immediately (no defer), then return.
+    if (interaction.commandName === 'link') {
+      try {
+        const start = process.env.AUTH_BRIDGE_START_URL;
+        const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
+        await interaction.reply({ content: `Click to link your account: ${url}`, flags: EPHEMERAL_FLAG });
+      } catch (err) {
+        console.warn('[link reply failed]', err?.rawError || err);
+      }
+      return;
+    }
+
+    try {
+      await interaction.deferReply(eph ? { ephemeral: true } : {});
+      console.log(`[ACK] /${interaction.commandName} deferred`);
+    } catch (err) {
+      console.warn('[deferReply failed]', err?.rawError || err);
+      return; // if we didn’t ack, stop to avoid “did not respond”
+    }
+  }
 
   if (interaction.isButton()) {
     // Button handlers can remain largely the same, but we'll use safeEdit for consistency
@@ -966,7 +978,7 @@ client.on('interactionCreate', async (interaction) => {
     else if (interaction.customId.startsWith('msg:')) {
       const invokerId = interaction.message.interaction?.user?.id;
       if (invokerId && invokerId !== interaction.user.id) {
-        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
       }
     
       try {
@@ -1129,7 +1141,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply('✅ Reply posted!');
     } catch (e) {
       console.error('reply modal error:', e);
-      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', ephemeral: true });
+      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', flags: EPHEMERAL_FLAG });
     }
   }
 
@@ -1138,12 +1150,6 @@ client.on('interactionCreate', async (interaction) => {
   // Centralized error handler for all slash commands
   try {
     const { commandName } = interaction;
-
-    if (commandName === 'link') {
-      const start = process.env.AUTH_BRIDGE_START_URL;
-      const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-      return await interaction.editReply({ content: `Click to link your account: ${url}` });
-    }
     
     if (commandName === 'whoami') {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
@@ -1395,7 +1401,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.replied || interaction.deferred) {
         await interaction.editReply({ content: msg, embeds: [], components: [] });
       } else {
-        await interaction.reply({ content: msg, ephemeral: true });
+        await interaction.reply({ content: msg, flags: EPHEMERAL_FLAG });
       }
     } catch (e) {
       console.error('Failed to send error reply:', e);
