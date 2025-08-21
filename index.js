@@ -71,7 +71,7 @@ const LB = {
   PAGE_SIZE: 10,
 };
 
-const DEFAULT_EMBED_COLOR = 0x2b2d31;
+const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
@@ -418,8 +418,14 @@ async function fetchLatestMessages(limit = 10) {
 // Build an embed showing a page of 10 messages (title, text, reply count)
 function buildMessagesEmbed(list, nameMap = {}) {
   const desc = list.map((m, i) => {
-    const who = m._who || nameMap[m.uid] || '(unknown)';
-    const when = m._when ? new Date(m._when).toLocaleString() : '—';
+    const who =
+      m.user ||
+      nameMap[m.uid] ||
+      m.username ||
+      m.displayName ||
+      m.name ||
+      '(unknown)';
+    const when = m.time ? new Date(m.time).toLocaleString() : '—';
     const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
     const textStr = String(rawText || '');
     const text = textStr.length > 100 ? textStr.slice(0, 100) + '…' : (textStr || null);
@@ -463,8 +469,14 @@ function fmtTime(ms){
 }
 
 function buildMessageDetailEmbed(msg, nameMap = {}) {
-  const who = msg._who || nameMap[msg.uid] || '(unknown)';
-  const when = msg._when ? new Date(msg._when).toLocaleString() : '—';
+  const who =
+    msg.user ||
+    nameMap[msg.uid] ||
+    msg.username ||
+    msg.displayName ||
+    msg.name ||
+    '(unknown)';
+  const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
   const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
@@ -552,16 +564,33 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
         .setStyle(ButtonStyle.Secondary)
     );
   }
-  if (numRow.components.length) rows.push(numRow); // <- only add if non-empty
+  if (numRow.components.length) rows.push(numRow);
 
-  rows.push(
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
-      new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
-      new ButtonBuilder().setCustomId(`msg:openPath:${encPath(parentPath)}`).setLabel('Back to message').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
-    )
+  const ctrl = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`msg:threadPrev:${encPath(parentPath)}:${Math.max(page-1,0)}`)
+      .setLabel('◀ Page')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page<=0),
+
+    new ButtonBuilder()
+      .setCustomId(`msg:threadNext:${encPath(parentPath)}:${Math.min(page+1,maxPage)}`)
+      .setLabel('Page ▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page>=maxPage),
+
+    new ButtonBuilder()
+      .setCustomId(`msg:openPath:${encPath(parentPath)}`)
+      .setLabel('Back to message')
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId('msg:back')
+      .setLabel('Back to list')
+      .setStyle(ButtonStyle.Secondary),
   );
+
+  rows.push(ctrl);
   return rows;
 }
 
@@ -1050,7 +1079,9 @@ client.on('interactionCreate', async (interaction) => {
 
   // Acknowledge chat input commands fast (3-second rule)
   if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === 'link') {
+    const name = interaction.commandName;
+
+    if (name === 'link') {
       try {
         if (!process.env.AUTH_BRIDGE_START_URL) {
           return interaction.reply({ content: 'Linking is not configured.', flags: 64 });
@@ -1064,12 +1095,14 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    try {
-      const ephemeral = isEphemeralCommand(interaction.commandName);
-      await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
-    } catch (err) {
-      console.warn('[deferReply failed]', err?.rawError || err);
-      return;
+    if (name !== 'vote') {
+      try {
+        const ephemeral = isEphemeralCommand(name);
+        await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
+      } catch (err) {
+        console.warn('[deferAndPing failed]', err?.rawError || err);
+        return;
+      }
     }
   }
 
@@ -1169,7 +1202,7 @@ client.on('interactionCreate', async (interaction) => {
           const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
           return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
-        if (action === 'thread') {
+        if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
           const path = decPath(a);
           const page = parseInt(b||'0',10) || 0;
           const parent = await loadNode(path);
@@ -1232,17 +1265,17 @@ client.on('interactionCreate', async (interaction) => {
         await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
       }
     } else if (interaction.customId.startsWith('vote:change:')) {
-      const key = interaction.customId.split(':')[2];
+      const uid = interaction.customId.split(':')[2];
       await interaction.deferUpdate(); // ack the button
       // Load that vote for defaults
-      const snap = await withTimeout(rtdb.ref(`votes/${key}`).get(), 4000, `RTDB votes/${key}`);
+      const snap = await withTimeout(rtdb.ref(`votes/${uid}`).get(), 4000, `RTDB votes/${uid}`);
       const v = snap.exists() ? snap.val() : {};
       return showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
     } else if (interaction.customId.startsWith('vote:delete:')) {
-      const key = interaction.customId.split(':')[2];
+      const uid = interaction.customId.split(':')[2];
       await interaction.deferUpdate();
       try {
-        await withTimeout(rtdb.ref(`votes/${key}`).remove(), 4000, `delete vote ${key}`);
+        await withTimeout(rtdb.ref(`votes/${uid}`).remove(), 4000, `delete vote ${uid}`);
         await safeEdit(interaction, { content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
       } catch (e) {
         await safeEdit(interaction, { content: 'Failed to delete your vote, try again.', components: [] });
@@ -1601,22 +1634,22 @@ client.on('interactionCreate', async (interaction) => {
           'Full Messageboard : https://kcevents.uk/#chatscroll',
           'Full Clips       : https://kcevents.uk/#socialfeed',
           'Full Voting      : https://kcevents.uk/#voting',
-        ].join('\n')
+        ].join('\n'),
+        flags: EPHEMERAL_FLAG
       });
     }
     else if (commandName === 'vote') {
       const discordId = interaction.user.id;
       const uid = await getKCUidForDiscord(discordId);
-      if (!uid) return interaction.editReply('Link your KC account first with /link.');
+      if (!uid) return interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
 
       if (!(await userIsVerified(uid))) {
-        return interaction.editReply('You must verify your email on KC before voting.');
+        return interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
       }
 
-      // If user already voted, offer to change/delete
-      const existing = await getExistingVotesBy(uid);
-      if (existing.length) {
-        const v = existing[existing.length - 1]; // latest (site doesn’t prevent multiples)
+      const existingSnap = await rtdb.ref(`votes/${uid}`).get();
+      if (existingSnap.exists()) {
+        const v = existingSnap.val() || {};
         const embed = new EmbedBuilder()
           .setTitle('You already have a vote')
           .setDescription([
@@ -1627,14 +1660,13 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR);
 
         const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`vote:change:${v.key}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`vote:delete:${v.key}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
         );
 
-        return interaction.editReply({ embeds:[embed], components:[row] });
+        return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
       }
 
-      // No existing vote — open modal immediately (initial response must be a modal)
       return showVoteModal(interaction);
     }
     else if (commandName === 'compare') {
@@ -1713,7 +1745,7 @@ client.on('interactionCreate', async (interaction) => {
 
 
 // ---------- Startup ----------
-client.once('clientReady', () => {
+client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
