@@ -151,12 +151,12 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
       return await interaction.reply(data);
     }
   } catch (err) {
+    console.warn('[safeEdit] primary edit/reply failed', err);
     if (isExpiredToken(err) || isPermsError(err)) {
       try {
-        // IMPORTANT: do NOT force ephemeral here
-        // If you want a followUp to be ephemeral, pass flags: 64 in `data`.
         return await interaction.followUp(data);
-      } catch {
+      } catch (e2) {
+        console.warn('[safeEdit] followUp failed', e2);
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
         }
@@ -167,9 +167,19 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
   }
 }
 
+// Stop swallowing the first edit error after defer.
 async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Working…' } = {}) {
-  await interaction.deferReply(ephemeral ? { ephemeral: true } : {});
-  try { await interaction.editReply({ content: text }); } catch {}
+  try {
+    await interaction.deferReply(ephemeral ? { ephemeral: true } : {});
+  } catch (e) {
+    console.warn('[deferReply failed]', e);
+    throw e; // important
+  }
+  try {
+    await interaction.editReply({ content: text });
+  } catch (e) {
+    console.warn('[editReply after defer failed]', e); // don’t swallow
+  }
 }
 
 function startReplyWatchdog(interaction, ms = 5000) {
@@ -1084,20 +1094,21 @@ client.on('interactionCreate', async (interaction) => {
     if (name === 'link') {
       try {
         if (!process.env.AUTH_BRIDGE_START_URL) {
-          return interaction.reply({ content: 'Linking is not configured.', flags: 64 });
+          return interaction.reply({ content: 'Linking is not configured.', ephemeral: true });
         }
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-        await interaction.reply({ content: `Click to link your account: ${url}`, flags: 64 });
+        await interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
       } catch (err) {
         console.warn('[link reply failed]', err?.rawError || err);
       }
       return;
     }
 
+    // Don’t defer when you’re going to open a modal.
     if (name !== 'vote') {
       try {
-        const ephemeral = isEphemeralCommand(name);
+        const ephemeral = isEphemeralCommand(name) || name === 'help';
         await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
       } catch (err) {
         console.warn('[deferAndPing failed]', err?.rawError || err);
@@ -1131,7 +1142,7 @@ client.on('interactionCreate', async (interaction) => {
     else if (interaction.customId.startsWith('msg:')) {
       const invokerId = interaction.message.interaction?.user?.id;
       if (invokerId && invokerId !== interaction.user.id) {
-        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
       }
     
       try {
@@ -1160,7 +1171,8 @@ client.on('interactionCreate', async (interaction) => {
             .setMaxLength(500);
     
           modal.addComponents(new ActionRowBuilder().addComponents(input));
-          return await interaction.showModal(modal);
+          await interaction.showModal(modal);
+          return; // Always return after a modal
         }
     
         // ✅ Everything else can be safely deferred
@@ -1266,11 +1278,11 @@ client.on('interactionCreate', async (interaction) => {
       }
     } else if (interaction.customId.startsWith('vote:change:')) {
       const uid = interaction.customId.split(':')[2];
-      await interaction.deferUpdate(); // ack the button
-      // Load that vote for defaults
+      // Do not defer before showing a modal
       const snap = await withTimeout(rtdb.ref(`votes/${uid}`).get(), 4000, `RTDB votes/${uid}`);
       const v = snap.exists() ? snap.val() : {};
-      return showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
+      await showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
+      return; // Return after modal
     } else if (interaction.customId.startsWith('vote:delete:')) {
       const uid = interaction.customId.split(':')[2];
       await interaction.deferUpdate();
@@ -1376,6 +1388,7 @@ client.on('interactionCreate', async (interaction) => {
         } catch {}
       }
     }
+    return;
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -1635,16 +1648,19 @@ client.on('interactionCreate', async (interaction) => {
           'Full Clips       : https://kcevents.uk/#socialfeed',
           'Full Voting      : https://kcevents.uk/#voting',
         ].join('\n'),
-        flags: EPHEMERAL_FLAG
       });
     }
     else if (commandName === 'vote') {
       const discordId = interaction.user.id;
       const uid = await getKCUidForDiscord(discordId);
-      if (!uid) return interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
+      if (!uid) {
+        await interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
+        return;
+      }
 
       if (!(await userIsVerified(uid))) {
-        return interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
+        await interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
+        return;
       }
 
       const existingSnap = await rtdb.ref(`votes/${uid}`).get();
@@ -1664,10 +1680,12 @@ client.on('interactionCreate', async (interaction) => {
           new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
         );
 
-        return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+        await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+        return;
       }
 
-      return showVoteModal(interaction);
+      await showVoteModal(interaction);
+      return;
     }
     else if (commandName === 'compare') {
       const youDiscordId = interaction.user.id;
@@ -1728,16 +1746,8 @@ client.on('interactionCreate', async (interaction) => {
 
   } catch (err) {
     console.error(`Error handling command ${interaction.commandName}:`, err);
-    const msg = 'Sorry, something went wrong.';
-    try {
-      if (interaction.replied || interaction.deferred) {
-        await interaction.editReply({ content: msg, embeds: [], components: [] });
-      } else {
-        await interaction.reply({ content: msg, flags: EPHEMERAL_FLAG });
-      }
-    } catch (e) {
-      console.error('Failed to send error reply:', e);
-    }
+    // Use safeEdit everywhere for error replies
+    await safeEdit(interaction, { content: 'Sorry, something went wrong.', embeds: [], components: [] });
   } finally {
     stopWatch();
   }
