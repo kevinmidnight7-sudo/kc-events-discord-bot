@@ -21,6 +21,9 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
 
+// 1) Make sure only ONE bot instance is running
+console.log('Instance:', process.env.RENDER_INSTANCE_ID || 'local');
+
 console.log('ENV sanity', {
   hasToken: !!process.env.DISCORD_BOT_TOKEN,
   hasClient: !!process.env.DISCORD_CLIENT_ID,
@@ -80,7 +83,7 @@ const globalCache = {
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme']).has(name);
+  new Set(['whoami', 'dumpme', 'help']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -163,22 +166,20 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
       }
       return null;
     }
+    // For other errors, we re-throw so the centralized handler can catch it.
     throw err;
   }
 }
 
-// Stop swallowing the first edit error after defer.
+// 4) Tighten your “defer then ping” helper
 async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Working…' } = {}) {
-  try {
-    await interaction.deferReply(ephemeral ? { ephemeral: true } : {});
-  } catch (e) {
-    console.warn('[deferReply failed]', e);
-    throw e; // important
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply(ephemeral ? { ephemeral: true } : {}); // throw if it fails
   }
   try {
     await interaction.editReply({ content: text });
   } catch (e) {
-    console.warn('[editReply after defer failed]', e); // don’t swallow
+    console.warn('[editReply after defer failed]', e);
   }
 }
 
@@ -1078,74 +1079,410 @@ async function registerCommands() {
   }
 }
 
+// 2) Guard against duplicate deliveries in-process
+const seen = new Set();
+setInterval(() => seen.clear(), 60_000);
+
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
-  // Log first (non-blocking)
+  // De-dupe
+  const id = interaction.id;
+  if (seen.has(id)) {
+    console.warn(`[INT] duplicate seen: ${id}`);
+    return;
+  }
+  seen.add(id);
+
   try {
-    const tag = interaction.user?.tag ?? 'unknown';
+    // Log with age
     const name = interaction.isChatInputCommand() ? interaction.commandName : interaction.customId;
-    console.log(`[INT] ${name} from ${tag} (${interaction.user?.id}) at ${new Date().toISOString()}`);
-  } catch (_) {}
+    console.log(`[INT] ${name} from ${interaction.user?.tag} age=${Date.now()-interaction.createdTimestamp}ms`);
 
-  // Acknowledge chat input commands fast (3-second rule)
-  if (interaction.isChatInputCommand()) {
-    const name = interaction.commandName;
-
-    if (name === 'link') {
-      try {
+    // --- Immediate Reply/Modal Commands (no defer) ---
+    if (interaction.isChatInputCommand()) {
+      const commandName = interaction.commandName;
+      if (commandName === 'link') {
         if (!process.env.AUTH_BRIDGE_START_URL) {
           return interaction.reply({ content: 'Linking is not configured.', ephemeral: true });
         }
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
         await interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
-      } catch (err) {
-        console.warn('[link reply failed]', err?.rawError || err);
+        return;
+      }
+      if (commandName === 'vote') {
+        // Handle all logic here and return, no defer before a modal
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          await interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
+          return;
+        }
+        if (!(await userIsVerified(uid))) {
+          await interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
+          return;
+        }
+        const existingSnap = await rtdb.ref(`votes/${uid}`).get();
+        if (existingSnap.exists()) {
+          const v = existingSnap.val() || {};
+          const embed = new EmbedBuilder()
+            .setTitle('You already have a vote')
+            .setDescription([
+              `**Best Offence:** ${v.bestOffence || '—'}`,
+              `**Best Defence:** ${v.bestDefence || '—'}`,
+              `**Rating:** ${v.rating || '—'} / 5`,
+            ].join('\n'))
+            .setColor(DEFAULT_EMBED_COLOR);
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
+          );
+          await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+          return;
+        }
+        await showVoteModal(interaction);
+        return;
+      }
+      
+      // --- Defer all other commands once ---
+      if (!interaction.deferred && !interaction.replied) {
+        await deferAndPing(interaction, { ephemeral: isEphemeralCommand(commandName) });
+      }
+    }
+
+    // --- Button/Modal handlers ---
+    if (interaction.isButton()) {
+      if (interaction.customId.startsWith('vote:change:')) {
+        const uid = interaction.customId.split(':')[2];
+        const snap = await withTimeout(rtdb.ref(`votes/${uid}`).get(), 4000, `RTDB votes/${uid}`);
+        const v = snap.exists() ? snap.val() : {};
+        await showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
+        return;
+      }
+      if (interaction.customId.startsWith('msg:') && interaction.customId.split(':')[1] === 'reply') {
+         const path = decPath(interaction.customId.split(':')[2]);
+         const modal = new ModalBuilder()
+           .setCustomId(`msg:replyModal:${encPath(path)}`)
+           .setTitle('Reply to message');
+         const input = new TextInputBuilder()
+           .setCustomId('replyText')
+           .setLabel('Your reply')
+           .setStyle(TextInputStyle.Paragraph)
+           .setMaxLength(500);
+         modal.addComponents(new ActionRowBuilder().addComponents(input));
+         await interaction.showModal(modal);
+         return;
+      }
+    }
+    if (interaction.isModalSubmit()) {
+      // All modal logic is self-contained and replies, so we can just return after.
+      if (interaction.customId.startsWith('msg:replyModal:')) {
+        await interaction.deferReply({ ephemeral: true });
+        const path = decPath(interaction.customId.split(':')[2]);
+        const text = interaction.fields.getTextInputValue('replyText').trim();
+        if (!text) return interaction.editReply('Reply can’t be empty.');
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+        let nameMap = await getAllUserNames();
+        const userName = nameMap[uid] || interaction.user.username;
+        const reply = { user: userName, uid, text, time: admin.database.ServerValue.TIMESTAMP };
+        await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
+        await interaction.editReply('✅ Reply posted!');
+      } else if (interaction.customId === 'vote:modal') {
+        await interaction.deferReply({ ephemeral: true });
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('Link your KC account first with /link.');
+        if (!(await userIsVerified(uid))) return interaction.editReply('You must verify your email on KC before voting.');
+        const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
+        const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
+        const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
+        if (!off || !def || !Number.isFinite(rating)) {
+          return interaction.editReply('Please fill all fields. Rating must be 1–5.');
+        }
+        const verifiedMap = await getVerifiedNameMap();
+        const offNorm = norm(off), defNorm = norm(def);
+        const offFinal = verifiedMap[offNorm], defFinal = verifiedMap[defNorm];
+        if (!offFinal || !defFinal) {
+          return interaction.editReply('Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.');
+        }
+        const nameMap = await getAllUserNames();
+        const username = nameMap[uid] || interaction.user.username;
+        const vote = { uid, username, bestOffence: offFinal, bestDefence: defFinal, rating, time: admin.database.ServerValue.TIMESTAMP };
+        const ref = rtdb.ref(`votes/${uid}`);
+        const tx = await ref.transaction(cur => cur ? undefined : vote, { applyLocally: false });
+        if (!tx.committed) {
+          await interaction.editReply({ content: '❗ You have already voted for this event.' });
+        } else {
+          await interaction.editReply('✅ Thanks for voting!');
+        }
       }
       return;
     }
 
-    // Don’t defer when you’re going to open a modal.
-    if (name !== 'vote') {
-      try {
-        const ephemeral = isEphemeralCommand(name) || name === 'help';
-        await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
-      } catch (err) {
-        console.warn('[deferAndPing failed]', err?.rawError || err);
-        return;
+    // --- Main Logic for Deferred Interactions ---
+    const stopWatch = startReplyWatchdog(interaction);
+    
+    if (interaction.isChatInputCommand()) {
+      const { commandName } = interaction;
+      if (commandName === 'whoami') {
+        const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+        await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
       }
-    }
-  }
-
-  if (interaction.isButton()) {
-    // Button handlers can remain largely the same, but we'll use safeEdit for consistency
-    if (interaction.customId.startsWith('lb:')) {
-      try {
-        await interaction.deferUpdate();
+      else if (commandName === 'dumpme') {
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) {
+            return await interaction.editReply({ content: 'Not linked. Run `/link` first.' });
+          }
+          const [userRT, badgesRT, postsRT] = await Promise.all([
+            withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
+            withTimeout(rtdb.ref(`badges/${uid}`).get(), 4000, `RTDB badges/${uid}`),
+            withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`),
+          ]);
+          const firestore = admin.firestore();
+          const [userFS, postsFS] = await Promise.all([
+            withTimeout(firestore.collection('users').doc(uid).get(), 4000, `FS users/${uid}`),
+            withTimeout(firestore.collection('users').doc(uid).collection('posts').get(), 4000, `FS users/${uid}/posts`),
+          ]);
+          const brief = (val) => {
+            const v = val && typeof val.val === 'function' ? val.val() : val;
+            if (!v || typeof v !== 'object') return v ?? null;
+            const keys = Object.keys(v);
+            const sample = {};
+            for (const k of keys.slice(0, 8)) sample[k] = v[k];
+            return { keys, sample };
+          };
+          const payload = {
+            uid,
+            rtdb: { user: brief(userRT), badges: brief(badgesRT), postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0 },
+            firestore: { userExists: userFS.exists, userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [], postsCount: postsFS.size }
+          };
+          await interaction.editReply({ content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
+      }
+      else if (commandName === 'leaderboard') {
+          const rows = await loadLeaderboardData();
+          const catIdx = 0, page = 0;
+          const embed = buildLbEmbed(rows, catIdx, page);
+          interaction.client.lbCache ??= new Map(); 
+          interaction.client.lbCache.set(interaction.id, rows);
+          await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
+      }
+      else if (commandName === 'clips') {
+          const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
+          const all = await fetchAllPosts({ platform });
+          if (!all.length) {
+            return await interaction.editReply({ content: 'No clips found.' });
+          }
+          all.sort((a, b) => b.score - a.score);
+          const top = all.slice(0, 5);
+          const nameMap = await getAllUserNames();
+          const lines = top.map((p, i) => {
+            const d = p.data || {};
+            const who = nameMap[p.ownerUid] || '(unknown)';
+            const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
+            let link = '';
+            if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
+            else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
+            const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
+            return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
+          });
+          const embed = new EmbedBuilder()
+            .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
+            .setDescription(lines.join('\n\n'))
+            .setColor(DEFAULT_EMBED_COLOR)
+            .setFooter({ text: 'KC Bot • /clips' });
+          await interaction.editReply({ embeds: [embed] });
+      }
+      else if (commandName === 'messages') {
+        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+        const embed = buildMessagesEmbed(list || [], nameMap || {});
+        await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
+      }
+      else if (commandName === 'votingscores') {
+          const scores = await loadVoteScores();
+          const embed = buildVoteEmbed(scores);
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+          );
+          await interaction.editReply({ embeds: [embed], components: [row] });
+      }
+      else if (commandName === 'badges') {
+          const target = interaction.options.getUser('user') || interaction.user;
+          const discordId = target.id;
+          const kcUid = await getKCUidForDiscord(discordId);
+          if (!kcUid) {
+            return await interaction.editReply({
+              content: target.id === interaction.user.id
+                ? 'I can’t find your KC account. Use `/link` to connect it first.'
+                : `I can’t find a KC account linked to **${target.tag}**.`
+            });
+          }
+          const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
+          if (!profile) {
+            return await interaction.editReply({ content: 'No profile data found.' });
+          }
+          const title = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
+          const description = clampStr(profile.about, 4096);
+          const badgesVal = clampStr(profile.badgesText, 1024);
+          const streakVal = clampStr(profile.streak, 1024, '—');
+          const postsVal = clampStr(profile.postsText, 1024);
+          const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
+          const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setThumbnail(discordAvatar)
+            .setDescription(description)
+            .addFields(
+              { name: 'Badges', value: badgesVal, inline: false },
+              { name: 'Streak', value: streakVal, inline: true  },
+              { name: 'Posts',  value: postsVal,  inline: false },
+            )
+            .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
+            .setFooter({ text: 'KC Bot • /badges' });
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setStyle(ButtonStyle.Link)
+              .setLabel('Full Profile')
+              .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
+          );
+          await interaction.editReply({ embeds: [embed], components: [row] });
+      }
+      else if (commandName === 'syncavatar') {
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) {
+            return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+          }
+          const allowed = await hasEmerald(uid);
+          if (!allowed) {
+            return await interaction.editReply({ content: 'This feature requires Emerald/profile customisation.' });
+          }
+          const action = interaction.options.getString('action');
+          if (action === 'set') {
+            const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
+            await setKCAvatar(uid, url);
+            await interaction.editReply({ content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
+          } else if (action === 'revert') {
+            await clearKCAvatar(uid);
+            await interaction.editReply({ content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
+          } else {
+            await interaction.editReply({ content: 'Unknown action.' });
+          }
+      }
+      else if (commandName === 'post') {
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) {
+            return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+          }
+          if (await postsDisabledGlobally()) {
+            return await interaction.editReply({ content: '🚫 Posting is currently disabled by admins.' });
+          }
+          const allowed = await postingUnlocked(uid);
+          if (!allowed) {
+            return await interaction.editReply({ content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
+          }
+          const link = interaction.options.getString('link') || '';
+          const caption = (interaction.options.getString('caption') || '').slice(0, 140);
+          const draft = !!interaction.options.getBoolean('draft');
+          const scheduleAtIso = interaction.options.getString('schedule_at') || '';
+          const parsed = parseVideoLink(link);
+          if (!parsed) {
+            return await interaction.editReply({ content: 'Invalid link. Please provide a YouTube or TikTok link.' });
+          }
+          const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
+          const postData = { ...parsed, caption, createdAt: admin.database.ServerValue.TIMESTAMP, createdBy: uid, draft: !!draft, publishAt: Number.isFinite(publishAt) ? publishAt : null };
+          const ref = rtdb.ref(`users/${uid}/posts`).push();
+          await withTimeout(ref.set(postData), 4000, `write post ${ref.key}`);
+          await interaction.editReply({ content: '✅ Post saved. Sending summary…' });
+          await interaction.followUp({
+            content: [
+              '✅ **Post created!**',
+              `• **Type:** ${postData.type}`,
+              `• **Caption:** ${caption || '(none)'}`,
+              publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
+            ].join('\n'),
+          });
+      }
+      else if (commandName === 'postmessage') {
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return await interaction.editReply({ content: 'You must link your KC account first with /link.' });
+        }
+        const nameMap = await getAllUserNames();
+        const userName = nameMap[uid] || interaction.user.username;
+        const text = interaction.options.getString('text');
+        const now = Date.now();
+        const message = { text, uid, user: userName, time: now, createdAt: now };
+        await rtdb.ref('messages').push(message);
+        await interaction.editReply({ content: '✅ Message posted!' });
+      }
+      else if (commandName === 'help') {
+        await interaction.editReply({
+          content: [
+            'KC Events Bot v1',
+            'Full Messageboard : https://kcevents.uk/#chatscroll',
+            'Full Clips       : https://kcevents.uk/#socialfeed',
+            'Full Voting      : https://kcevents.uk/#voting',
+          ].join('\n'),
+        });
+      }
+      else if (commandName === 'compare') {
+        const youDiscordId = interaction.user.id;
+        const otherUser = interaction.options.getUser('user');
+        const youUid = await getKCUidForDiscord(youDiscordId);
+        const otherUid = await getKCUidForDiscord(otherUser.id);
+        if (!youUid)  return interaction.editReply('Link your KC account first with /link.');
+        if (!otherUid) return interaction.editReply(`I can’t find a KC account linked to **${otherUser.tag}**.`);
+        const [youBadgesSnap, otherBadgesSnap, youProfile, otherProfile, youCB, otherCB] = await Promise.all([
+          withTimeout(rtdb.ref(`badges/${youUid}`).get(), 3000, 'RTDB badges you'),
+          withTimeout(rtdb.ref(`badges/${otherUid}`).get(), 3000, 'RTDB badges other'),
+          getKCProfile(youUid),
+          getKCProfile(otherUid),
+          loadCustomBadges(youUid),
+          loadCustomBadges(otherUid),
+        ]);
+        const youBadges = youBadgesSnap.exists() ? (youBadgesSnap.val() || {}) : {};
+        const otherBadges = otherBadgesSnap.exists() ? (otherBadgesSnap.val() || {}) : {};
+        const counts = b => ({
+          offence: parseInt(b.offence || b.bestOffence || 0) || 0,
+          defence: parseInt(b.defence || b.bestDefence || 0) || 0,
+          overall: parseInt(b.overall  || b.overallWins  || 0) || 0,
+        });
+        const a = counts(youBadges);
+        const b = counts(otherBadges);
+        const left = [`Offence: **${a.offence}**`, `Defence: **${a.defence}**`, `Overall: **${a.overall}**`, youCB.length ? `Custom: ${youCB.join(', ')}` : null].filter(Boolean).join('\n');
+        const right = [`Offence: **${b.offence}**`, `Defence: **${b.defence}**`, `Overall: **${b.overall}**`, otherCB.length ? `Custom: ${otherCB.join(', ')}` : null].filter(Boolean).join('\n');
+        const embed = new EmbedBuilder()
+          .setTitle('Badge comparison')
+          .addFields(
+            { name: youProfile.displayName || 'You',   value: left  || 'No badges.', inline: true },
+            { name: otherProfile.displayName || otherUser.tag, value: right || 'No badges.', inline: true },
+          )
+          .setColor(DEFAULT_EMBED_COLOR)
+          .setFooter({ text: 'KC Bot • /compare' });
+        await interaction.editReply({ embeds:[embed] });
+      }
+    } else if (interaction.isButton()) {
+      await interaction.deferUpdate();
+      if (interaction.customId.startsWith('lb:')) {
         const [, , catStr, pageStr] = interaction.customId.split(':');
         const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
         const page   = Math.max(0, parseInt(pageStr,10) || 0);
-
         let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
         if (!Array.isArray(rows)) {
-          console.log('[LB] cache miss, reloading data');
           rows = await loadLeaderboardData();
         }
-
         const embed = buildLbEmbed(rows, catIdx, page);
         await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
-      } catch (e) {
-        console.error('lb button error:', e);
-        await safeEdit(interaction, { content: 'Sorry — leaderboard couldn’t refresh right now.', components: [] });
       }
-    }
-    else if (interaction.customId.startsWith('msg:')) {
-      const invokerId = interaction.message.interaction?.user?.id;
-      if (invokerId && invokerId !== interaction.user.id) {
-        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-      }
-    
-      try {
+      else if (interaction.customId.startsWith('msg:')) {
+        const invokerId = interaction.message.interaction?.user?.id;
+        if (invokerId && invokerId !== interaction.user.id) {
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+        }
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
         let state = interaction.client.msgCache.get(key);
@@ -1154,76 +1491,52 @@ client.on('interactionCreate', async (interaction) => {
           state = { list, nameMap };
           interaction.client.msgCache.set(key, state);
         }
-    
-        const [ns, action, a, b] = interaction.customId.split(':'); // msg:<action>:...
-    
-        // ✅ Modal path: DO NOT defer
-        if (action === 'reply') {
-          const path = decPath(a);
-          const modal = new ModalBuilder()
-            .setCustomId(`msg:replyModal:${encPath(path)}`)
-            .setTitle('Reply to message');
-    
-          const input = new TextInputBuilder()
-            .setCustomId('replyText')
-            .setLabel('Your reply')
-            .setStyle(TextInputStyle.Paragraph)
-            .setMaxLength(500);
-    
-          modal.addComponents(new ActionRowBuilder().addComponents(input));
-          await interaction.showModal(modal);
-          return; // Always return after a modal
-        }
-    
-        // ✅ Everything else can be safely deferred
-        await interaction.deferUpdate();
-    
+        const [ns, action, a, b] = interaction.customId.split(':');
         if (action === 'view' || action === 'openIdx') {
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
-        if (action === 'back') {
+        else if (action === 'back') {
           const embed = buildMessagesEmbed(state.list, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
+          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
         }
-        if (action === 'refresh') {
+        else if (action === 'refresh') {
           const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
           state.list = list;
           state.nameMap = nameMap;
           const embed = buildMessagesEmbed(list, nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
         }
-        if (action === 'refreshOne') {
+        else if (action === 'refreshOne') {
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
-        if (action === 'openPath') {
+        else if (action === 'openPath') {
           const path = decPath(a);
           const idx = state.list.findIndex(m=>m.path===path);
           const base = idx>=0 ? state.list[idx] : await loadNode(path);
           const fresh = await loadNode(path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
+          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
-        if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
+        else if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
           const path = decPath(a);
           const page = parseInt(b||'0',10) || 0;
           const parent = await loadNode(path);
           const children = await loadReplies(path);
-          console.log('THREAD open', { path, page, parent: !!parent, childrenLen: children.length });
           const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
+          await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
         }
-        if (action === 'openChild') {
+        else if (action === 'openChild') {
           const path = decPath(a);
           const node = await loadNode(path);
           const hasReplies = !!(node?.replies && Object.keys(node.replies).length);
@@ -1239,517 +1552,43 @@ client.on('interactionCreate', async (interaction) => {
               new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
             ),
           ];
-          return await safeEdit(interaction, { embeds: [embed], components: rows });
+          await safeEdit(interaction, { embeds: [embed], components: rows });
         }
-        if (action === 'like') {
+        else if (action === 'like') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await safeEdit(interaction, { content: 'Link your KC account first with /link.' });
-    
+          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', ephemeral: true });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
           const wasLiked = likedSnap.exists();
           await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
           await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
-    
           const node = await loadNode(path);
           const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
           const i = state.list.findIndex(m=>m.path===path);
           if (i>=0) state.list[i] = { ...state.list[i], ...node };
-          return await safeEdit(interaction, { embeds: [embed] }); // components persist
+          await safeEdit(interaction, { embeds: [embed] });
         }
-      } catch (e) {
-        console.error('msg button error (thread):', e);
-        await safeEdit(interaction, { content: 'Couldn’t open that thread right now.', components: [] });
       }
-    }
-    else if (interaction.customId === 'votes:refresh') {
-      try {
-        await interaction.deferUpdate();
+      else if (interaction.customId === 'votes:refresh') {
         const scores = await loadVoteScores();
         const embed = buildVoteEmbed(scores);
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
         );
         await safeEdit(interaction, { embeds: [embed], components: [row] });
-      } catch (e) {
-        console.error('votes refresh error:', e);
-        await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
       }
-    } else if (interaction.customId.startsWith('vote:change:')) {
-      const uid = interaction.customId.split(':')[2];
-      // Do not defer before showing a modal
-      const snap = await withTimeout(rtdb.ref(`votes/${uid}`).get(), 4000, `RTDB votes/${uid}`);
-      const v = snap.exists() ? snap.val() : {};
-      await showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
-      return; // Return after modal
-    } else if (interaction.customId.startsWith('vote:delete:')) {
-      const uid = interaction.customId.split(':')[2];
-      await interaction.deferUpdate();
-      try {
+      else if (interaction.customId.startsWith('vote:delete:')) {
+        const uid = interaction.customId.split(':')[2];
         await withTimeout(rtdb.ref(`votes/${uid}`).remove(), 4000, `delete vote ${uid}`);
         await safeEdit(interaction, { content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
-      } catch (e) {
-        await safeEdit(interaction, { content: 'Failed to delete your vote, try again.', components: [] });
       }
     }
-    return;
-  }
-
-  if (interaction.isModalSubmit()) {
-    if (interaction.customId.startsWith('msg:replyModal:')) {
-      try {
-        await interaction.deferReply({ ephemeral: true });
-        const path = decPath(interaction.customId.split(':')[2]);
-        const text = interaction.fields.getTextInputValue('replyText').trim();
-        if (!text) return interaction.editReply('Reply can’t be empty.');
     
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return interaction.editReply('You must link your KC account first with /link.');
-    
-        // Resolve a display name (same source your site uses)
-        let nameMap = await getAllUserNames();
-        const userName = nameMap[uid] || interaction.user.username;
-    
-        const reply = {
-          user: userName,
-          uid,
-          text,
-          time: admin.database.ServerValue.TIMESTAMP,
-        };
-    
-        await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
-    
-        await interaction.editReply('✅ Reply posted!');
-      } catch (e) {
-        console.error('reply modal error:', e);
-        try {
-          if (interaction.deferred && !interaction.replied) {
-            await interaction.editReply('Failed to post reply.');
-          }
-        } catch {}
-      }
-    } else if (interaction.customId === 'vote:modal') {
-      try {
-        await interaction.deferReply({ ephemeral: true });
-
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return interaction.editReply('Link your KC account first with /link.');
-        if (!(await userIsVerified(uid))) return interaction.editReply('You must verify your email on KC before voting.');
-
-        const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
-        const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
-        const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
-
-        if (!off || !def || !Number.isFinite(rating)) {
-          return interaction.editReply('Please fill all fields. Rating must be 1–5.');
-        }
-
-        // Validate names against verified users (same as site)
-        const verifiedMap = await getVerifiedNameMap(); // normalizedName -> original
-        const offNorm = norm(off), defNorm = norm(def);
-        const offFinal = verifiedMap[offNorm], defFinal = verifiedMap[defNorm];
-
-        if (!offFinal || !defFinal) {
-          return interaction.editReply('Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.');
-        }
-
-        const nameMap = await getAllUserNames();
-        const username = nameMap[uid] || interaction.user.username;
-
-        const vote = {
-          uid, username,
-          bestOffence: offFinal,
-          bestDefence: defFinal,
-          rating,
-          time: admin.database.ServerValue.TIMESTAMP,
-        };
-        
-        const ref = rtdb.ref(`votes/${uid}`);
-        const tx = await ref.transaction(cur => {
-          if (cur) return; // already exists -> abort (no change)
-          return vote; // first vote -> commit
-        }, { applyLocally: false });
-        
-        if (!tx.committed) {
-          await interaction.editReply({ content: '❗ You have already voted for this event.' });
-          return;
-        }
-
-        await interaction.editReply('✅ Thanks for voting!');
-      } catch (e) {
-        console.error('vote modal error:', e);
-        try {
-          if (interaction.deferred && !interaction.replied) {
-            await interaction.editReply('Failed to save your vote. Please try again.');
-          }
-        } catch {}
-      }
-    }
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  // Centralized error handler for all slash commands
-  const stopWatch = startReplyWatchdog(interaction);
-  try {
-    const { commandName } = interaction;
-    
-    if (commandName === 'whoami') {
-      const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-      await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
-    }
-    else if (commandName === 'dumpme') {
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return await interaction.editReply({ content: 'Not linked. Run `/link` first.' });
-        }
-
-        const [userRT, badgesRT, postsRT] = await Promise.all([
-          withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
-          withTimeout(rtdb.ref(`badges/${uid}`).get(), 4000, `RTDB badges/${uid}`),
-          withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`),
-        ]);
-
-        const firestore = admin.firestore();
-        const [userFS, postsFS] = await Promise.all([
-          withTimeout(firestore.collection('users').doc(uid).get(), 4000, `FS users/${uid}`),
-          withTimeout(firestore.collection('users').doc(uid).collection('posts').get(), 4000, `FS users/${uid}/posts`),
-        ]);
-
-        const brief = (val) => {
-          const v = val && typeof val.val === 'function' ? val.val() : val;
-          if (!v || typeof v !== 'object') return v ?? null;
-          const keys = Object.keys(v);
-          const sample = {};
-          for (const k of keys.slice(0, 8)) sample[k] = v[k];
-          return { keys, sample };
-        };
-
-        const payload = {
-          uid,
-          rtdb: {
-            user: brief(userRT),
-            badges: brief(badgesRT),
-            postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0,
-          },
-          firestore: {
-            userExists: userFS.exists,
-            userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [],
-            postsCount: postsFS.size,
-          }
-        };
-        await interaction.editReply({ content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
-    }
-    else if (commandName === 'leaderboard') {
-        const rows = await loadLeaderboardData();
-        const catIdx = 0, page = 0;
-        const embed = buildLbEmbed(rows, catIdx, page);
-        interaction.client.lbCache ??= new Map(); 
-        interaction.client.lbCache.set(interaction.id, rows);
-        await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
-    }
-    else if (commandName === 'clips') {
-        const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
-        const all = await fetchAllPosts({ platform });
-        if (!all.length) {
-          return await interaction.editReply({ content: 'No clips found.' });
-        }
-
-        all.sort((a, b) => b.score - a.score);
-        const top = all.slice(0, 5);
-        const nameMap = await getAllUserNames();
-
-        const lines = top.map((p, i) => {
-          const d = p.data || {};
-          const who = nameMap[p.ownerUid] || '(unknown)';
-          const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
-          let link = '';
-          if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
-          else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
-          const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
-          return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
-        });
-
-        const embed = new EmbedBuilder()
-          .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
-          .setDescription(lines.join('\n\n'))
-          .setColor(DEFAULT_EMBED_COLOR)
-          .setFooter({ text: 'KC Bot • /clips' });
-
-        await interaction.editReply({ embeds: [embed] });
-    }
-    else if (commandName === 'messages') {
-      await interaction.editReply({ content: '🗨️ Loading latest 10…' });
-      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-      const embed = buildMessagesEmbed(list || [], nameMap || {});
-      await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
-    }
-    else if (commandName === 'votingscores') {
-        const scores = await loadVoteScores();
-        const embed = buildVoteEmbed(scores);
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
-        );
-        await interaction.editReply({ embeds: [embed], components: [row] });
-    }
-    else if (commandName === 'badges') {
-        const target = interaction.options.getUser('user') || interaction.user;
-        const discordId = target.id;
-        const kcUid = await getKCUidForDiscord(discordId);
-
-        if (!kcUid) {
-          return await interaction.editReply({
-            content: target.id === interaction.user.id
-              ? 'I can’t find your KC account. Use `/link` to connect it first.'
-              : `I can’t find a KC account linked to **${target.tag}**.`
-          });
-        }
-        
-        const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
-        if (!profile) {
-          return await interaction.editReply({ content: 'No profile data found.' });
-        }
-
-        const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
-        const description = clampStr(profile.about, 4096);
-        const badgesVal   = clampStr(profile.badgesText, 1024);
-        const streakVal   = clampStr(profile.streak, 1024, '—');
-        const postsVal    = clampStr(profile.postsText, 1024);
-        const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
-
-        const embed = new EmbedBuilder()
-          .setTitle(title)
-          .setThumbnail(discordAvatar)
-          .setDescription(description)
-          .addFields(
-            { name: 'Badges', value: badgesVal, inline: false },
-            { name: 'Streak', value: streakVal, inline: true  },
-            { name: 'Posts',  value: postsVal,  inline: false },
-          )
-          .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
-          .setFooter({ text: 'KC Bot • /badges' });
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setStyle(ButtonStyle.Link)
-            .setLabel('Full Profile')
-            .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
-        );
-
-        await interaction.editReply({ embeds: [embed], components: [row] });
-    }
-    else if (commandName === 'syncavatar') {
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
-        }
-
-        const allowed = await hasEmerald(uid);
-        if (!allowed) {
-          return await interaction.editReply({ content: 'This feature requires Emerald/profile customisation.' });
-        }
-
-        const action = interaction.options.getString('action');
-        if (action === 'set') {
-          const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
-          await setKCAvatar(uid, url);
-          await interaction.editReply({ content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
-        } else if (action === 'revert') {
-          await clearKCAvatar(uid);
-          await interaction.editReply({ content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
-        } else {
-          await interaction.editReply({ content: 'Unknown action.' });
-        }
-    }
-    else if (commandName === 'post') {
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
-        }
-    
-        if (await postsDisabledGlobally()) {
-          return await interaction.editReply({ content: '🚫 Posting is currently disabled by admins.' });
-        }
-    
-        const allowed = await postingUnlocked(uid);
-        if (!allowed) {
-          return await interaction.editReply({ content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
-        }
-    
-        const link = interaction.options.getString('link') || '';
-        const caption = (interaction.options.getString('caption') || '').slice(0, 140);
-        const draft = !!interaction.options.getBoolean('draft');
-        const scheduleAtIso = interaction.options.getString('schedule_at') || '';
-        const parsed = parseVideoLink(link);
-    
-        if (!parsed) {
-          return await interaction.editReply({ content: 'Invalid link. Please provide a YouTube or TikTok link.' });
-        }
-    
-        const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
-        const postData = {
-          ...parsed,
-          caption,
-          createdAt: admin.database.ServerValue.TIMESTAMP,
-          createdBy: uid,
-          draft: !!draft,
-          publishAt: Number.isFinite(publishAt) ? publishAt : null,
-        };
-    
-        const ref = rtdb.ref(`users/${uid}/posts`).push();
-        const postId = ref.key;
-        await withTimeout(ref.set(postData), 4000, `write post ${postId}`);
-    
-        await interaction.editReply({ content: '✅ Post saved. Sending summary…' });
-        await interaction.followUp({
-          content: [
-            '✅ **Post created!**',
-            `• **Type:** ${postData.type}`,
-            `• **Caption:** ${caption || '(none)'}`,
-            publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
-          ].join('\n'),
-        });
-    }
-    else if (commandName === 'postmessage') {
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) {
-        return await interaction.editReply({ content: 'You must link your KC account first with /link.' });
-      }
-
-      const nameMap = await getAllUserNames();
-      const userName = nameMap[uid] || interaction.user.username;
-      const text = interaction.options.getString('text');
-      const now = Date.now();
-      
-      const message = {
-        text,
-        uid,
-        user: userName,
-        time: now,
-        createdAt: now,
-      };
-
-      await rtdb.ref('messages').push(message);
-      await interaction.editReply({ content: '✅ Message posted!' });
-    }
-    else if (commandName === 'help') {
-      await interaction.editReply({
-        content: [
-          'KC Events Bot v1',
-          'Full Messageboard : https://kcevents.uk/#chatscroll',
-          'Full Clips       : https://kcevents.uk/#socialfeed',
-          'Full Voting      : https://kcevents.uk/#voting',
-        ].join('\n'),
-      });
-    }
-    else if (commandName === 'vote') {
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) {
-        await interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
-        return;
-      }
-
-      if (!(await userIsVerified(uid))) {
-        await interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
-        return;
-      }
-
-      const existingSnap = await rtdb.ref(`votes/${uid}`).get();
-      if (existingSnap.exists()) {
-        const v = existingSnap.val() || {};
-        const embed = new EmbedBuilder()
-          .setTitle('You already have a vote')
-          .setDescription([
-            `**Best Offence:** ${v.bestOffence || '—'}`,
-            `**Best Defence:** ${v.bestDefence || '—'}`,
-            `**Rating:** ${v.rating || '—'} / 5`,
-          ].join('\n'))
-          .setColor(DEFAULT_EMBED_COLOR);
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
-        );
-
-        await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-        return;
-      }
-
-      await showVoteModal(interaction);
-      return;
-    }
-    else if (commandName === 'compare') {
-      const youDiscordId = interaction.user.id;
-      const otherUser = interaction.options.getUser('user');
-      const youUid = await getKCUidForDiscord(youDiscordId);
-      const otherUid = await getKCUidForDiscord(otherUser.id);
-
-      if (!youUid)  return interaction.editReply('Link your KC account first with /link.');
-      if (!otherUid) return interaction.editReply(`I can’t find a KC account linked to **${otherUser.tag}**.`);
-
-      // Load badge counts
-      const [youBadgesSnap, otherBadgesSnap, youProfile, otherProfile, youCB, otherCB] = await Promise.all([
-        withTimeout(rtdb.ref(`badges/${youUid}`).get(), 3000, 'RTDB badges you'),
-        withTimeout(rtdb.ref(`badges/${otherUid}`).get(), 3000, 'RTDB badges other'),
-        getKCProfile(youUid),
-        getKCProfile(otherUid),
-        loadCustomBadges(youUid),
-        loadCustomBadges(otherUid),
-      ]);
-
-      const youBadges   = youBadgesSnap.exists()   ? (youBadgesSnap.val()   || {}) : {};
-      const otherBadges = otherBadgesSnap.exists() ? (otherBadgesSnap.val() || {}) : {};
-
-      const counts = b => ({
-        offence: parseInt(b.offence || b.bestOffence || 0) || 0,
-        defence: parseInt(b.defence || b.bestDefence || 0) || 0,
-        overall: parseInt(b.overall  || b.overallWins  || 0) || 0,
-      });
-
-      const a = counts(youBadges);
-      const b = counts(otherBadges);
-
-      const left  = [
-        `Offence: **${a.offence}**`,
-        `Defence: **${a.defence}**`,
-        `Overall: **${a.overall}**`,
-        youCB.length ? `Custom: ${youCB.join(', ')}` : null,
-      ].filter(Boolean).join('\n');
-
-      const right = [
-        `Offence: **${b.offence}**`,
-        `Defence: **${b.defence}**`,
-        `Overall: **${b.overall}**`,
-        otherCB.length ? `Custom: ${otherCB.join(', ')}` : null,
-      ].filter(Boolean).join('\n');
-
-      const embed = new EmbedBuilder()
-        .setTitle('Badge comparison')
-        .addFields(
-          { name: youProfile.displayName || 'You',   value: left  || 'No badges.', inline: true },
-          { name: otherProfile.displayName || otherUser.tag, value: right || 'No badges.', inline: true },
-        )
-        .setColor(DEFAULT_EMBED_COLOR)
-        .setFooter({ text: 'KC Bot • /compare' });
-
-      await interaction.editReply({ embeds:[embed] });
-    }
-
-  } catch (err) {
-    console.error(`Error handling command ${interaction.commandName}:`, err);
-    // Use safeEdit everywhere for error replies
-    await safeEdit(interaction, { content: 'Sorry, something went wrong.', embeds: [], components: [] });
-  } finally {
     stopWatch();
+  } catch (err) {
+    console.error('handler error:', err);
+    await safeEdit(interaction, { content: 'Sorry, something went wrong.', embeds: [], components: [] });
   }
 });
 
