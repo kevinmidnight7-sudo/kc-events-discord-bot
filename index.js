@@ -71,7 +71,7 @@ const LB = {
   PAGE_SIZE: 10,
 };
 
-const DEFAULT_EMBED_COLOR = 0x5865F2;
+const DEFAULT_EMBED_COLOR = 0x2b2d31;
 
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
@@ -167,6 +167,19 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
   }
 }
 
+async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Working…' } = {}) {
+  await interaction.deferReply(ephemeral ? { ephemeral: true } : {});
+  try { await interaction.editReply({ content: text }); } catch {}
+}
+
+function startReplyWatchdog(interaction, ms = 5000) {
+  const t = setTimeout(() => {
+    if (!interaction.replied) {
+      interaction.editReply({ content: 'Still working…' }).catch(() => {});
+    }
+  }, ms);
+  return () => clearTimeout(t);
+}
 
 // --- Promise timeout wrapper so we never hang indefinitely
 function withTimeout(promise, ms, label = 'operation') {
@@ -1037,7 +1050,6 @@ client.on('interactionCreate', async (interaction) => {
 
   // Acknowledge chat input commands fast (3-second rule)
   if (interaction.isChatInputCommand()) {
-    // Special case: /link — reply immediately (no defer), then return.
     if (interaction.commandName === 'link') {
       try {
         if (!process.env.AUTH_BRIDGE_START_URL) {
@@ -1053,11 +1065,11 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     try {
-      await interaction.deferReply(isEphemeralCommand(interaction.commandName) ? { ephemeral: true } : {});
-      console.log(`[ACK] /${interaction.commandName} deferred`);
+      const ephemeral = isEphemeralCommand(interaction.commandName);
+      await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
     } catch (err) {
       console.warn('[deferReply failed]', err?.rawError || err);
-      return; // if we didn’t ack, stop to avoid “did not respond”
+      return;
     }
   }
 
@@ -1202,8 +1214,8 @@ client.on('interactionCreate', async (interaction) => {
           return await safeEdit(interaction, { embeds: [embed] }); // components persist
         }
       } catch (e) {
-        console.error('msg button error:', e);
-        await safeEdit(interaction, { content: 'Sorry — could not update messages right now.', components: [] });
+        console.error('msg button error (thread):', e);
+        await safeEdit(interaction, { content: 'Couldn’t open that thread right now.', components: [] });
       }
     }
     else if (interaction.customId === 'votes:refresh') {
@@ -1336,6 +1348,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   // Centralized error handler for all slash commands
+  const stopWatch = startReplyWatchdog(interaction);
   try {
     const { commandName } = interaction;
     
@@ -1425,24 +1438,10 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ embeds: [embed] });
     }
     else if (commandName === 'messages') {
-      try {
-        const [list, nameMap] = await Promise.all([
-          fetchLatestMessages(10),
-          getAllUserNames().catch(() => ({})) // name map is nice-to-have
-        ]);
-
-        interaction.client.msgCache ??= new Map();
-        interaction.client.msgCache.set(interaction.id, { list, nameMap });
-
-        const embed = buildMessagesEmbed(list, nameMap);
-        await safeEdit(interaction, {
-          embeds: [embed],
-          components: messageIndexRows(list.length || 0)
-        });
-      } catch (e) {
-        console.error('/messages error:', e);
-        await safeEdit(interaction, { content: 'Sorry — could not load the messageboard right now.' });
-      }
+      await interaction.editReply({ content: '🗨️ Loading latest 10…' });
+      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      const embed = buildMessagesEmbed(list || [], nameMap || {});
+      await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
     }
     else if (commandName === 'votingscores') {
         const scores = await loadVoteScores();
@@ -1707,6 +1706,8 @@ client.on('interactionCreate', async (interaction) => {
     } catch (e) {
       console.error('Failed to send error reply:', e);
     }
+  } finally {
+    stopWatch();
   }
 });
 
