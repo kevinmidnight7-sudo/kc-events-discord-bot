@@ -363,43 +363,43 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
   return results;
 }
 
-// Latest N messageboard messages (defensive: over-fetch then trim)
 async function fetchLatestMessages(limit = 10) {
-  const OVERFETCH = Math.max(limit * 6, 60); // grab extra, then sort & trim
-  // 1) Read without orderByChild so we don't filter out items missing "time"
-  const snap = await withTimeout(
-    rtdb.ref('messages').limitToLast(OVERFETCH).get(),
-    5000,
-    'RTDB messages latest-by-key'
-  );
+  const OVERFETCH = Math.max(limit * 3, 30);
 
-  const list = [];
-  if (snap.exists()) {
-    snap.forEach(child => {
-      const v = child.val() || {};
-      // best-effort timestamp + text normalization
-      const when = v.time ?? v.createdAt ?? v.timestamp ?? v.ts ?? 0;
-      const text = v.text ?? v.message ?? v.content ?? v.body ?? '';
-      const who  = v.user ?? v.username ?? v.displayName ?? v.name ?? null;
-
-      list.push({
-        key: child.key,
-        path: `messages/${child.key}`,
-        // keep all original fields too
-        ...v,
-        // normalized helpers used by the embed
-        _when: Number(when) || 0,
-        _text: String(text),
-        _who:  who,
+  async function snapToMsgs(snap) {
+    const arr = [];
+    if (snap?.exists && snap.exists()) {
+      snap.forEach(c => {
+        const v = c.val() || {};
+        // filter: must look like a message
+        const isMsg = typeof v === 'object' &&
+          (typeof v.text === 'string' || typeof v.user === 'string' || typeof v.uid === 'string');
+        if (isMsg) arr.push({ key: c.key, ...(v || {}) });
       });
-    });
+      // sort newest first by time (fallback to key if missing)
+      arr.sort((a, b) => ((b.time || 0) - (a.time || 0)) || (b.key > a.key ? 1 : -1));
+    }
+    return arr.slice(0, limit).map(m => ({ ...m, path: `messages/${m.key}` }));
   }
 
-  // 2) Sort newest first using the normalized timestamp, then fallback to push-key recency
-  list.sort((a, b) => b._when - a._when);
-
-  // 3) Trim & return
-  return list.slice(0, limit);
+  // Try indexed query first
+  try {
+    const snap = await withTimeout(
+      rtdb.ref('messages').orderByChild('time').limitToLast(OVERFETCH).get(),
+      5000,
+      'RTDB messages recent'
+    );
+    return await snapToMsgs(snap);
+  } catch (e) {
+    // Fallback if index missing or anything else
+    console.warn('[messages] falling back to unordered fetch:', e?.message || e);
+    const snap = await withTimeout(
+      rtdb.ref('messages').limitToLast(OVERFETCH).get(),
+      5000,
+      'RTDB messages fallback'
+    );
+    return await snapToMsgs(snap);
+  }
 }
 
 // Build an embed showing a page of 10 messages (title, text, reply count)
@@ -407,7 +407,9 @@ function buildMessagesEmbed(list, nameMap = {}) {
   const desc = list.map((m, i) => {
     const who = m._who || nameMap[m.uid] || '(unknown)';
     const when = m._when ? new Date(m._when).toLocaleString() : '—';
-    const text = m._text?.length > 100 ? m._text.slice(0, 100) + '…' : (m._text || null);
+    const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
+    const textStr = String(rawText || '');
+    const text = textStr.length > 100 ? textStr.slice(0, 100) + '…' : (textStr || null);
     const replies = m.replies ? Object.keys(m.replies).length : 0;
     return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${replies}**`;
   }).join('\n\n');
@@ -450,7 +452,8 @@ function fmtTime(ms){
 function buildMessageDetailEmbed(msg, nameMap = {}) {
   const who = msg._who || nameMap[msg.uid] || '(unknown)';
   const when = msg._when ? new Date(msg._when).toLocaleString() : '—';
-  const text = msg._text || '_no text_';
+  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
+  const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
 
@@ -509,7 +512,7 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
       r.name ||
       '(unknown)';
     const raw = r.text ?? r.message ?? r.content ?? r.body ?? '';
-    const txt = String(raw).slice(0,120) || '(no text)';
+    const txt = String(raw || '').slice(0,120) || '(no text)';
     return `**${i+1}. ${who}** — ${txt}`;
   }).join('\n\n') || '_No replies yet_';
 
@@ -1244,12 +1247,24 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ embeds: [embed] });
     }
     else if (commandName === 'messages') {
-        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+      try {
+        const [list, nameMap] = await Promise.all([
+          fetchLatestMessages(10),
+          getAllUserNames().catch(() => ({})) // name map is nice-to-have
+        ]);
+
         interaction.client.msgCache ??= new Map();
         interaction.client.msgCache.set(interaction.id, { list, nameMap });
-        // Show the list first (numbers 1..10 + Refresh) as you do today:
+
         const embed = buildMessagesEmbed(list, nameMap);
-        await interaction.editReply({ embeds: [embed], components: messageIndexRows(list.length || 0) });
+        await safeEdit(interaction, {
+          embeds: [embed],
+          components: messageIndexRows(list.length || 0)
+        });
+      } catch (e) {
+        console.error('/messages error:', e);
+        await safeEdit(interaction, { content: 'Sorry — could not load the messageboard right now.' });
+      }
     }
     else if (commandName === 'votingscores') {
         const scores = await loadVoteScores();
