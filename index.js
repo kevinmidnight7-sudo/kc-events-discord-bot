@@ -966,9 +966,12 @@ client.on('interactionCreate', async (interaction) => {
     // Special case: /link — reply immediately (no defer), then return.
     if (interaction.commandName === 'link') {
       try {
+        if (!process.env.AUTH_BRIDGE_START_URL) {
+          return interaction.reply({ content: 'Linking is not configured.', flags: 64 });
+        }
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-        await interaction.reply({ content: `Click to link your account: ${url}` });
+        await interaction.reply({ content: `Click to link your account: ${url}`, flags: 64 });
       } catch (err) {
         console.warn('[link reply failed]', err?.rawError || err);
       }
@@ -1442,7 +1445,7 @@ client.on('interactionCreate', async (interaction) => {
 
 
 // ---------- Startup ----------
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
