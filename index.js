@@ -70,7 +70,7 @@ const globalCache = {
 };
 
 const isEphemeralCommand = (name) => new Set([
-  'whoami', 'dumpme', 'syncavatar', 'post'
+  'whoami', 'dumpme', 'syncavatar', 'post', 'postmessage'
 ]).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
@@ -462,13 +462,13 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
   return e;
 }
 
-function messageDetailRows(idx, list, path) {
+function messageDetailRows(idx, list, path, hasReplies = true) {
   const max = list.length - 1;
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`msg:openIdx:${Math.max(idx-1,0)}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(idx<=0),
       new ButtonBuilder().setCustomId(`msg:openIdx:${Math.min(idx+1,max)}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(idx>=max),
-      new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary).setDisabled(!hasReplies),
       new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`msg:refreshOne:${idx}`).setLabel('Refresh').setStyle(ButtonStyle.Secondary),
     ),
@@ -876,10 +876,19 @@ const postCmd = new SlashCommandBuilder()
      .setDescription('Schedule publish time ISO (e.g. 2025-08-21T10:00)')
      .setRequired(false));
 
+const postMessageCmd = new SlashCommandBuilder()
+  .setName('postmessage')
+  .setDescription('Post a message to the message board')
+  .addStringOption(o =>
+    o.setName('text')
+      .setDescription('The message to post')
+      .setRequired(true)
+  );
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
-  avatarCmd, postCmd
+  avatarCmd, postCmd, postMessageCmd
 ].map(c => c.toJSON());
 
 
@@ -976,27 +985,37 @@ client.on('interactionCreate', async (interaction) => {
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
+          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         if (action === 'back') {
           const embed = buildMessagesEmbed(state.list, state.nameMap);
           return await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
         }
+        if (action === 'refresh') {
+          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+          state.list = list;
+          state.nameMap = nameMap;
+          const embed = buildMessagesEmbed(list, nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+        }
         if (action === 'refreshOne') {
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
+          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         if (action === 'openPath') {
           const path = decPath(a);
           const idx = state.list.findIndex(m=>m.path===path);
           const base = idx>=0 ? state.list[idx] : await loadNode(path);
           const fresh = await loadNode(path);
+          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...(base||{}), ...(fresh||{}) }, state.nameMap);
-          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path) });
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
         if (action === 'thread') {
           const path = decPath(a);
@@ -1009,10 +1028,11 @@ client.on('interactionCreate', async (interaction) => {
         if (action === 'openChild') {
           const path = decPath(a);
           const node = await loadNode(path);
+          const hasReplies = !!(node?.replies && Object.keys(node.replies).length);
           const embed = buildMessageDetailEmbed(node, state.nameMap);
           const rows = [
             new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary).setDisabled(!hasReplies),
               new ButtonBuilder().setCustomId(`msg:openPath:${encPath(path.split('/replies/').slice(0,-1).join('/replies/'))}`).setLabel('Up one level').setStyle(ButtonStyle.Secondary),
               new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
             ),
@@ -1339,6 +1359,27 @@ client.on('interactionCreate', async (interaction) => {
           ].join('\n'),
         });
     }
+    else if (commandName === 'postmessage') {
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) {
+        return await interaction.editReply({ content: 'You must link your KC account first with /link.' });
+      }
+
+      const nameMap = await getAllUserNames();
+      const userName = nameMap[uid] || interaction.user.username;
+      const text = interaction.options.getString('text');
+
+      const message = {
+        text,
+        uid,
+        user: userName,
+        time: admin.database.ServerValue.TIMESTAMP,
+      };
+
+      await rtdb.ref('messages').push(message);
+      await interaction.editReply({ content: '✅ Message posted!' });
+    }
 
   } catch (err) {
     console.error(`Error handling command ${interaction.commandName}:`, err);
@@ -1367,4 +1408,4 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
 (async () => {
   await registerCommands();
   await client.login(process.env.DISCORD_BOT_TOKEN);
-})();
+})
