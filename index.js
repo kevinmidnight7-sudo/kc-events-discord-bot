@@ -71,7 +71,7 @@ const LB = {
   PAGE_SIZE: 10,
 };
 
-const DEFAULT_EMBED_COLOR = 0x2b2d31;
+const DEFAULT_EMBED_COLOR = 0x5865F2;
 
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
@@ -788,7 +788,7 @@ async function getKCProfile(uid) {
   const customBadges = user.customBadges || {};
   for (const key of Object.keys(customBadges)) {
     const b = customBadges[key] || {};
-    const piece = [b.emoji, b.label].filter(Boolean).join(' ');
+    const piece = [b.icon ?? b.emoji, b.name ?? b.label].filter(Boolean).join(' ');
     if (piece) badgeLines.push(piece);
   }
 
@@ -803,6 +803,87 @@ async function getKCProfile(uid) {
     // embed colour preference: nameColor > gradient first colour > default
     embedColor: hexToInt(nameColor) || hexToInt(gradientColor) || null,
   };
+}
+
+function norm(s=''){ return s.toLowerCase().replace(/[^a-z0-9]/g,''); }
+
+async function getVerifiedNameMap() {
+  const snap = await withTimeout(rtdb.ref('users').get(), 5000, 'RTDB users for voting');
+  const map = {}; // normalizedName -> original displayName/email
+  if (snap.exists()) {
+    const all = snap.val() || {};
+    for (const uid of Object.keys(all)) {
+      const u = all[uid] || {};
+      if (u.emailVerified) {
+        const name = u.displayName || u.email || '';
+        const k = norm(name);
+        if (k && !map[k]) map[k] = name;
+      }
+    }
+  }
+  return map;
+}
+
+async function userIsVerified(uid) {
+  const s = await withTimeout(rtdb.ref(`users/${uid}/emailVerified`).get(), 3000, 'RTDB emailVerified');
+  return !!s.val();
+}
+
+async function getExistingVotesBy(uid) {
+  const q = await withTimeout(
+    rtdb.ref('votes').orderByChild('uid').equalTo(uid).get(),
+    5000, 'RTDB votes by uid'
+  );
+  const found = [];
+  if (q.exists()) q.forEach(c => found.push({ key:c.key, ...(c.val()||{}) }));
+  return found;
+}
+
+async function showVoteModal(interaction, defaults={}) {
+  const modal = new ModalBuilder()
+    .setCustomId('vote:modal')
+    .setTitle('KC Events — Vote');
+
+  const offIn = new TextInputBuilder()
+    .setCustomId('voteOff')
+    .setLabel('Best Offence (type player name)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setValue(defaults.off || '');
+
+  const defIn = new TextInputBuilder()
+    .setCustomId('voteDef')
+    .setLabel('Best Defence (type player name)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setValue(defaults.def || '');
+
+  const rateIn = new TextInputBuilder()
+    .setCustomId('voteRate')
+    .setLabel('Event rating 1–5')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setValue(defaults.rating ? String(defaults.rating) : '');
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(offIn),
+    new ActionRowBuilder().addComponents(defIn),
+    new ActionRowBuilder().addComponents(rateIn),
+  );
+
+  return interaction.showModal(modal);
+}
+
+async function loadCustomBadges(uid) {
+  const s = await withTimeout(rtdb.ref(`users/${uid}/customBadges`).get(), 4000, `RTDB users/${uid}/customBadges`);
+  const out = [];
+  if (s.exists()) {
+    s.forEach(c => {
+      const b = c.val() || {};
+      if (b.name) out.push(`${b.icon || ''} ${b.name}`.trim());
+    });
+  }
+  return out.slice(0, 10); // clamp to fit embed field
 }
 
 
@@ -900,10 +981,27 @@ const postMessageCmd = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+const helpCmd = new SlashCommandBuilder()
+  .setName('help')
+  .setDescription('Links to the full KC features');
+
+const voteCmd = new SlashCommandBuilder()
+  .setName('vote')
+  .setDescription('Vote Best Offence, Best Defence and rate the event');
+
+const compareCmd = new SlashCommandBuilder()
+  .setName('compare')
+  .setDescription('Compare your KC badges with another player')
+  .addUserOption(o =>
+    o.setName('user')
+     .setDescription('The other Discord user')
+     .setRequired(true)
+  );
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
-  avatarCmd, postCmd, postMessageCmd
+  avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd
 ].map(c => c.toJSON());
 
 
@@ -1056,7 +1154,7 @@ client.on('interactionCreate', async (interaction) => {
           const base = idx>=0 ? state.list[idx] : await loadNode(path);
           const fresh = await loadNode(path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
-          const embed = buildMessageDetailEmbed({ ...(base||{}), ...(fresh||{}) }, state.nameMap);
+          const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
           return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
         if (action === 'thread') {
@@ -1064,6 +1162,7 @@ client.on('interactionCreate', async (interaction) => {
           const page = parseInt(b||'0',10) || 0;
           const parent = await loadNode(path);
           const children = await loadReplies(path);
+          console.log('THREAD open', { path, page, parent: !!parent, childrenLen: children.length });
           const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
           return await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
         }
@@ -1120,38 +1219,117 @@ client.on('interactionCreate', async (interaction) => {
         console.error('votes refresh error:', e);
         await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
       }
+    } else if (interaction.customId.startsWith('vote:change:')) {
+      const key = interaction.customId.split(':')[2];
+      await interaction.deferUpdate(); // ack the button
+      // Load that vote for defaults
+      const snap = await withTimeout(rtdb.ref(`votes/${key}`).get(), 4000, `RTDB votes/${key}`);
+      const v = snap.exists() ? snap.val() : {};
+      return showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
+    } else if (interaction.customId.startsWith('vote:delete:')) {
+      const key = interaction.customId.split(':')[2];
+      await interaction.deferUpdate();
+      try {
+        await withTimeout(rtdb.ref(`votes/${key}`).remove(), 4000, `delete vote ${key}`);
+        await safeEdit(interaction, { content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
+      } catch (e) {
+        await safeEdit(interaction, { content: 'Failed to delete your vote, try again.', components: [] });
+      }
     }
     return;
   }
 
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('msg:replyModal:')) {
-    try {
-      await interaction.deferReply({ ephemeral: true });
-      const path = decPath(interaction.customId.split(':')[2]);
-      const text = interaction.fields.getTextInputValue('replyText').trim();
-      if (!text) return interaction.editReply('Reply can’t be empty.');
-  
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) return interaction.editReply('You must link your KC account first with /link.');
-  
-      // Resolve a display name (same source your site uses)
-      let nameMap = await getAllUserNames();
-      const userName = nameMap[uid] || interaction.user.username;
-  
-      const reply = {
-        user: userName,
-        uid,
-        text,
-        time: admin.database.ServerValue.TIMESTAMP,
-      };
-  
-      await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
-  
-      await interaction.editReply('✅ Reply posted!');
-    } catch (e) {
-      console.error('reply modal error:', e);
-      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', flags: EPHEMERAL_FLAG });
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith('msg:replyModal:')) {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+        const path = decPath(interaction.customId.split(':')[2]);
+        const text = interaction.fields.getTextInputValue('replyText').trim();
+        if (!text) return interaction.editReply('Reply can’t be empty.');
+    
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+    
+        // Resolve a display name (same source your site uses)
+        let nameMap = await getAllUserNames();
+        const userName = nameMap[uid] || interaction.user.username;
+    
+        const reply = {
+          user: userName,
+          uid,
+          text,
+          time: admin.database.ServerValue.TIMESTAMP,
+        };
+    
+        await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
+    
+        await interaction.editReply('✅ Reply posted!');
+      } catch (e) {
+        console.error('reply modal error:', e);
+        try {
+          if (interaction.deferred && !interaction.replied) {
+            await interaction.editReply('Failed to post reply.');
+          }
+        } catch {}
+      }
+    } else if (interaction.customId === 'vote:modal') {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('Link your KC account first with /link.');
+        if (!(await userIsVerified(uid))) return interaction.editReply('You must verify your email on KC before voting.');
+
+        const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
+        const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
+        const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
+
+        if (!off || !def || !Number.isFinite(rating)) {
+          return interaction.editReply('Please fill all fields. Rating must be 1–5.');
+        }
+
+        // Validate names against verified users (same as site)
+        const verifiedMap = await getVerifiedNameMap(); // normalizedName -> original
+        const offNorm = norm(off), defNorm = norm(def);
+        const offFinal = verifiedMap[offNorm], defFinal = verifiedMap[defNorm];
+
+        if (!offFinal || !defFinal) {
+          return interaction.editReply('Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.');
+        }
+
+        const nameMap = await getAllUserNames();
+        const username = nameMap[uid] || interaction.user.username;
+
+        const vote = {
+          uid, username,
+          bestOffence: offFinal,
+          bestDefence: defFinal,
+          rating,
+          time: admin.database.ServerValue.TIMESTAMP,
+        };
+        
+        const ref = rtdb.ref(`votes/${uid}`);
+        const tx = await ref.transaction(cur => {
+          if (cur) return; // already exists -> abort (no change)
+          return vote; // first vote -> commit
+        }, { applyLocally: false });
+        
+        if (!tx.committed) {
+          await interaction.editReply({ content: '❗ You have already voted for this event.' });
+          return;
+        }
+
+        await interaction.editReply('✅ Thanks for voting!');
+      } catch (e) {
+        console.error('vote modal error:', e);
+        try {
+          if (interaction.deferred && !interaction.replied) {
+            await interaction.editReply('Failed to save your vote. Please try again.');
+          }
+        } catch {}
+      }
     }
   }
 
@@ -1416,6 +1594,105 @@ client.on('interactionCreate', async (interaction) => {
 
       await rtdb.ref('messages').push(message);
       await interaction.editReply({ content: '✅ Message posted!' });
+    }
+    else if (commandName === 'help') {
+      await interaction.editReply({
+        content: [
+          'KC Events Bot v1',
+          'Full Messageboard : https://kcevents.uk/#chatscroll',
+          'Full Clips       : https://kcevents.uk/#socialfeed',
+          'Full Voting      : https://kcevents.uk/#voting',
+        ].join('\n')
+      });
+    }
+    else if (commandName === 'vote') {
+      const discordId = interaction.user.id;
+      const uid = await getKCUidForDiscord(discordId);
+      if (!uid) return interaction.editReply('Link your KC account first with /link.');
+
+      if (!(await userIsVerified(uid))) {
+        return interaction.editReply('You must verify your email on KC before voting.');
+      }
+
+      // If user already voted, offer to change/delete
+      const existing = await getExistingVotesBy(uid);
+      if (existing.length) {
+        const v = existing[existing.length - 1]; // latest (site doesn’t prevent multiples)
+        const embed = new EmbedBuilder()
+          .setTitle('You already have a vote')
+          .setDescription([
+            `**Best Offence:** ${v.bestOffence || '—'}`,
+            `**Best Defence:** ${v.bestDefence || '—'}`,
+            `**Rating:** ${v.rating || '—'} / 5`,
+          ].join('\n'))
+          .setColor(DEFAULT_EMBED_COLOR);
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`vote:change:${v.key}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`vote:delete:${v.key}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
+        );
+
+        return interaction.editReply({ embeds:[embed], components:[row] });
+      }
+
+      // No existing vote — open modal immediately (initial response must be a modal)
+      return showVoteModal(interaction);
+    }
+    else if (commandName === 'compare') {
+      const youDiscordId = interaction.user.id;
+      const otherUser = interaction.options.getUser('user');
+      const youUid = await getKCUidForDiscord(youDiscordId);
+      const otherUid = await getKCUidForDiscord(otherUser.id);
+
+      if (!youUid)  return interaction.editReply('Link your KC account first with /link.');
+      if (!otherUid) return interaction.editReply(`I can’t find a KC account linked to **${otherUser.tag}**.`);
+
+      // Load badge counts
+      const [youBadgesSnap, otherBadgesSnap, youProfile, otherProfile, youCB, otherCB] = await Promise.all([
+        withTimeout(rtdb.ref(`badges/${youUid}`).get(), 3000, 'RTDB badges you'),
+        withTimeout(rtdb.ref(`badges/${otherUid}`).get(), 3000, 'RTDB badges other'),
+        getKCProfile(youUid),
+        getKCProfile(otherUid),
+        loadCustomBadges(youUid),
+        loadCustomBadges(otherUid),
+      ]);
+
+      const youBadges   = youBadgesSnap.exists()   ? (youBadgesSnap.val()   || {}) : {};
+      const otherBadges = otherBadgesSnap.exists() ? (otherBadgesSnap.val() || {}) : {};
+
+      const counts = b => ({
+        offence: parseInt(b.offence || b.bestOffence || 0) || 0,
+        defence: parseInt(b.defence || b.bestDefence || 0) || 0,
+        overall: parseInt(b.overall  || b.overallWins  || 0) || 0,
+      });
+
+      const a = counts(youBadges);
+      const b = counts(otherBadges);
+
+      const left  = [
+        `Offence: **${a.offence}**`,
+        `Defence: **${a.defence}**`,
+        `Overall: **${a.overall}**`,
+        youCB.length ? `Custom: ${youCB.join(', ')}` : null,
+      ].filter(Boolean).join('\n');
+
+      const right = [
+        `Offence: **${b.offence}**`,
+        `Defence: **${b.defence}**`,
+        `Overall: **${b.overall}**`,
+        otherCB.length ? `Custom: ${otherCB.join(', ')}` : null,
+      ].filter(Boolean).join('\n');
+
+      const embed = new EmbedBuilder()
+        .setTitle('Badge comparison')
+        .addFields(
+          { name: youProfile.displayName || 'You',   value: left  || 'No badges.', inline: true },
+          { name: otherProfile.displayName || otherUser.tag, value: right || 'No badges.', inline: true },
+        )
+        .setColor(DEFAULT_EMBED_COLOR)
+        .setFooter({ text: 'KC Bot • /compare' });
+
+      await interaction.editReply({ embeds:[embed] });
     }
 
   } catch (err) {
