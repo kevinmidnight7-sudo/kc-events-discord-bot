@@ -21,6 +21,15 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
 
+console.log('ENV sanity', {
+  hasToken: !!process.env.DISCORD_BOT_TOKEN,
+  hasClient: !!process.env.DISCORD_CLIENT_ID,
+  hasGuild: !!process.env.DISCORD_GUILD_ID,          // optional
+  hasDbUrl: !!process.env.FB_DATABASE_URL,
+  hasSAJson: !!process.env.FB_SERVICE_ACCOUNT_JSON,
+  hasSAPath: !!process.env.FB_SERVICE_ACCOUNT_PATH,
+});
+
 
 const {
   Client,
@@ -70,7 +79,7 @@ const globalCache = {
 };
 
 const isEphemeralCommand = (name) => new Set([
-  'whoami', 'dumpme', 'syncavatar', 'post', 'postmessage'
+  'whoami', 'dumpme', 'syncavatar', 'post', 'postmessage', 'link'
 ]).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
@@ -916,6 +925,17 @@ async function registerCommands() {
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (interaction.isChatInputCommand()) {
+      const eph = isEphemeralCommand(interaction.commandName);
+      await interaction.deferReply(eph ? { ephemeral: true } : {});
+      console.log(`[ACK] /${interaction.commandName} deferred`);
+    }
+  } catch (err) {
+    console.warn('[deferReply failed]', err?.rawError || err);
+    return; // if we didn’t ack, bail out — otherwise Discord shows “did not respond”
+  }
+
+  try {
     const tag = interaction.user?.tag ?? 'unknown';
     const name = interaction.isChatInputCommand() ? interaction.commandName : interaction.customId;
     console.log(`[INT] ${name} from ${tag} (${interaction.user?.id}) at ${new Date().toISOString()}`);
@@ -1122,22 +1142,9 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'link') {
       const start = process.env.AUTH_BRIDGE_START_URL;
       const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-      // This command is simple and doesn't need deferral
-      return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
+      return await interaction.editReply({ content: `Click to link your account: ${url}` });
     }
-
-    // Defer all other commands immediately
-    try {
-      await interaction.deferReply(isEphemeralCommand(commandName) ? { ephemeral: true } : {});
-    } catch (err) {
-      // If we missed the 3s window, there’s nothing we can do for this interaction.
-      if (err?.code === 10062 || err?.rawError?.code === 10062) {
-        console.warn('[deferReply] Unknown interaction — likely cold start or token expired.');
-        return;
-      }
-      throw err;
-    }
-
+    
     if (commandName === 'whoami') {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
       await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
@@ -1406,6 +1413,20 @@ process.on('unhandledRejection', e => console.error('unhandledRejection', e));
 process.on('uncaughtException', e => console.error('uncaughtException', e));
 
 (async () => {
-  await registerCommands();
-  await client.login(process.env.DISCORD_BOT_TOKEN);
-})
+  try {
+    console.log('Registering slash commands…');
+    await registerCommands();
+    console.log('Slash command registration complete.');
+  } catch (e) {
+    console.error('registerCommands FAILED:', e?.rawError || e);
+  }
+
+  try {
+    console.log('Logging into Discord…');
+    await client.login(process.env.DISCORD_BOT_TOKEN);
+    console.log('Login promise resolved.');
+  } catch (e) {
+    console.error('client.login FAILED:', e?.rawError || e);
+    process.exit(1); // don’t keep a “healthy” web server without the bot
+  }
+})();
