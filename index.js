@@ -148,7 +148,7 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
     // Token expired / unknown interaction / perms issues: try followUp (supports flags)
     if (isExpiredToken(err) || isPermsError(err)) {
       try {
-        return await interaction.followUp(data.flags ? data : { ...data, flags: EPHEMERAL_FLAG });
+        return await interaction.followUp(data.ephemeral === undefined ? { ...data, ephemeral: true } : data);
       } catch {
         if (interaction.channel && fallbackText) {
           try { await interaction.channel.send(fallbackText); } catch {}
@@ -402,9 +402,10 @@ async function fetchLatestMessages(limit = 10) {
 function buildMessagesEmbed(list, userNames = {}) {
   const desc = list
     .map((m, i) => {
-      const who = userNames[m.uid] || m.user || '(unknown)';
+      const who = m.user || userNames[m.uid] || m.username || m.displayName || '(unknown)';
       const text = m.text?.length > 100 ? m.text.slice(0, 100) + '…' : m.text;
-      return `**${i + 1}. ${who}**\n— ${text || '_no text_'}\nReplies: **${m.replies ? Object.keys(m.replies).length : 0}**`;
+      const when = m.time ? new Date(m.time).toLocaleString() : '';
+      return `**${i + 1}. ${who}** — _${when}_\n— ${text || '_no text_'}\nReplies: **${m.replies ? Object.keys(m.replies).length : 0}**`;
     })
     .join('\n\n');
 
@@ -444,7 +445,7 @@ function fmtTime(ms){
 }
 
 function buildMessageDetailEmbed(msg, nameMap = {}) {
-  const who = nameMap[msg.uid] || msg.user || '(unknown)';
+  const who = msg.user || nameMap[msg.uid] || msg.username || msg.displayName || '(unknown)';
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
 
@@ -497,7 +498,7 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
   const start = page*pageSize;
   const slice = children.slice(start, start+pageSize);
   const lines = slice.map((r,i)=>{
-    const who = nameMap[r.uid] || r.user || '(unknown)';
+    const who = r.user || nameMap[r.uid] || r.username || r.displayName || '(unknown)';
     const txt = (r.text||'').toString().slice(0,120) || '(no text)';
     return `**${i+1}. ${who}** — ${txt}`;
   }).join('\n\n') || '_No replies yet_';
@@ -510,26 +511,30 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
 }
 
 function threadRows(parentPath, children, page=0, pageSize=10) {
+  const rows = [];
   const maxPage = Math.max(0, Math.ceil(children.length/pageSize)-1);
   const start = page*pageSize;
-  const rowNums = new ActionRowBuilder();
-  for (let i=0;i<Math.min(children.length-start,5);i++){
-    rowNums.addComponents(
+
+  const numRow = new ActionRowBuilder();
+  for (let i=0; i<Math.min(children.length-start,5); i++) {
+    numRow.addComponents(
       new ButtonBuilder()
         .setCustomId(`msg:openChild:${encPath(children[start+i].path)}`)
         .setLabel(String(i+1))
         .setStyle(ButtonStyle.Secondary)
     );
   }
-  return [
-    rowNums,
+  if (numRow.components.length) rows.push(numRow); // <- only add if non-empty
+
+  rows.push(
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
       new ButtonBuilder().setCustomId(`msg:thread:${encPath(parentPath)}:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
       new ButtonBuilder().setCustomId(`msg:openPath:${encPath(parentPath)}`).setLabel('Back to message').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
-    ),
-  ];
+    )
+  );
+  return rows;
 }
 
 
@@ -932,15 +937,13 @@ client.on('interactionCreate', async (interaction) => {
     else if (interaction.customId.startsWith('msg:')) {
       const invokerId = interaction.message.interaction?.user?.id;
       if (invokerId && invokerId !== interaction.user.id) {
-        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+        return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
       }
+    
       try {
-        await interaction.deferUpdate();
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
         let state = interaction.client.msgCache.get(key);
-    
-        // If cache is gone (message aged out), rebuild it
         if (!state) {
           const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
           state = { list, nameMap };
@@ -949,97 +952,8 @@ client.on('interactionCreate', async (interaction) => {
     
         const [ns, action, a, b] = interaction.customId.split(':'); // msg:<action>:...
     
-        // 1) Show detail for index from the list
-        if (action === 'view' || action === 'openIdx') {
-          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
-          const msg = state.list[idx];
-          const fresh = await loadNode(msg.path); // pull latest likes/replies counts
-          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
-        }
-    
-        // 2) Back to index list
-        else if (action === 'back') {
-          const embed = buildMessagesEmbed(state.list, state.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
-        }
-    
-        // 3) Refresh a single detail (keep idx in button)
-        else if (action === 'refreshOne') {
-          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
-          const msg = state.list[idx];
-          const fresh = await loadNode(msg.path);
-          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
-        }
-    
-        // 4) Open detail by absolute path (used when coming “up” from a thread)
-        else if (action === 'openPath') {
-          const path = decPath(a);
-          const idx = state.list.findIndex(m=>m.path===path);
-          const base = idx>=0 ? state.list[idx] : await loadNode(path);
-          const fresh = await loadNode(path);
-          const embed = buildMessageDetailEmbed({ ...(base||{}), ...(fresh||{}) }, state.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path) });
-        }
-    
-        // 5) Thread view (pageable)
-        else if (action === 'thread') {
-          const path = decPath(a);
-          const page = parseInt(b||'0',10) || 0;
-          const parent = await loadNode(path);
-          const children = await loadReplies(path);
-          const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
-          await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
-        }
-    
-        // 6) Open a child reply as its own message (so you can like/reply to replies)
-        else if (action === 'openChild') {
-          const path = decPath(a);
-          const node = await loadNode(path);
-          const embed = buildMessageDetailEmbed(node, state.nameMap);
-          // Build rows against this path, but Prev/Next don’t apply (we don’t know siblings from list); just show thread controls:
-          const rows = [
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
-              new ButtonBuilder().setCustomId(`msg:openPath:${encPath(path.split('/replies/').slice(0,-1).join('/replies/'))}`).setLabel('Up one level').setStyle(ButtonStyle.Secondary),
-              new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
-            ),
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`msg:like:${encPath(path)}`).setLabel('❤️ Like/Unlike').setStyle(ButtonStyle.Primary),
-              new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
-            ),
-          ];
-          await safeEdit(interaction, { embeds: [embed], components: rows });
-        }
-    
-        // 7) Like/unlike (mirrors website logic)
-        else if (action === 'like') {
-          const discordId = interaction.user.id;
-          const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await safeEdit(interaction, { content: 'Link your KC account first with /link.', components: [] });
-    
-          const path = decPath(a);
-          // read if liked
-          const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
-          const wasLiked = likedSnap.exists();
-    
-          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
-          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
-    
-          // Refresh current node
-          const node = await loadNode(path);
-          const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
-          // If this was a list item, try to update cached copy too
-          if (state) {
-            const i = state.list.findIndex(m=>m.path===path);
-            if (i>=0) state.list[i] = { ...state.list[i], ...node };
-          }
-          await safeEdit(interaction, { embeds: [embed] });
-        }
-    
-        // 8) Reply — show a modal
-        else if (action === 'reply') {
+        // ✅ Modal path: DO NOT defer
+        if (action === 'reply') {
           const path = decPath(a);
           const modal = new ModalBuilder()
             .setCustomId(`msg:replyModal:${encPath(path)}`)
@@ -1055,6 +969,77 @@ client.on('interactionCreate', async (interaction) => {
           return await interaction.showModal(modal);
         }
     
+        // ✅ Everything else can be safely deferred
+        await interaction.deferUpdate();
+    
+        if (action === 'view' || action === 'openIdx') {
+          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
+          const msg = state.list[idx];
+          const fresh = await loadNode(msg.path);
+          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
+        }
+        if (action === 'back') {
+          const embed = buildMessagesEmbed(state.list, state.nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
+        }
+        if (action === 'refreshOne') {
+          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
+          const msg = state.list[idx];
+          const fresh = await loadNode(msg.path);
+          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path) });
+        }
+        if (action === 'openPath') {
+          const path = decPath(a);
+          const idx = state.list.findIndex(m=>m.path===path);
+          const base = idx>=0 ? state.list[idx] : await loadNode(path);
+          const fresh = await loadNode(path);
+          const embed = buildMessageDetailEmbed({ ...(base||{}), ...(fresh||{}) }, state.nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path) });
+        }
+        if (action === 'thread') {
+          const path = decPath(a);
+          const page = parseInt(b||'0',10) || 0;
+          const parent = await loadNode(path);
+          const children = await loadReplies(path);
+          const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
+          return await safeEdit(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
+        }
+        if (action === 'openChild') {
+          const path = decPath(a);
+          const node = await loadNode(path);
+          const embed = buildMessageDetailEmbed(node, state.nameMap);
+          const rows = [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId(`msg:openPath:${encPath(path.split('/replies/').slice(0,-1).join('/replies/'))}`).setLabel('Up one level').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
+            ),
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`msg:like:${encPath(path)}`).setLabel('❤️ Like/Unlike').setStyle(ButtonStyle.Primary),
+              new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
+            ),
+          ];
+          return await safeEdit(interaction, { embeds: [embed], components: rows });
+        }
+        if (action === 'like') {
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) return await safeEdit(interaction, { content: 'Link your KC account first with /link.' });
+    
+          const path = decPath(a);
+          const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
+          const wasLiked = likedSnap.exists();
+          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
+          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
+    
+          const node = await loadNode(path);
+          const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
+          const i = state.list.findIndex(m=>m.path===path);
+          if (i>=0) state.list[i] = { ...state.list[i], ...node };
+          return await safeEdit(interaction, { embeds: [embed] }); // components persist
+        }
       } catch (e) {
         console.error('msg button error:', e);
         await safeEdit(interaction, { content: 'Sorry — could not update messages right now.', components: [] });
@@ -1079,7 +1064,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.isModalSubmit() && interaction.customId.startsWith('msg:replyModal:')) {
     try {
-      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
+      await interaction.deferReply({ ephemeral: true });
       const path = decPath(interaction.customId.split(':')[2]);
       const text = interaction.fields.getTextInputValue('replyText').trim();
       if (!text) return interaction.editReply('Reply can’t be empty.');
@@ -1104,7 +1089,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply('✅ Reply posted!');
     } catch (e) {
       console.error('reply modal error:', e);
-      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', flags: EPHEMERAL_FLAG });
+      if (!interaction.replied) await interaction.reply({ content: 'Failed to post reply.', ephemeral: true });
     }
   }
 
@@ -1118,7 +1103,7 @@ client.on('interactionCreate', async (interaction) => {
       const start = process.env.AUTH_BRIDGE_START_URL;
       const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
       // This command is simple and doesn't need deferral
-      return interaction.reply({ content: `Click to link your account: ${url}`, flags: EPHEMERAL_FLAG });
+      return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
     }
 
     // Defer all other commands immediately
@@ -1362,7 +1347,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.replied || interaction.deferred) {
         await interaction.editReply({ content: msg, embeds: [], components: [] });
       } else {
-        await interaction.reply({ content: msg, flags: EPHEMERAL_FLAG });
+        await interaction.reply({ content: msg, ephemeral: true });
       }
     } catch (e) {
       console.error('Failed to send error reply:', e);
