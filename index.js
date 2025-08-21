@@ -918,11 +918,16 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // Defer all other commands immediately
-    await interaction.deferReply(
-      isEphemeralCommand(commandName)
-        ? { flags: EPHEMERAL_FLAG }
-        : {}
-    );
+    try {
+      await interaction.deferReply(isEphemeralCommand(commandName) ? { ephemeral: true } : {});
+    } catch (err) {
+      // If we missed the 3s window, there’s nothing we can do for this interaction.
+      if (err?.code === 10062 || err?.rawError?.code === 10062) {
+        console.warn('[deferReply] Unknown interaction — likely cold start or token expired.');
+        return;
+      }
+      throw err;
+    }
 
     if (commandName === 'whoami') {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
