@@ -133,19 +133,13 @@ admin.initializeApp({
 const rtdb = admin.database();
 
 // ---------- Helpers ----------
-function isPermsError(err) { return err?.code === 50013; }
-
-function isExpiredToken(err) {
-  return (
-    err?.code === 10062 || // Unknown interaction
-    err?.code === 50027 || // Invalid Webhook Token
-    err?.status === 401    // Unauthorized (same effect)
-  );
-}
+function isPermsError(err){ return err?.code === 50013; }
+function isExpiredToken(err){ return err?.code === 10062 || err?.code === 50027 || err?.status === 401; }
 
 function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
+// 4) Make safeEdit() resilient to race conditions
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -154,33 +148,25 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
       return await interaction.reply(data);
     }
   } catch (err) {
-    console.warn('[safeEdit] primary edit/reply failed', err);
+    // If we guessed wrong and it's already acknowledged, try editReply instead of reply
+    if (err?.code === 40060) {
+      try { return await interaction.editReply(data); } catch (e2) { err = e2; }
+    }
     if (isExpiredToken(err) || isPermsError(err)) {
-      try {
-        return await interaction.followUp(data);
-      } catch (e2) {
-        console.warn('[safeEdit] followUp failed', e2);
-        if (interaction.channel && fallbackText) {
-          try { await interaction.channel.send(fallbackText); } catch {}
-        }
-      }
+      try { return await interaction.followUp(data); } catch {}
+      try { return await interaction.channel?.send(fallbackText); } catch {}
       return null;
     }
-    // For other errors, we re-throw so the centralized handler can catch it.
     throw err;
   }
 }
 
-// 4) Tighten your “defer then ping” helper
+// 2) Never mix reply() after deferReply()
 async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Working…' } = {}) {
   if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply(ephemeral ? { ephemeral: true } : {}); // throw if it fails
+    await interaction.deferReply(ephemeral ? { flags: EPHEMERAL_FLAG } : {});
   }
-  try {
-    await interaction.editReply({ content: text });
-  } catch (e) {
-    console.warn('[editReply after defer failed]', e);
-  }
+  try { await interaction.editReply({ content: text }); } catch {}
 }
 
 function startReplyWatchdog(interaction, ms = 5000) {
@@ -192,16 +178,10 @@ function startReplyWatchdog(interaction, ms = 5000) {
   return () => clearTimeout(t);
 }
 
-// --- Promise timeout wrapper so we never hang indefinitely
-function withTimeout(promise, ms, label = 'operation') {
-  let t;
-  const timeout = new Promise((_, rej) => {
-    t = setTimeout(() => rej(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
-  });
-  return Promise.race([
-    promise.finally(() => clearTimeout(t)),
-    timeout,
-  ]);
+// 7) Trim long operations to avoid the 3-second ACK window
+async function withTimeout(promise, ms, label='op') {
+  let t; const timeout = new Promise((_,rej)=> t=setTimeout(()=>rej(new Error(`Timeout ${ms}ms: ${label}`)), ms));
+  return Promise.race([ promise.finally(()=>clearTimeout(t)), timeout ]);
 }
 
 async function hasEmerald(uid) {
@@ -595,8 +575,9 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
       .setLabel('Back to message')
       .setStyle(ButtonStyle.Secondary),
 
+    // 6) Fix duplicate custom IDs on thread view
     new ButtonBuilder()
-      .setCustomId('msg:back')
+      .setCustomId('msg:list') // Use a unique ID
       .setLabel('Back to list')
       .setStyle(ButtonStyle.Secondary),
   );
@@ -1079,25 +1060,19 @@ async function registerCommands() {
   }
 }
 
-// 2) Guard against duplicate deliveries in-process
-const seen = new Set();
-setInterval(() => seen.clear(), 60_000);
-
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
-  // De-dupe
-  const id = interaction.id;
-  if (seen.has(id)) {
-    console.warn(`[INT] duplicate seen: ${id}`);
+  // 1) De-dupe deliveries and log age
+  const seen = globalThis.__seen ??= new Set();
+  if (seen.has(interaction.id)) {
+    console.warn(`[INT] duplicate seen: ${interaction.id}`);
     return;
   }
-  seen.add(id);
+  seen.add(interaction.id);
+  setTimeout(() => seen.delete(interaction.id), 60_000);
+  console.log(`[INT] ${interaction.isChatInputCommand() ? interaction.commandName : interaction.customId} from ${interaction.user?.tag} age=${Date.now()-interaction.createdTimestamp}ms`);
 
   try {
-    // Log with age
-    const name = interaction.isChatInputCommand() ? interaction.commandName : interaction.customId;
-    console.log(`[INT] ${name} from ${interaction.user?.tag} age=${Date.now()-interaction.createdTimestamp}ms`);
-
     // --- Immediate Reply/Modal Commands (no defer) ---
     if (interaction.isChatInputCommand()) {
       const commandName = interaction.commandName;
@@ -1145,12 +1120,12 @@ client.on('interactionCreate', async (interaction) => {
       }
       
       // --- Defer all other commands once ---
-      if (!interaction.deferred && !interaction.replied) {
-        await deferAndPing(interaction, { ephemeral: isEphemeralCommand(commandName) });
-      }
+      const ephemeral = isEphemeralCommand(commandName);
+      await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
     }
 
     // --- Button/Modal handlers ---
+    // 5) Button handlers: ACK with deferUpdate() once
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('vote:change:')) {
         const uid = interaction.customId.split(':')[2];
@@ -1173,11 +1148,13 @@ client.on('interactionCreate', async (interaction) => {
          await interaction.showModal(modal);
          return;
       }
+      // For all other buttons, defer the update immediately
+      await interaction.deferUpdate();
     }
     if (interaction.isModalSubmit()) {
-      // All modal logic is self-contained and replies, so we can just return after.
+      // 3) Modal flows: don’t defer first
+      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
       if (interaction.customId.startsWith('msg:replyModal:')) {
-        await interaction.deferReply({ ephemeral: true });
         const path = decPath(interaction.customId.split(':')[2]);
         const text = interaction.fields.getTextInputValue('replyText').trim();
         if (!text) return interaction.editReply('Reply can’t be empty.');
@@ -1190,7 +1167,6 @@ client.on('interactionCreate', async (interaction) => {
         await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 4000, `RTDB ${path}/replies.push`);
         await interaction.editReply('✅ Reply posted!');
       } else if (interaction.customId === 'vote:modal') {
-        await interaction.deferReply({ ephemeral: true });
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) return interaction.editReply('Link your KC account first with /link.');
@@ -1466,7 +1442,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ embeds:[embed] });
       }
     } else if (interaction.isButton()) {
-      await interaction.deferUpdate();
       if (interaction.customId.startsWith('lb:')) {
         const [, , catStr, pageStr] = interaction.customId.split(':');
         const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
@@ -1500,7 +1475,7 @@ client.on('interactionCreate', async (interaction) => {
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
           await safeEdit(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
-        else if (action === 'back') {
+        else if (action === 'back' || action === 'list') {
           const embed = buildMessagesEmbed(state.list, state.nameMap);
           await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
         }
