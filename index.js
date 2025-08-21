@@ -5,6 +5,22 @@
 // Make dotenv optional (used locally, ignored on Render if not installed)
 try { require('dotenv').config(); } catch (_) {}
 
+// Healthcheck server for Render
+const express = require('express');
+const app = express();
+app.get('/', (_req, res) => res.status(200).send('OK'));
+app.get('/health', (_req, res) => {
+  const status = {
+    up: true,
+    uptime: process.uptime(),
+    memory: process.memoryUsage().rss,
+    ts: Date.now(),
+  };
+  res.status(200).json(status);
+});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
+
 
 const {
   Client,
@@ -111,25 +127,6 @@ function isExpiredToken(err) {
   );
 }
 
-async function safeDefer(interaction, { ephemeral = false } = {}) {
-  const age = Date.now() - interaction.createdTimestamp;
-  if (age > 2900) return false;
-  if (interaction.deferred || interaction.replied) return true;
-  try {
-    await interaction.deferReply({ ephemeral });
-    return true;
-  } catch (err) {
-    // Retry as ephemeral (often succeeds even if channel send perms are missing)
-    try {
-      await interaction.deferReply({ ephemeral: true });
-      return true;
-    } catch (e2) {
-      console.warn(`[safeDefer] All defer attempts failed for interaction ${interaction.id}`);
-      return false;
-    }
-  }
-}
-
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -163,49 +160,6 @@ function withTimeout(promise, ms, label = 'operation') {
     promise.finally(() => clearTimeout(t)),
     timeout,
   ]);
-}
-
-function watchdog(ms, onTimeout) {
-  let done = false;
-  const t = setTimeout(() => { if (!done) onTimeout(); }, ms);
-  return () => { done = true; clearTimeout(t); };
-}
-
-// Always produce a user-visible message even if interaction token expired
-async function finalRespond(interaction, data, fallbackText = null) {
-  try {
-    if (interaction.deferred || interaction.replied) {
-      return await interaction.editReply(data);
-    }
-    // brand new reply
-    return await interaction.reply({ ...data, ephemeral: data.ephemeral || false });
-  } catch (err) {
-    // If editReply failed because the token is invalid, perms are missing, etc.
-    if (isExpiredToken(err) || isPermsError(err)) {
-      console.warn(`[finalRespond] editReply failed for ${interaction.id}, attempting followup.`);
-      try {
-        // followUp can be used to send a new message after the token expires.
-        return await interaction.followUp({ ...data, ephemeral: true });
-      } catch (followUpErr) {
-        console.error('[finalRespond] FollowUp also failed:', followUpErr);
-        // As a last resort, send a message to the channel if we have a fallback.
-        if (interaction.channel && fallbackText) {
-          try { await interaction.channel.send(fallbackText); } catch (_) {}
-        }
-      }
-      return null;
-    }
-    // Re-throw other, unexpected errors
-    throw err;
-  }
-}
-
-function progressKick(interaction, ms = 2900, text = 'Still working…') {
-  const cancel = watchdog(ms, () => {
-    // always ephemeral so we don’t spam channels if something stalls
-    finalRespond(interaction, { content: text, ephemeral: true }, text);
-  });
-  return cancel;
 }
 
 async function hasEmerald(uid) {
@@ -864,522 +818,348 @@ client.on('interactionCreate', async (interaction) => {
     console.log(`[INT] ${name} from ${tag} (${interaction.user?.id}) at ${new Date().toISOString()}`);
   } catch (_) {}
 
-  if (interaction.isButton() && interaction.customId.startsWith('lb:')) {
-    try {
-      await interaction.deferUpdate();
-      const cancel = progressKick(interaction, 2000, 'Refreshing…');
-      const [, , catStr, pageStr] = interaction.customId.split(':');
-      const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
-      const page   = Math.max(0, parseInt(pageStr,10) || 0);
+  if (interaction.isButton()) {
+    // Button handlers can remain largely the same, but we'll use safeEdit for consistency
+    if (interaction.customId.startsWith('lb:')) {
+      try {
+        await interaction.deferUpdate();
+        const [, , catStr, pageStr] = interaction.customId.split(':');
+        const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
+        const page   = Math.max(0, parseInt(pageStr,10) || 0);
 
-      let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
-      if (!Array.isArray(rows)) {
-        console.log('[LB] cache miss, reloading data');
-        rows = await loadLeaderboardData();
+        let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
+        if (!Array.isArray(rows)) {
+          console.log('[LB] cache miss, reloading data');
+          rows = await loadLeaderboardData();
+        }
+
+        const embed = buildLbEmbed(rows, catIdx, page);
+        await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
+      } catch (e) {
+        console.error('lb button error:', e);
+        await safeEdit(interaction, { content: 'Sorry — leaderboard couldn’t refresh right now.', components: [] });
       }
-
-      const embed = buildLbEmbed(rows, catIdx, page);
-      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
-      cancel();
-    } catch (e) {
-      console.error('lb button error:', e);
-      await safeEdit(interaction, { content: 'Sorry — leaderboard couldn’t refresh right now.', components: [] });
     }
-    return;
-  }
+    else if (interaction.customId.startsWith('msg:')) {
+      try {
+        await interaction.deferUpdate();
+        const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
+        const action = parts[1];
 
-  if (interaction.isButton() && interaction.customId.startsWith('msg:')) {
-    try {
-      await interaction.deferUpdate();
-      const cancel = progressKick(interaction, 2000, 'Refreshing…');
-      const parts = interaction.customId.split(':'); // msg:view:idx | msg:back | msg:refresh | msg:refreshOne:idx
-      const action = parts[1];
+        const key = interaction.message.interaction?.id || '';
+        interaction.client.msgCache ??= new Map();
+        let cache = interaction.client.msgCache.get(key);
 
-      // Find cached data from the originating slash interaction
-      const key = interaction.message.interaction?.id || '';
-      interaction.client.msgCache ??= new Map();
-      let cache = interaction.client.msgCache.get(key);
+        if (!cache) {
+          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+          cache = { list, nameMap };
+          interaction.client.msgCache.set(key, cache);
+        }
 
-      // If cache missing, reload latest
-      if (!cache) {
-        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-        cache = { list, nameMap };
-        interaction.client.msgCache.set(key, cache);
+        if (action === 'view') {
+          const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
+          const msg = cache.list[idx];
+          const embed = buildRepliesEmbed(msg, cache.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
+        } else if (action === 'back') {
+          const embed = buildMessagesEmbed(cache.list, cache.nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
+        } else if (action === 'refresh') {
+          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+          interaction.client.msgCache.set(key, { list, nameMap });
+          const embed = buildMessagesEmbed(list, nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
+        } else if (action === 'refreshOne') {
+          const idx = parseInt(parts[2] || '0', 10);
+          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+          interaction.client.msgCache.set(key, { list, nameMap });
+          const msg = list[idx] || list[0];
+          const embed = buildRepliesEmbed(msg, nameMap);
+          await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
+        }
+      } catch (e) {
+        console.error('msg button error:', e);
+        await safeEdit(interaction, { content: 'Sorry — messages couldn’t refresh right now.', components: [] });
       }
-
-      if (action === 'view') {
-        const idx = Math.max(0, Math.min(parseInt(parts[2] || '0', 10), (cache.list.length || 1) - 1));
-        const msg = cache.list[idx];
-        const embed = buildRepliesEmbed(msg, cache.nameMap);
-        await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(idx)] });
-      } else if (action === 'back') {
-        const embed = buildMessagesEmbed(cache.list, cache.nameMap);
-        await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(cache.list.length || 0) });
-      } else if (action === 'refresh') {
-        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-        interaction.client.msgCache.set(key, { list, nameMap });
-        const embed = buildMessagesEmbed(list, nameMap);
-        await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
-      } else if (action === 'refreshOne') {
-        const idx = parseInt(parts[2] || '0', 10);
-        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-        interaction.client.msgCache.set(key, { list, nameMap });
-        const msg = list[idx] || list[0];
-        const embed = buildRepliesEmbed(msg, nameMap);
-        await safeEdit(interaction, { embeds: [embed], components: [repliesNavRow(Math.max(0, idx))] });
-      }
-      cancel();
-    } catch (e) {
-      console.error('msg button error:', e);
-      await safeEdit(interaction, { content: 'Sorry — messages couldn’t refresh right now.', components: [] });
     }
-    return;
-  }
-
-  if (interaction.isButton() && interaction.customId === 'votes:refresh') {
-    try {
-      await interaction.deferUpdate();
-      const cancel = progressKick(interaction, 2000, 'Refreshing…');
-      const scores = await loadVoteScores();
-      const embed = buildVoteEmbed(scores);
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
-      );
-      await safeEdit(interaction, { embeds: [embed], components: [row] });
-      cancel();
-    } catch (e) {
-      console.error('votes refresh error:', e);
-      await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
+    else if (interaction.customId === 'votes:refresh') {
+      try {
+        await interaction.deferUpdate();
+        const scores = await loadVoteScores();
+        const embed = buildVoteEmbed(scores);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+        );
+        await safeEdit(interaction, { embeds: [embed], components: [row] });
+      } catch (e) {
+        console.error('votes refresh error:', e);
+        await safeEdit(interaction, { content: 'Sorry — voting scores couldn’t refresh right now.', components: [] });
+      }
     }
     return;
   }
 
   if (!interaction.isChatInputCommand()) return;
 
-  const handleDeferFailure = async () => {
-    console.warn(`[DEFER FAIL] ${interaction.commandName} in #${interaction.channel?.id} — missing perms or token expired`);
-    try {
-        await interaction.reply({ content: 'Sorry, that timed out. Please run the command again.', ephemeral: true });
-    } catch {
-        if (interaction.channel) { try { await interaction.channel.send('Sorry, that timed out. Please run the command again.'); } catch {} }
+  // Centralized error handler for all slash commands
+  try {
+    const { commandName } = interaction;
+
+    if (commandName === 'link') {
+      const start = process.env.AUTH_BRIDGE_START_URL;
+      const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
+      // This command is simple and doesn't need deferral
+      return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
     }
-  };
 
-  if (interaction.commandName === 'link') {
-    const start = process.env.AUTH_BRIDGE_START_URL;
-    const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-    return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
-  }
+    // Defer all other commands immediately
+    await interaction.deferReply({ ephemeral: ['whoami', 'dumpme', 'syncavatar', 'post'].includes(commandName) });
 
-  if (interaction.commandName === 'whoami') {
-    const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction, 4000);
-
-    try {
-      console.log('[INT] whoami -> getKCUidForDiscord');
+    if (commandName === 'whoami') {
       const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-      await finalRespond(
-        interaction,
-        { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``, ephemeral: true },
-        'The whoami reply expired. Please try again.'
-      );
-    } catch (e) {
-      console.error('whoami error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong.', ephemeral: true }, 'whoami failed, please try again.');
-    } finally {
-      cancelProgress();
+      await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
     }
-    return;
-  }
-
-  if (interaction.commandName === 'dumpme') {
-    const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction, 4000);
-
-    try {
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) {
-        await safeEdit(interaction, { content: 'Not linked. Run `/link` first.', ephemeral: true });
-        return;
-      }
-
-      const [userRT, badgesRT, postsRT] = await Promise.all([
-        withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
-        withTimeout(rtdb.ref(`badges/${uid}`).get(), 4000, `RTDB badges/${uid}`),
-        withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`),
-      ]);
-
-      const firestore = admin.firestore();
-      const [userFS, postsFS] = await Promise.all([
-        withTimeout(firestore.collection('users').doc(uid).get(), 4000, `FS users/${uid}`),
-        withTimeout(firestore.collection('users').doc(uid).collection('posts').get(), 4000, `FS users/${uid}/posts`),
-      ]);
-
-      const brief = (val) => {
-        const v = val && typeof val.val === 'function' ? val.val() : val;
-        if (!v || typeof v !== 'object') return v ?? null;
-        const keys = Object.keys(v);
-        const sample = {};
-        for (const k of keys.slice(0, 8)) sample[k] = v[k];
-        return { keys, sample };
-      };
-
-      const payload = {
-        uid,
-        rtdb: {
-          user: brief(userRT),
-          badges: brief(badgesRT),
-          postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0,
-        },
-        firestore: {
-          userExists: userFS.exists,
-          userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [],
-          postsCount: postsFS.size,
+    else if (commandName === 'dumpme') {
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return await interaction.editReply({ content: 'Not linked. Run `/link` first.' });
         }
-      };
 
-      await safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```', ephemeral: true });
-    } catch (e) {
-      console.error('dumpme error:', e);
-      await safeEdit(interaction, { content: 'Error reading data (see logs).', ephemeral: true });
-    } finally {
-      cancelProgress();
+        const [userRT, badgesRT, postsRT] = await Promise.all([
+          withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
+          withTimeout(rtdb.ref(`badges/${uid}`).get(), 4000, `RTDB badges/${uid}`),
+          withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 4000, `RTDB users/${uid}/posts`),
+        ]);
+
+        const firestore = admin.firestore();
+        const [userFS, postsFS] = await Promise.all([
+          withTimeout(firestore.collection('users').doc(uid).get(), 4000, `FS users/${uid}`),
+          withTimeout(firestore.collection('users').doc(uid).collection('posts').get(), 4000, `FS users/${uid}/posts`),
+        ]);
+
+        const brief = (val) => {
+          const v = val && typeof val.val === 'function' ? val.val() : val;
+          if (!v || typeof v !== 'object') return v ?? null;
+          const keys = Object.keys(v);
+          const sample = {};
+          for (const k of keys.slice(0, 8)) sample[k] = v[k];
+          return { keys, sample };
+        };
+
+        const payload = {
+          uid,
+          rtdb: {
+            user: brief(userRT),
+            badges: brief(badgesRT),
+            postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0,
+          },
+          firestore: {
+            userExists: userFS.exists,
+            userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [],
+            postsCount: postsFS.size,
+          }
+        };
+        await interaction.editReply({ content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
     }
-    return;
-  }
-
-  if (interaction.commandName === 'leaderboard') {
-    const ok = await safeDefer(interaction); // public
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction);
-
-    try {
-      console.log('[INT] leaderboard -> loadLeaderboardData');
-      const rows = await loadLeaderboardData();
-      const catIdx = 0, page = 0;
-      const embed = buildLbEmbed(rows, catIdx, page);
-      await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
-      interaction.client.lbCache ??= new Map(); 
-      interaction.client.lbCache.set(interaction.id, rows);
-    } catch (e) {
-        console.error('leaderboard error:', e);
-        await finalRespond(interaction, { content: 'Something went wrong.' }, 'leaderboard failed, please try again.');
-    } finally {
-        cancelProgress();
+    else if (commandName === 'leaderboard') {
+        const rows = await loadLeaderboardData();
+        const catIdx = 0, page = 0;
+        const embed = buildLbEmbed(rows, catIdx, page);
+        interaction.client.lbCache ??= new Map(); 
+        interaction.client.lbCache.set(interaction.id, rows);
+        await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
     }
-    return;
-  }
+    else if (commandName === 'clips') {
+        const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
+        const all = await fetchAllPosts({ platform });
+        if (!all.length) {
+          return await interaction.editReply({ content: 'No clips found.' });
+        }
 
-  if (interaction.commandName === 'clips') {
-    const ok = await safeDefer(interaction); // public
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction);
+        all.sort((a, b) => b.score - a.score);
+        const top = all.slice(0, 5);
+        const nameMap = await getAllUserNames();
 
-    try {
-      const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
-      const all = await fetchAllPosts({ platform });
-      if (!all.length) {
-        await safeEdit(interaction, { content: 'No clips found.' });
-        return;
-      }
+        const lines = top.map((p, i) => {
+          const d = p.data || {};
+          const who = nameMap[p.ownerUid] || '(unknown)';
+          const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
+          let link = '';
+          if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
+          else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
+          const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
+          return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
+        });
 
-      // Sort by popularity score and take top 5
-      all.sort((a, b) => b.score - a.score);
-      const top = all.slice(0, 5);
+        const embed = new EmbedBuilder()
+          .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
+          .setDescription(lines.join('\n\n'))
+          .setColor(DEFAULT_EMBED_COLOR)
+          .setFooter({ text: 'KC Bot • /clips' });
 
-      const nameMap = await getAllUserNames();
-
-      const lines = top.map((p, i) => {
-        const d = p.data || {};
-        const who = nameMap[p.ownerUid] || '(unknown)';
-        const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
-        let link = '';
-        if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
-        else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
-
-        const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
-        return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
-      });
-
-      const embed = new EmbedBuilder()
-        .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
-        .setDescription(lines.join('\n\n'))
-        .setColor(DEFAULT_EMBED_COLOR)
-        .setFooter({ text: 'KC Bot • /clips' });
-
-      await safeEdit(interaction, { embeds: [embed] }, 'The reply expired—try `/clips` again.');
-    } catch (e) {
-      console.error('clips error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong.' }, 'clips failed, please try again.');
-    } finally {
-      cancelProgress();
+        await interaction.editReply({ embeds: [embed] });
     }
-    return;
-  }
-
-  if (interaction.commandName === 'messages') {
-    const ok = await safeDefer(interaction); // public
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction);
-
-    try {
-      const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-      const embed = buildMessagesEmbed(list, nameMap);
-
-      // Cache for the buttons handler
-      interaction.client.msgCache ??= new Map();
-      interaction.client.msgCache.set(interaction.id, { list, nameMap });
-
-      await safeEdit(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
-    } catch (e) {
-      console.error('messages error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong.' }, 'messages failed, please try again.');
-    } finally {
-      cancelProgress();
+    else if (commandName === 'messages') {
+        const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
+        const embed = buildMessagesEmbed(list, nameMap);
+        interaction.client.msgCache ??= new Map();
+        interaction.client.msgCache.set(interaction.id, { list, nameMap });
+        await interaction.editReply({ embeds: [embed], components: messageIndexRows(list.length || 0) });
     }
-    return;
-  }
-
-  if (interaction.commandName === 'votingscores') {
-    const ok = await safeDefer(interaction); // public
-    if (!ok) return handleDeferFailure();
-    const cancelProgress = progressKick(interaction);
-
-    try {
-      const scores = await loadVoteScores();
-      const embed = buildVoteEmbed(scores);
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
-      );
-      await safeEdit(interaction, { embeds: [embed], components: [row] });
-    } catch (e) {
-      console.error('votingscores error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong.' }, 'votingscores failed, please try again.');
-    } finally {
-      cancelProgress();
+    else if (commandName === 'votingscores') {
+        const scores = await loadVoteScores();
+        const embed = buildVoteEmbed(scores);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
+        );
+        await interaction.editReply({ embeds: [embed], components: [row] });
     }
-    return;
-  }
+    else if (commandName === 'badges') {
+        const target = interaction.options.getUser('user') || interaction.user;
+        const discordId = target.id;
+        const kcUid = await getKCUidForDiscord(discordId);
 
-  if (interaction.commandName === 'badges') {
-    const ok = await safeDefer(interaction); // public
-    if (!ok) return handleDeferFailure();
+        if (!kcUid) {
+          return await interaction.editReply({
+            content: target.id === interaction.user.id
+              ? 'I can’t find your KC account. Use `/link` to connect it first.'
+              : `I can’t find a KC account linked to **${target.tag}**.`
+          });
+        }
+        
+        const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
+        if (!profile) {
+          return await interaction.editReply({ content: 'No profile data found.' });
+        }
+
+        const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
+        const description = clampStr(profile.about, 4096);
+        const badgesVal   = clampStr(profile.badgesText, 1024);
+        const streakVal   = clampStr(profile.streak, 1024, '—');
+        const postsVal    = clampStr(profile.postsText, 1024);
+        const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
+
+        const embed = new EmbedBuilder()
+          .setTitle(title)
+          .setThumbnail(discordAvatar)
+          .setDescription(description)
+          .addFields(
+            { name: 'Badges', value: badgesVal, inline: false },
+            { name: 'Streak', value: streakVal, inline: true  },
+            { name: 'Posts',  value: postsVal,  inline: false },
+          )
+          .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
+          .setFooter({ text: 'KC Bot • /badges' });
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setStyle(ButtonStyle.Link)
+            .setLabel('Full Profile')
+            .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
+        );
+
+        await interaction.editReply({ embeds: [embed], components: [row] });
+    }
+    else if (commandName === 'syncavatar') {
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+        }
+
+        const allowed = await hasEmerald(uid);
+        if (!allowed) {
+          return await interaction.editReply({ content: 'This feature requires Emerald/profile customisation.' });
+        }
+
+        const action = interaction.options.getString('action');
+        if (action === 'set') {
+          const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
+          await setKCAvatar(uid, url);
+          await interaction.editReply({ content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
+        } else if (action === 'revert') {
+          await clearKCAvatar(uid);
+          await interaction.editReply({ content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
+        } else {
+          await interaction.editReply({ content: 'Unknown action.' });
+        }
+    }
+    else if (commandName === 'post') {
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+        }
     
-    const cancelProgress = progressKick(interaction);
-
-    try {
-      // target: provided user or self
-      const target = interaction.options.getUser('user') || interaction.user;
-      const discordId = target.id;
-      
-      console.log('[INT] badges -> getKCUidForDiscord');
-      const kcUid = await getKCUidForDiscord(discordId);
-      if (!kcUid) {
-        await finalRespond(interaction, {
-          content: target.id === interaction.user.id
-            ? 'I can’t find your KC account. Use `/link` to connect it first.'
-            : `I can’t find a KC account linked to **${target.tag}**.`
-        }, 'Could not find a linked KC account.');
-        return;
-      }
-      
-      console.log('[INT] badges -> getKCProfile');
-      const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
-
-      if (!profile) {
-        await finalRespond(interaction, { content: 'No profile data found.' }, 'No profile data found.');
-        return;
-      }
-
-      const title       = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
-      const description = clampStr(profile.about, 4096);
-      const badgesVal   = clampStr(profile.badgesText, 1024);
-      const streakVal   = clampStr(profile.streak, 1024, '—');
-      const postsVal    = clampStr(profile.postsText, 1024);
-
-      const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
-
-      const embed = new EmbedBuilder()
-        .setTitle(title)
-        .setThumbnail(discordAvatar)
-        .setDescription(description)
-        .addFields(
-          { name: 'Badges', value: badgesVal, inline: false },
-          { name: 'Streak', value: streakVal, inline: true  },
-          { name: 'Posts',  value: postsVal,  inline: false },
-        )
-        .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
-        .setFooter({ text: 'KC Bot • /badges' });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel('Full Profile')
-          .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
-      );
-
-      await finalRespond(
-        interaction,
-        { embeds: [embed], components: [row] },
-        'Your `/badges` reply expired — please run it again.'
-      );
-    } catch (err) {
-      console.error('badges command error:', err);
-      console.error('raw error body:', err?.rawError);
-      console.error('raw errors tree:', err?.rawError?.errors);
-      await finalRespond(
-        interaction,
-        { content: 'Something went wrong (see logs).' },
-        'Something went wrong running `/badges`. Please try again.'
-      );
-    } finally {
-      cancelProgress();
+        if (await postsDisabledGlobally()) {
+          return await interaction.editReply({ content: '🚫 Posting is currently disabled by admins.' });
+        }
+    
+        const allowed = await postingUnlocked(uid);
+        if (!allowed) {
+          return await interaction.editReply({ content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
+        }
+    
+        const link = interaction.options.getString('link') || '';
+        const caption = (interaction.options.getString('caption') || '').slice(0, 140);
+        const draft = !!interaction.options.getBoolean('draft');
+        const scheduleAtIso = interaction.options.getString('schedule_at') || '';
+        const parsed = parseVideoLink(link);
+    
+        if (!parsed) {
+          return await interaction.editReply({ content: 'Invalid link. Please provide a YouTube or TikTok link.' });
+        }
+    
+        const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
+        const postData = {
+          ...parsed,
+          caption,
+          createdAt: admin.database.ServerValue.TIMESTAMP,
+          createdBy: uid,
+          draft: !!draft,
+          publishAt: Number.isFinite(publishAt) ? publishAt : null,
+        };
+    
+        const ref = rtdb.ref(`users/${uid}/posts`).push();
+        const postId = ref.key;
+        await withTimeout(ref.set(postData), 4000, `write post ${postId}`);
+    
+        await interaction.editReply({ content: '✅ Post saved. Sending summary…' });
+        await interaction.followUp({
+          content: [
+            '✅ **Post created!**',
+            `• **Type:** ${postData.type}`,
+            `• **Caption:** ${caption || '(none)'}`,
+            publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
+          ].join('\n'),
+          ephemeral: false
+        });
     }
-    return;
-  }
 
-  if (interaction.commandName === 'syncavatar') {
-    const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) return handleDeferFailure();
-
+  } catch (err) {
+    console.error(`Error handling command ${interaction.commandName}:`, err);
+    const msg = 'Sorry, something went wrong.';
     try {
-      // 1) Must be linked
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) {
-        await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
-        return;
+      if (interaction.replied || interaction.deferred) {
+        await interaction.editReply({ content: msg, embeds: [], components: [] });
+      } else {
+        await interaction.reply({ content: msg, ephemeral: true });
       }
-
-      // 2) Must have Emerald (or higher) customisation
-      const allowed = await hasEmerald(uid);
-      if (!allowed) {
-        await safeEdit(interaction, { content: 'This feature requires Emerald/profile customisation.' });
-        return;
-      }
-
-      // 3) Action
-      const action = interaction.options.getString('action');
-
-      if (action === 'set') {
-        // Prefer PNG and a sensible size; 256 is plenty for your site
-        const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
-        await setKCAvatar(uid, url);
-        await safeEdit(interaction, { content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
-        return;
-      }
-
-      if (action === 'revert') {
-        await clearKCAvatar(uid);
-        await safeEdit(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
-        return;
-      }
-
-      await safeEdit(interaction, { content: 'Unknown action.' });
     } catch (e) {
-      console.error('syncavatar error:', e);
-      await safeEdit(interaction, { content: 'Something went wrong updating your avatar.' });
+      console.error('Failed to send error reply:', e);
     }
-    return;
-  }
-  
-  if (interaction.commandName === 'post') {
-    const ok = await safeDefer(interaction, { ephemeral: true });
-    if (!ok) return handleDeferFailure();
-  
-    try {
-      // Must be linked
-      const discordId = interaction.user.id;
-      const uid = await getKCUidForDiscord(discordId);
-      if (!uid) {
-        await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
-        return;
-      }
-  
-      // Global stop switch
-      if (await postsDisabledGlobally()) {
-        await safeEdit(interaction, { content: '🚫 Posting is currently disabled by admins.' });
-        return;
-      }
-  
-      // Must have posting unlocked (emerald/diamond/content etc.)
-      const allowed = await postingUnlocked(uid);
-      if (!allowed) {
-        await safeEdit(interaction, { content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
-        return;
-      }
-  
-      // Inputs
-      const link = interaction.options.getString('link') || '';
-      const caption = (interaction.options.getString('caption') || '').slice(0, 140);
-      const draft = !!interaction.options.getBoolean('draft');
-      const scheduleAtIso = interaction.options.getString('schedule_at') || '';
-      const parsed = parseVideoLink(link);
-  
-      if (!parsed) {
-        await safeEdit(interaction, { content: 'Invalid link. Please provide a YouTube or TikTok link.' });
-        return;
-      }
-  
-      // Build post payload (mirror site)
-      const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
-  
-      const postData = {
-        ...parsed,
-        caption,
-        createdAt: admin.database.ServerValue.TIMESTAMP,
-        createdBy: uid,
-        draft: !!draft,
-        publishAt: Number.isFinite(publishAt) ? publishAt : null,
-      };
-  
-      // Create a new post id and write
-      const ref = rtdb.ref(`users/${uid}/posts`).push();
-      const postId = ref.key;
-      await withTimeout(ref.set(postData), 4000, `write post ${postId}`);
-  
-      // Public confirmation (non-ephemeral) with a small summary
-      await safeEdit(interaction, { content: '✅ Post saved. Sending summary…', ephemeral: true });
-      await interaction.followUp({
-        content: [
-          '✅ **Post created!**',
-          `• **Type:** ${postData.type}`,
-          `• **Caption:** ${caption || '(none)'}`,
-          publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
-        ].join('\n'),
-        ephemeral: false
-      });
-    } catch (e) {
-      console.error('post command error:', e);
-      await finalRespond(interaction, { content: 'Something went wrong creating the post.' }, 'Post failed, please try again.');
-    }
-    return;
   }
 });
+
 
 // ---------- Startup ----------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-process.on('unhandledRejection', (err) => {
-  if (isExpiredToken(err)) {
-    console.warn('Ignored expired token error (unhandledRejection).');
-    return;
-  }
-  console.error('unhandledRejection:', err);
-});
-
-client.on('error', (err) => {
-  if (isExpiredToken(err)) {
-    console.warn('Client error: Ignored expired token error.');
-    return;
-  }
-  console.error('Client error:', err);
-});
+process.on('unhandledRejection', e => console.error('unhandledRejection', e));
+process.on('uncaughtException', e => console.error('uncaughtException', e));
 
 (async () => {
   await registerCommands();
