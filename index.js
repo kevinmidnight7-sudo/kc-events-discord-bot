@@ -152,7 +152,7 @@ function decPath(s){ return String(s).replace(/\|/g, '/'); }
 async function safeDefer(interaction, { ephemeral = false } = {}) {
   try {
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ ephemeral }); // use the documented field
+      await interaction.deferReply({ flags: ephemeral ? EPHEMERAL_FLAG : undefined });
       return true; // deferred successfully
     }
   } catch (e) {
@@ -168,38 +168,37 @@ async function safeDefer(interaction, { ephemeral = false } = {}) {
 // Defer (if possible) and try to show a “working” ping
 async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Fetching data…' } = {}) {
   const ok = await safeDefer(interaction, { ephemeral });
-  try {
-    if (ok) {
-      await interaction.editReply({ content: text });
-    } else {
-      // If another instance already ACKed, we can still follow up
-      await interaction.followUp({ content: text, ephemeral });
-    }
-  } catch (e) {
-    // If even followUp fails, just ignore—real content will be sent later
-    if (!isUnknown(e) && !isAlreadyAcked(e)) throw e;
+  if (!ok) {
+    // We couldn't ACK (10062/40060/etc). Do not try followUp/editReply.
+    // Let later safeEdit(...) fall back to channel.send if needed.
+    return false;
   }
+  try { await interaction.editReply({ content: text }); } catch {}
+  return true;
 }
 
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
-    } else {
-      return await interaction.reply(data);
     }
+    // Before replying, double-check the token hasn't died
+    return await interaction.reply(data);
   } catch (err) {
-    // If we guessed wrong (already ACKed), try the other method
+    // If ACK state was wrong, try the other method once
     if (err?.code === 40060) {
       try { return await interaction.editReply(data); } catch (e2) { err = e2; }
     }
-    // If the original webhook token is no longer usable in this proc,
-    // a followUp often still works (because another proc ACKed)
-    if (isUnknown(err)) {
-      try { return await interaction.followUp(data); } catch {}
+
+    // If the interaction token is invalid/expired/unknown, fall back to channel
+    if (err?.code === 10062 || err?.code === 50027 || err?.status === 401) {
       try { return await interaction.channel?.send(fallbackText); } catch {}
       return null;
     }
+
+    // Permission error? Don't crash.
+    if (err?.code === 50013) return null;
+
     throw err;
   }
 }
@@ -1301,16 +1300,16 @@ client.on('interactionCreate', async (interaction) => {
       if (name === 'link') {
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = start ? `${start}?state=${encodeURIComponent(interaction.user.id)}` : null;
-        return interaction.reply({ content: url ? `Click to link your account: ${url}` : 'Linking is not configured.', ephemeral: true });
+        return interaction.reply({ content: url ? `Click to link your account: ${url}` : 'Linking is not configured.', flags: EPHEMERAL_FLAG });
       }
       if (name === 'vote') {
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          return interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
+          return interaction.reply({ content:'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
         }
         if (!(await userIsVerified(uid))) {
-          return interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
+          return interaction.reply({ content:'You must verify your email on KC before voting.', flags: EPHEMERAL_FLAG });
         }
         const existingSnap = await rtdb.ref(`votes/${uid}`).get();
         if (existingSnap.exists()) {
@@ -1327,13 +1326,17 @@ client.on('interactionCreate', async (interaction) => {
             new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
           );
-          return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+          return interaction.reply({ embeds: [embed], components: [row], flags: EPHEMERAL_FLAG });
         }
         return showVoteModal(interaction); // no defer before showModal
       }
 
       // Everyone else: try to defer — and **do not** crash if it fails
-      await deferAndPing(interaction, { ephemeral: isEphemeralCommand(name), text: '⏳ Fetching data…' });
+      const acked = await deferAndPing(interaction, {
+        ephemeral: isEphemeralCommand(interaction.commandName),
+        text: '⏳ Fetching data…'
+      });
+      if (!acked) return; // if defer failed (10062), stop here gracefully
     }
 
     // --- Button/Modal handlers ---
@@ -1358,7 +1361,7 @@ client.on('interactionCreate', async (interaction) => {
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
-          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: 64 });
+          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: EPHEMERAL_FLAG });
         }
 
         const modal = new ModalBuilder()
@@ -1383,7 +1386,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) {
       // 3) Modal flows: don’t defer first
       if (interaction.customId.startsWith('clips:commentModal:')) {
-        await interaction.deferReply({ flags: 64 }); // ephemeral ack
+        await interaction.deferReply({ flags: EPHEMERAL_FLAG }); // ephemeral ack
 
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
@@ -1411,7 +1414,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
       if (interaction.customId.startsWith('c:cm:')) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: EPHEMERAL_FLAG });
 
         const idx = parseInt(interaction.customId.split(':')[2], 10);
         const { item } = getClipByIdx(interaction, idx);
@@ -1482,13 +1485,13 @@ client.on('interactionCreate', async (interaction) => {
       const { commandName } = interaction;
       if (commandName === 'whoami') {
         const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-        await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
+        await safeEdit(interaction, { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
       }
       else if (commandName === 'dumpme') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
           if (!uid) {
-            return await interaction.editReply({ content: 'Not linked. Run `/link` first.' });
+            return await safeEdit(interaction, { content: 'Not linked. Run `/link` first.' });
           }
           const [userRT, badgesRT, postsRT] = await Promise.all([
             withTimeout(rtdb.ref(`users/${uid}`).get(), 4000, `RTDB users/${uid}`),
@@ -1513,7 +1516,7 @@ client.on('interactionCreate', async (interaction) => {
             rtdb: { user: brief(userRT), badges: brief(badgesRT), postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0 },
             firestore: { userExists: userFS.exists, userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [], postsCount: postsFS.size }
           };
-          await interaction.editReply({ content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
+          await safeEdit(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
       }
       else if (commandName === 'leaderboard') {
           const rows = await loadLeaderboardData();
@@ -1521,14 +1524,12 @@ client.on('interactionCreate', async (interaction) => {
           const embed = buildLbEmbed(rows, catIdx, page);
           interaction.client.lbCache ??= new Map(); 
           interaction.client.lbCache.set(interaction.id, rows);
-          await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
+          await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
       }
       else if (commandName === 'clips') {
-        await interaction.editReply({ content: '⏳ Fetching data...' });
-
         const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
         const all = await fetchAllPosts({ platform });
-        if (!all.length) return interaction.editReply({ content: 'No clips found.' });
+        if (!all.length) return safeEdit(interaction, { content: 'No clips found.' });
 
         all.sort((a,b)=>b.score-a.score);
         const list = all.slice(0, CLIPS.MAX_LIST);
@@ -1539,12 +1540,12 @@ client.on('interactionCreate', async (interaction) => {
         interaction.client.clipsCache.set(interaction.id, state);
 
         const embed = buildClipsListEmbed(list, 0, nameMap);
-        return interaction.editReply({ content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
+        return safeEdit(interaction, { content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
       }
       else if (commandName === 'messages') {
         const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
         const embed = buildMessagesEmbed(list || [], nameMap || {});
-        await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
+        await safeEdit(interaction, { content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
       }
       else if (commandName === 'votingscores') {
           const scores = await loadVoteScores();
@@ -1552,14 +1553,14 @@ client.on('interactionCreate', async (interaction) => {
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
           );
-          await interaction.editReply({ embeds: [embed], components: [row] });
+          await safeEdit(interaction, { embeds: [embed], components: [row] });
       }
       else if (commandName === 'badges') {
           const target = interaction.options.getUser('user') || interaction.user;
           const discordId = target.id;
           const kcUid = await getKCUidForDiscord(discordId);
           if (!kcUid) {
-            return await interaction.editReply({
+            return await safeEdit(interaction, {
               content: target.id === interaction.user.id
                 ? 'I can’t find your KC account. Use `/link` to connect it first.'
                 : `I can’t find a KC account linked to **${target.tag}**.`
@@ -1567,7 +1568,7 @@ client.on('interactionCreate', async (interaction) => {
           }
           const profile = await withTimeout(getKCProfile(kcUid), 5000, `getKCProfile(${kcUid})`);
           if (!profile) {
-            return await interaction.editReply({ content: 'No profile data found.' });
+            return await safeEdit(interaction, { content: 'No profile data found.' });
           }
           const title = clampStr(`${profile.displayName} — KC Profile`, 256, 'KC Profile');
           const description = clampStr(profile.about, 4096);
@@ -1592,42 +1593,42 @@ client.on('interactionCreate', async (interaction) => {
               .setLabel('Full Profile')
               .setURL(`https://kcevents.uk/#loginpage?uid=${kcUid}`)
           );
-          await interaction.editReply({ embeds: [embed], components: [row] });
+          await safeEdit(interaction, { embeds: [embed], components: [row] });
       }
       else if (commandName === 'syncavatar') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
           if (!uid) {
-            return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+            return await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
           }
           const allowed = await hasEmerald(uid);
           if (!allowed) {
-            return await interaction.editReply({ content: 'This feature requires Emerald/profile customisation.' });
+            return await safeEdit(interaction, { content: 'This feature requires Emerald/profile customisation.' });
           }
           const action = interaction.options.getString('action');
           if (action === 'set') {
             const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
             await setKCAvatar(uid, url);
-            await interaction.editReply({ content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
+            await safeEdit(interaction, { content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
           } else if (action === 'revert') {
             await clearKCAvatar(uid);
-            await interaction.editReply({ content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
+            await safeEdit(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
           } else {
-            await interaction.editReply({ content: 'Unknown action.' });
+            await safeEdit(interaction, { content: 'Unknown action.' });
           }
       }
       else if (commandName === 'post') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
           if (!uid) {
-            return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
+            return await safeEdit(interaction, { content: 'You are not linked. Use `/link` first.' });
           }
           if (await postsDisabledGlobally()) {
-            return await interaction.editReply({ content: '🚫 Posting is currently disabled by admins.' });
+            return await safeEdit(interaction, { content: '🚫 Posting is currently disabled by admins.' });
           }
           const allowed = await postingUnlocked(uid);
           if (!allowed) {
-            return await interaction.editReply({ content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
+            return await safeEdit(interaction, { content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
           }
           const link = interaction.options.getString('link') || '';
           const caption = (interaction.options.getString('caption') || '').slice(0, 140);
@@ -1635,13 +1636,13 @@ client.on('interactionCreate', async (interaction) => {
           const scheduleAtIso = interaction.options.getString('schedule_at') || '';
           const parsed = parseVideoLink(link);
           if (!parsed) {
-            return await interaction.editReply({ content: 'Invalid link. Please provide a YouTube or TikTok link.' });
+            return await safeEdit(interaction, { content: 'Invalid link. Please provide a YouTube or TikTok link.' });
           }
           const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
           const postData = { ...parsed, caption, createdAt: admin.database.ServerValue.TIMESTAMP, createdBy: uid, draft: !!draft, publishAt: Number.isFinite(publishAt) ? publishAt : null };
           const ref = rtdb.ref(`users/${uid}/posts`).push();
           await withTimeout(ref.set(postData), 4000, `write post ${ref.key}`);
-          await interaction.editReply({ content: '✅ Post saved. Sending summary…' });
+          await safeEdit(interaction, { content: '✅ Post saved. Sending summary…' });
           await interaction.followUp({
             content: [
               '✅ **Post created!**',
@@ -1655,7 +1656,7 @@ client.on('interactionCreate', async (interaction) => {
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          return await interaction.editReply({ content: 'You must link your KC account first with /link.' });
+          return await safeEdit(interaction, { content: 'You must link your KC account first with /link.' });
         }
         const nameMap = await getAllUserNames();
         const userName = nameMap[uid] || interaction.user.username;
@@ -1663,10 +1664,10 @@ client.on('interactionCreate', async (interaction) => {
         const now = Date.now();
         const message = { text, uid, user: userName, time: now, createdAt: now };
         await rtdb.ref('messages').push(message);
-        await interaction.editReply({ content: '✅ Message posted!' });
+        await safeEdit(interaction, { content: '✅ Message posted!' });
       }
       else if (commandName === 'help') {
-        await interaction.editReply({
+        await safeEdit(interaction, {
           content: [
             'KC Events Bot v1',
             'Full Messageboard : https://kcevents.uk/#chatscroll',
@@ -1680,8 +1681,8 @@ client.on('interactionCreate', async (interaction) => {
         const otherUser = interaction.options.getUser('user');
         const youUid = await getKCUidForDiscord(youDiscordId);
         const otherUid = await getKCUidForDiscord(otherUser.id);
-        if (!youUid)  return interaction.editReply('Link your KC account first with /link.');
-        if (!otherUid) return interaction.editReply(`I can’t find a KC account linked to **${otherUser.tag}**.`);
+        if (!youUid)  return safeEdit(interaction, 'Link your KC account first with /link.');
+        if (!otherUid) return safeEdit(interaction, `I can’t find a KC account linked to **${otherUser.tag}**.`);
         const [youBadgesSnap, otherBadgesSnap, youProfile, otherProfile, youCB, otherCB] = await Promise.all([
           withTimeout(rtdb.ref(`badges/${youUid}`).get(), 3000, 'RTDB badges you'),
           withTimeout(rtdb.ref(`badges/${otherUid}`).get(), 3000, 'RTDB badges other'),
@@ -1709,7 +1710,7 @@ client.on('interactionCreate', async (interaction) => {
           )
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /compare' });
-        await interaction.editReply({ embeds:[embed] });
+        await safeEdit(interaction, { embeds:[embed] });
       }
     } else if (interaction.isButton()) {
       if (interaction.customId.startsWith('lb:')) {
@@ -1726,7 +1727,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
+          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
         }
 
         const [c, action, a, b] = interaction.customId.split(':'); // c:<action>:...
@@ -1792,7 +1793,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // Quick visual nudge; the embed body will refresh on next open anyway
-        try { await interaction.followUp({ content: '✅ Reaction updated.', flags: 64 }); } catch {}
+        try { await interaction.followUp({ content: '✅ Reaction updated.', flags: EPHEMERAL_FLAG }); } catch {}
 
         // Rebuild the same rows so the cached ids remain valid for a while
         try {
@@ -1832,7 +1833,7 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /clips' });
 
-        await interaction.followUp({ embeds:[embed], flags: 64 });
+        await interaction.followUp({ embeds:[embed], flags: EPHEMERAL_FLAG });
       }
       else if (interaction.customId.startsWith('clips:back')) {
         const state = getClipsState(interaction);
@@ -1842,7 +1843,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
         }
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
@@ -1918,7 +1919,7 @@ client.on('interactionCreate', async (interaction) => {
         else if (action === 'like') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', ephemeral: true });
+          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
           await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
