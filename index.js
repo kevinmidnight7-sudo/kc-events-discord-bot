@@ -21,9 +21,6 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
 
-// 1) Make sure only ONE bot instance is running
-console.log('Instance:', process.env.RENDER_INSTANCE_ID || 'local');
-
 console.log('ENV sanity', {
   hasToken: !!process.env.DISCORD_BOT_TOKEN,
   hasClient: !!process.env.DISCORD_CLIENT_ID,
@@ -91,7 +88,7 @@ const globalCache = {
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme', 'help']).has(name);
+  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -140,39 +137,54 @@ admin.initializeApp({
 
 const rtdb = admin.database();
 
-// ---------- Helpers ----------
-function isPermsError(err){ return err?.code === 50013; }
-function isUnknown(e){ return e?.code === 10062 || e?.code === 50027 || e?.status === 401; }
-function isAlreadyAcked(e){ return e?.code === 40060; } // "already acknowledged"
+// --- Singleton Bot Lock ---
+const instanceId = process.env.RENDER_INSTANCE_ID || `local-${process.pid}`;
+const BOT_LOCK_PATH = 'botRuntime/discordLock';
 
+async function claimBotLock(leaseMs = 120000) {
+  const now = Date.now();
+  const ref = rtdb.ref(BOT_LOCK_PATH);
+  const tx = await ref.transaction(cur => {
+    if (!cur || (now - (cur.heartbeat || 0)) > leaseMs) {
+      return { holder: instanceId, started: now, heartbeat: now };
+    }
+    return; // someone else holds it
+  });
+  return tx.committed && tx.snapshot?.val()?.holder === instanceId;
+}
+
+async function renewBotLock() {
+  await rtdb.ref(BOT_LOCK_PATH).child('heartbeat').set(Date.now());
+}
+
+
+// ---------- Helpers ----------
 function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
-// Try to defer. Swallow duplicate/late errors and let the flow continue.
+// --- New Safe Interaction Handlers ---
+function isUnknown(e){ return e?.code === 10062 || e?.code === 50027 || e?.status === 401; }
+function isAlreadyAcked(e){ return e?.code === 40060; }
+
 async function safeDefer(interaction, { ephemeral = false } = {}) {
   try {
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: ephemeral ? EPHEMERAL_FLAG : undefined });
-      return true; // deferred successfully
+      return true;
     }
   } catch (e) {
     if (isUnknown(e) || isAlreadyAcked(e)) {
       console.warn('[defer ignored]', e.code);
-      return false; // continue without crashing
+      return false; // don’t try to reply/edit later
     }
-    throw e; // real error
+    throw e;
   }
-  return false;
+  return true;
 }
 
-// Defer (if possible) and try to show a “working” ping
 async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Fetching data…' } = {}) {
-  const ok = await safeDefer(interaction, { ephemeral });
-  if (!ok) {
-    // We couldn't ACK (10062/40060/etc). Do not try followUp/editReply.
-    // Let later safeEdit(...) fall back to channel.send if needed.
-    return false;
-  }
+  const acked = await safeDefer(interaction, { ephemeral });
+  if (!acked) return false;           // IMPORTANT: stop here if we failed to defer
   try { await interaction.editReply({ content: text }); } catch {}
   return true;
 }
@@ -181,24 +193,18 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
   try {
     if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(data);
+    } else {
+      return await interaction.reply(data);
     }
-    // Before replying, double-check the token hasn't died
-    return await interaction.reply(data);
   } catch (err) {
-    // If ACK state was wrong, try the other method once
-    if (err?.code === 40060) {
+    if (err?.code === 40060) { // acked elsewhere
       try { return await interaction.editReply(data); } catch (e2) { err = e2; }
     }
-
-    // If the interaction token is invalid/expired/unknown, fall back to channel
-    if (err?.code === 10062 || err?.code === 50027 || err?.status === 401) {
+    if (isUnknown(err)) {
       try { return await interaction.channel?.send(fallbackText); } catch {}
       return null;
     }
-
-    // Permission error? Don't crash.
-    if (err?.code === 50013) return null;
-
+    if (err?.code === 50013) return null; // perms
     throw err;
   }
 }
@@ -212,7 +218,6 @@ function startReplyWatchdog(interaction, ms = 5000) {
   return () => clearTimeout(t);
 }
 
-// 7) Trim long operations to avoid the 3-second ACK window
 async function withTimeout(promise, ms, label='op') {
   let t; const timeout = new Promise((_,rej)=> t=setTimeout(()=>rej(new Error(`Timeout ${ms}ms: ${label}`)), ms));
   return Promise.race([ promise.finally(()=>clearTimeout(t)), timeout ]);
@@ -537,7 +542,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.displayName ||
     msg.name ||
     '(unknown)';
-  const when = msg.time ? new Date(m.time).toLocaleString() : '—';
+  const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
   const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
@@ -645,7 +650,6 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
       .setLabel('Back to message')
       .setStyle(ButtonStyle.Secondary),
 
-    // 6) Fix duplicate custom IDs on thread view
     new ButtonBuilder()
       .setCustomId('msg:list') // Use a unique ID
       .setLabel('Back to list')
@@ -1281,7 +1285,6 @@ async function registerCommands() {
 
 // ---------- Interaction handling ----------
 client.on('interactionCreate', async (interaction) => {
-  // 1) De-dupe deliveries and log age
   const seen = globalThis.__seen ??= new Set();
   if (seen.has(interaction.id)) {
     console.warn(`[INT] duplicate seen: ${interaction.id}`);
@@ -1289,6 +1292,15 @@ client.on('interactionCreate', async (interaction) => {
   }
   seen.add(interaction.id);
   setTimeout(() => seen.delete(interaction.id), 60_000);
+
+  // Age guard
+  if (interaction.isChatInputCommand()) {
+    const age = Date.now() - interaction.createdTimestamp;
+    if (age > 2500) {
+      console.warn(`[old interaction] skipping ${interaction.commandName} (${age}ms)`);
+      return;
+    }
+  }
   console.log(`[INT] ${interaction.isChatInputCommand() ? interaction.commandName : interaction.customId} from ${interaction.user?.tag} age=${Date.now()-interaction.createdTimestamp}ms`);
 
   try {
@@ -1296,98 +1308,72 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const name = interaction.commandName;
 
-      // Commands that must NOT be deferred (reply immediately / or show modal)
       if (name === 'link') {
         const start = process.env.AUTH_BRIDGE_START_URL;
         const url = start ? `${start}?state=${encodeURIComponent(interaction.user.id)}` : null;
         return interaction.reply({ content: url ? `Click to link your account: ${url}` : 'Linking is not configured.', flags: EPHEMERAL_FLAG });
       }
       if (name === 'vote') {
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return interaction.reply({ content:'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
-        }
-        if (!(await userIsVerified(uid))) {
-          return interaction.reply({ content:'You must verify your email on KC before voting.', flags: EPHEMERAL_FLAG });
-        }
-        const existingSnap = await rtdb.ref(`votes/${uid}`).get();
-        if (existingSnap.exists()) {
-          const v = existingSnap.val() || {};
-          const embed = new EmbedBuilder()
-            .setTitle('You already have a vote')
-            .setDescription([
-              `**Best Offence:** ${v.bestOffence || '—'}`,
-              `**Best Defence:** ${v.bestDefence || '—'}`,
-              `**Rating:** ${v.rating || '—'} / 5`,
-            ].join('\n'))
-            .setColor(DEFAULT_EMBED_COLOR);
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
-          );
-          return interaction.reply({ embeds: [embed], components: [row], flags: EPHEMERAL_FLAG });
-        }
-        return showVoteModal(interaction); // no defer before showModal
+        // Always show the modal immediately.
+        // Verification will happen on modal submit.
+        return showVoteModal(interaction);
       }
 
-      // Everyone else: try to defer — and **do not** crash if it fails
-      const acked = await deferAndPing(interaction, {
+      // Defer all other commands
+      const ok = await deferAndPing(interaction, {
         ephemeral: isEphemeralCommand(interaction.commandName),
-        text: '⏳ Fetching data…'
       });
-      if (!acked) return; // if defer failed (10062), stop here gracefully
+      if (!ok) return; // IMPORTANT: if defer failed, we can't safely reply.
     }
 
     // --- Button/Modal handlers ---
-    // 5) Button handlers: ACK with deferUpdate() once
     if (interaction.isButton()) {
-      // Modal buttons – show modal immediately and return
-      if (interaction.customId.startsWith('msg:reply')) {
-         const path = decPath(interaction.customId.split(':')[2]);
-         const modal = new ModalBuilder()
-           .setCustomId(`msg:replyModal:${encPath(path)}`)
-           .setTitle('Reply to message');
-         const input = new TextInputBuilder()
-           .setCustomId('replyText')
-           .setLabel('Your reply')
-           .setStyle(TextInputStyle.Paragraph)
-           .setMaxLength(500);
-         modal.addComponents(new ActionRowBuilder().addComponents(input));
-         return interaction.showModal(modal);
-      }
-      if (interaction.customId.startsWith('clips:comment')) {
-        // IMPORTANT: do NOT defer before showModal
-        const sid = interaction.customId.split(':')[2];
-        const payload = readModalTarget(sid);
-        if (!payload) {
-          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: EPHEMERAL_FLAG });
+      if (interaction.customId.startsWith('msg:reply') || interaction.customId.startsWith('clips:comment')) {
+        // These open modals; do NOT defer before showModal.
+        if (interaction.customId.startsWith('msg:reply')) {
+           const path = decPath(interaction.customId.split(':')[2]);
+           const modal = new ModalBuilder()
+             .setCustomId(`msg:replyModal:${encPath(path)}`)
+             .setTitle('Reply to message');
+           const input = new TextInputBuilder()
+             .setCustomId('replyText')
+             .setLabel('Your reply')
+             .setStyle(TextInputStyle.Paragraph)
+             .setMaxLength(500);
+           modal.addComponents(new ActionRowBuilder().addComponents(input));
+           return interaction.showModal(modal);
         }
+        if (interaction.customId.startsWith('clips:comment')) {
+          const sid = interaction.customId.split(':')[2];
+          const payload = readModalTarget(sid);
+          if (!payload) {
+            return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: EPHEMERAL_FLAG });
+          }
 
-        const modal = new ModalBuilder()
-          .setCustomId(`clips:commentModal:${sid}`)
-          .setTitle('Add a comment');
+          const modal = new ModalBuilder()
+            .setCustomId(`clips:commentModal:${sid}`)
+            .setTitle('Add a comment');
 
-        const input = new TextInputBuilder()
-          .setCustomId('commentText')
-          .setLabel('Your comment')
-          .setStyle(TextInputStyle.Paragraph)
-          .setMaxLength(300)
-          .setRequired(true);
+          const input = new TextInputBuilder()
+            .setCustomId('commentText')
+            .setLabel('Your comment')
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(300)
+            .setRequired(true);
 
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-        return interaction.showModal(modal);
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          return interaction.showModal(modal);
+        }
       }
 
-      // Everything else: best-effort defer
-      try { await interaction.deferUpdate(); }
-      catch (e) { if (!isUnknown(e) && !isAlreadyAcked(e)) throw e; }
+      // All other buttons: defer update.
+      await interaction.deferUpdate().catch(() => {});
     }
     if (interaction.isModalSubmit()) {
-      // 3) Modal flows: don’t defer first
-      if (interaction.customId.startsWith('clips:commentModal:')) {
-        await interaction.deferReply({ flags: EPHEMERAL_FLAG }); // ephemeral ack
+      // Defer the reply to the modal submission.
+      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
 
+      if (interaction.customId.startsWith('clips:commentModal:')) {
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) return interaction.editReply('This action expired. Reopen the clip.');
@@ -1413,28 +1399,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply('✅ Comment posted!');
         return;
       }
-      if (interaction.customId.startsWith('c:cm:')) {
-        await interaction.deferReply({ flags: EPHEMERAL_FLAG });
-
-        const idx = parseInt(interaction.customId.split(':')[2], 10);
-        const { item } = getClipByIdx(interaction, idx);
-        const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
-        if (!text) return interaction.editReply('Comment can’t be empty.');
-
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return interaction.editReply('You must link your KC account first with /link.');
-
-        const nameMap = await getAllUserNames();
-        const userName = nameMap[uid] || interaction.user.username;
-
-        const comment = { text, uid, user: userName, time: admin.database.ServerValue.TIMESTAMP };
-        await rtdb.ref(`${clipDbPath(item)}/comments`).push(comment);
-
-        return interaction.editReply('✅ Comment posted!');
-      }
-
-      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
       if (interaction.customId.startsWith('msg:replyModal:')) {
         const path = decPath(interaction.customId.split(':')[2]);
         const text = interaction.fields.getTextInputValue('replyText').trim();
@@ -1452,6 +1416,12 @@ client.on('interactionCreate', async (interaction) => {
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) return interaction.editReply('Link your KC account first with /link.');
         if (!(await userIsVerified(uid))) return interaction.editReply('You must verify your email on KC before voting.');
+        
+        const existingSnap = await rtdb.ref(`votes/${uid}`).get();
+        if (existingSnap.exists()) {
+            return interaction.editReply('You have already voted. To change your vote, run `/vote` again and use the buttons.');
+        }
+
         const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
         const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
         const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
@@ -1468,12 +1438,8 @@ client.on('interactionCreate', async (interaction) => {
         const username = nameMap[uid] || interaction.user.username;
         const vote = { uid, username, bestOffence: offFinal, bestDefence: defFinal, rating, time: admin.database.ServerValue.TIMESTAMP };
         const ref = rtdb.ref(`votes/${uid}`);
-        const tx = await ref.transaction(cur => cur ? undefined : vote, null, false);
-        if (!tx.committed) {
-          await interaction.editReply({ content: '❗ You have already voted for this event.' });
-        } else {
-          await interaction.editReply('✅ Thanks for voting!');
-        }
+        await ref.set(vote);
+        await interaction.editReply('✅ Thanks for voting!');
       }
       return;
     }
@@ -1762,62 +1728,39 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
       else if (interaction.customId.startsWith('clips:react:')) {
-        await interaction.deferUpdate().catch(()=>{});
         const shortId = interaction.customId.split(':')[2];
         const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
         if (!payload) {
-          return safeEdit(interaction, { content: 'Reaction expired. Reopen the clip and try again.' });
+          return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', flags: EPHEMERAL_FLAG });
         }
 
         const { postPath, emoji } = payload;
-
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          return safeEdit(interaction, { content: 'Link your KC account with /link to react.' });
+          return interaction.followUp({ content: 'Link your KC account with /link to react.', flags: EPHEMERAL_FLAG });
         }
 
-        // --- TOGGLE behaviour ---
         const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
-        const tx = await myRef.transaction(cur => (cur ? null : true), null, false);
+        const tx = await myRef.transaction(cur => (cur ? null : true));
+        const wasReacted = !tx.snapshot.exists(); // it was null before, so we added it. if it existed, we removed it.
 
-        // --- Optional: allow only ONE reaction per user per post ---
-        const SINGLE_REACTION_PER_USER = true; // set false if you want multi
-        if (SINGLE_REACTION_PER_USER && tx.committed && tx.snapshot?.val() === true) {
-          // Remove user from any other emoji buckets
-          await Promise.all(
-            POST_EMOJIS
-              .filter(e => e !== emoji)
-              .map(e => rtdb.ref(`${postPath}/reactions/${e}/${uid}`).remove().catch(()=>{}))
-          );
-        }
+        await rtdb.ref(`${postPath}/reactionCounts/${emoji}`).transaction(cur => (cur || 0) + (wasReacted ? -1 : 1));
 
-        // Quick visual nudge; the embed body will refresh on next open anyway
         try { await interaction.followUp({ content: '✅ Reaction updated.', flags: EPHEMERAL_FLAG }); } catch {}
-
-        // Rebuild the same rows so the cached ids remain valid for a while
-        try {
-          const rows = clipsDetailRows(interaction, postPath, true);
-          await safeEdit(interaction, { components: rows }); // keep existing embed
-        } catch {}
       }
       else if (interaction.customId.startsWith('clips:reactors:')) {
-        await interaction.deferUpdate().catch(()=>{});
         const sid = interaction.customId.split(':')[2];
         const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
         if (!payload) {
-          return safeEdit(interaction, { content: 'That list expired. Reopen the clip to refresh.' });
+          return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', flags: EPHEMERAL_FLAG });
         }
         const { postPath } = payload;
 
-        // Load reactions { emoji: { uid: true, ... }, ... }
         const snap = await withTimeout(rtdb.ref(`${postPath}/reactions`).get(), 4000, `RTDB ${postPath}/reactions`);
         const data = snap.exists() ? (snap.val() || {}) : {};
-
-        // Pull a name map once to translate uids → display names
         const nameMap = await getAllUserNames();
 
-        // Build readable lines like: 🔥 User A, User B (3)
         const lines = [];
         for (const emo of POST_EMOJIS) {
           const uids = Object.keys(data[emo] || {});
@@ -1922,9 +1865,9 @@ client.on('interactionCreate', async (interaction) => {
           if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
-          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true, null, false);
           const wasLiked = likedSnap.exists();
-          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1), null, false);
+          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
+          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
           const node = await loadNode(path);
           const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
           const i = state.list.findIndex(m=>m.path===path);
@@ -1971,6 +1914,13 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
   } catch (e) {
     console.error('registerCommands FAILED:', e?.rawError || e);
   }
+
+  // Claim lock before logging in
+  if (!(await claimBotLock())) {
+    console.log(`Another instance holds the Discord lock. Serving health only. id=${instanceId}`);
+    return; // do NOT login this process
+  }
+  setInterval(() => renewBotLock().catch(()=>{}), 30_000);
 
   try {
     console.log('Logging into Discord…');
