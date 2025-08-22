@@ -537,7 +537,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.displayName ||
     msg.name ||
     '(unknown)';
-  const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
+  const when = msg.time ? new Date(m.time).toLocaleString() : '—';
   const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
@@ -1468,7 +1468,7 @@ client.on('interactionCreate', async (interaction) => {
         const username = nameMap[uid] || interaction.user.username;
         const vote = { uid, username, bestOffence: offFinal, bestDefence: defFinal, rating, time: admin.database.ServerValue.TIMESTAMP };
         const ref = rtdb.ref(`votes/${uid}`);
-        const tx = await ref.transaction(cur => cur ? undefined : vote, { applyLocally: false });
+        const tx = await ref.transaction(cur => cur ? undefined : vote, null, false);
         if (!tx.committed) {
           await interaction.editReply({ content: '❗ You have already voted for this event.' });
         } else {
@@ -1779,7 +1779,7 @@ client.on('interactionCreate', async (interaction) => {
 
         // --- TOGGLE behaviour ---
         const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
-        const tx = await myRef.transaction(cur => (cur ? null : true), { applyLocally: false });
+        const tx = await myRef.transaction(cur => (cur ? null : true), null, false);
 
         // --- Optional: allow only ONE reaction per user per post ---
         const SINGLE_REACTION_PER_USER = true; // set false if you want multi
@@ -1922,9 +1922,9 @@ client.on('interactionCreate', async (interaction) => {
           if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
-          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
+          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true, null, false);
           const wasLiked = likedSnap.exists();
-          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
+          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1), null, false);
           const node = await loadNode(path);
           const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
           const i = state.list.findIndex(m=>m.path===path);
