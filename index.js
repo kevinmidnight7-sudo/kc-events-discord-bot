@@ -75,10 +75,12 @@ const LB = {
 };
 
 const CLIPS = {
-  PAGE_SIZE: 5,                      // 5 per page in the list
-  REACTS: ['🔥','😂','😮','👍','💯'],  // match your site’s set
-  MAX_LIST: 50                       // cap how many we score & browse
+  PAGE_SIZE: 5,
+  REACTS: ['🔥','😂','😮','👍','💯'],
+  MAX_LIST: 50
 };
+
+const POST_EMOJIS = ['🔥','❤️','😂','👍','👎']; // same list you show on the site
 
 const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
@@ -267,7 +269,7 @@ function parseVideoLink(link='') {
 
 function clipLink(d={}) {
   if (d.type === 'youtube' && d.ytId) return `https://youtu.be/${d.ytId}`;
-  if (d.type === 'tiktok'  && d.videoId) return `https://www.tiktok.com/embed/v2/${d.videoId}`;
+  else if (d.type === 'tiktok' && d.videoId) return `https://www.tiktok.com/embed/v2/${d.videoId}`;
   return '';
 }
 function clipThumb(d={}) {
@@ -283,6 +285,22 @@ function reactCount(reactions={}) {
 function sitePostUrl(ownerUid, postId) {
   // If you have a deep link on the site, put it here; otherwise link to feed:
   return `https://kcevents.uk/#socialfeed`;
+}
+
+function getClipsState(interaction) {
+  interaction.client.clipsCache ??= new Map();
+  const key = interaction.message?.interaction?.id || interaction.id; // root command id
+  return interaction.client.clipsCache.get(key);
+}
+function getClipByIdx(interaction, idx) {
+  const state = getClipsState(interaction);
+  if (!state || !Array.isArray(state.list)) throw new Error('Clips state missing/expired');
+  const item = state.list[idx];
+  if (!item) throw new Error('Unknown clip index');
+  return { state, item, idx };
+}
+function clipDbPath(item) {
+  return `users/${item.ownerUid}/posts/${item.postId}`;
 }
 
 async function postingUnlocked(uid) {
@@ -637,25 +655,24 @@ function clipsListRows(listLen, page=0) {
   const rows = [];
   const start = page * CLIPS.PAGE_SIZE;
   const visible = Math.min(CLIPS.PAGE_SIZE, Math.max(0, listLen - start));
-  // numbers row (1..N for the current page)
+
   const num = new ActionRowBuilder();
   for (let i = 0; i < visible; i++) {
     num.addComponents(
       new ButtonBuilder()
-        .setCustomId(`clips:openIdx:${start+i}`)
+        .setCustomId(`c:o:${start+i}`)   // open idx
         .setLabel(String(start + i + 1))
         .setStyle(ButtonStyle.Secondary)
     );
   }
   if (num.components.length) rows.push(num);
 
-  // paging + refresh
   const maxPage = Math.max(0, Math.ceil(listLen/CLIPS.PAGE_SIZE)-1);
   rows.push(
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`clips:page:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
-      new ButtonBuilder().setCustomId(`clips:page:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
-      new ButtonBuilder().setCustomId('clips:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`c:p:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
+      new ButtonBuilder().setCustomId(`c:p:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
+      new ButtonBuilder().setCustomId('c:rf').setLabel('Refresh').setStyle(ButtonStyle.Primary),
     )
   );
   return rows;
@@ -677,7 +694,8 @@ function buildClipDetailEmbed(item, nameMap={}) {
       `Uploader: **${who}**`,
       `Reactions: ${reactsLine}  (total ${total})`,
       `Comments: **${comments}**`,
-    ].join('\n'))
+      link,
+    ].filter(Boolean).join('\n'))
     .setColor(DEFAULT_EMBED_COLOR)
     .setFooter({ text: 'KC Bot • /clips' });
 
@@ -687,26 +705,48 @@ function buildClipDetailEmbed(item, nameMap={}) {
   return e;
 }
 
-function clipsDetailRows(item) {
-  const path = `users/${item.ownerUid}/posts/${item.postId}`;
+function clipsDetailRows(interaction, postPath) {
+  const rows = [];
   const row1 = new ActionRowBuilder();
-  for (const emoji of CLIPS.REACTS) {
+  for (const emo of POST_EMOJIS) {
+    const sid = _cacheForMessage(
+      interaction.client.reactCache,
+      interaction.message ?? interaction,
+      { postPath, emoji: emo }
+    );
     row1.addComponents(
       new ButtonBuilder()
-        .setCustomId(`clips:react:${encPath(path)}:${encodeURIComponent(emoji)}`)
-        .setLabel(emoji)
+        .setCustomId(`clips:react:${sid}`)
+        .setLabel(emo)
         .setStyle(ButtonStyle.Secondary)
     );
   }
-  const link = clipLink(item.data||{});
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`clips:comment:${encPath(path)}`).setLabel('↩️ Comment').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('clips:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
-    ...(link ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Open Video').setURL(link)] : []),
-    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Open on Site').setURL(sitePostUrl(item.ownerUid, item.postId)),
-  );
+  if (row1.components.length) rows.push(row1);
 
-  return [row1, row2];
+  const sidView = _cacheForMessage(
+    interaction.client.reactorsCache,
+    interaction.message ?? interaction,
+    { postPath }
+  );
+  
+  const commentSid = cacheModalTarget({ postPath });
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`clips:reactors:${sidView}`)
+      .setLabel('👀 View reactors')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`clips:comment:${commentSid}`)
+      .setLabel('💬 Comment')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('clips:back')
+      .setLabel('Back to list')
+      .setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(row2);
+
+  return rows;
 }
 
 
@@ -1052,6 +1092,36 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+// --- Short-id caches for /clips actions ---// Map key = "<messageId>|<shortId>"
+client.reactCache = new Map();
+client.reactorsCache = new Map();
+client.modalCache = new Map();
+
+function _makeShortId(len = 8) {
+  const abc = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let s = ''; for (let i = 0; i < len; i++) s += abc[Math.floor(Math.random()*abc.length)];
+  return s;
+}
+function cacheModalTarget(payload, ttlMs = 10 * 60 * 1000) {
+  const sid = _makeShortId(10);
+  client.modalCache.set(sid, payload);
+  setTimeout(() => client.modalCache.delete(sid), ttlMs).unref?.();
+  return sid;
+}
+function readModalTarget(sid) {
+  return client.modalCache.get(sid) || null;
+}
+function _cacheForMessage(map, message, payload, ttlMs = 10 * 60 * 1000) {
+  const short = _makeShortId();
+  const key = `${message.id}|${short}`;
+  map.set(key, payload);
+  setTimeout(() => map.delete(key), ttlMs).unref?.();
+  return short;
+}
+function _readFromCache(map, message, shortId) {
+  return map.get(`${message.id}|${shortId}`) || null;
+}
+
 // ---------- Slash Commands (definitions) ----------
 const linkCmd = new SlashCommandBuilder()
   .setName('link')
@@ -1272,9 +1342,40 @@ client.on('interactionCreate', async (interaction) => {
          return;
       }
       if (interaction.customId.startsWith('clips:comment:')) {
-        const path = decPath(interaction.customId.split(':')[2]);
-        const modal = new ModalBuilder().setCustomId(`clips:commentModal:${encPath(path)}`).setTitle('Add a comment');
-        const input = new TextInputBuilder().setCustomId('commentText').setLabel('Your comment').setStyle(TextInputStyle.Paragraph).setMaxLength(500).setRequired(true);
+        // IMPORTANT: do NOT defer before showModal
+        const sid = interaction.customId.split(':')[2];
+        const payload = readModalTarget(sid);
+        if (!payload) {
+          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: 64 });
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId(`clips:commentModal:${sid}`)
+          .setTitle('Add a comment');
+
+        const input = new TextInputBuilder()
+          .setCustomId('commentText')
+          .setLabel('Your comment')
+          .setStyle(TextInputStyle.Paragraph)
+          .setMaxLength(300)
+          .setRequired(true);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+      const [prefix, action, a, b] = interaction.customId.split(':');
+      if (prefix === 'c' && action === 'cm') {
+        // open comment modal for clip idx = a
+        const { item } = getClipByIdx(interaction, parseInt(a,10));
+        const modal = new ModalBuilder()
+          .setCustomId(`c:cm:${a}`)  // reuse same id for submit handler
+          .setTitle('Add a comment');
+        const input = new TextInputBuilder()
+          .setCustomId('commentText')
+          .setLabel('Your comment')
+          .setStyle(TextInputStyle.Paragraph)
+          .setMaxLength(500)
+          .setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
       }
@@ -1284,28 +1385,52 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) {
       // 3) Modal flows: don’t defer first
       if (interaction.customId.startsWith('clips:commentModal:')) {
-        try {
-          await interaction.deferReply({ ephemeral: true });
-          const path = decPath(interaction.customId.split(':')[2]);
-          const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
-          if (!text) return interaction.editReply('Comment can’t be empty.');
+        await interaction.deferReply({ flags: 64 }); // ephemeral ack
 
-          const discordId = interaction.user.id;
-          const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+        const sid = interaction.customId.split(':')[2];
+        const payload = readModalTarget(sid);
+        if (!payload) return interaction.editReply('This action expired. Reopen the clip.');
 
-          const nameMap = await getAllUserNames();
-          const userName = nameMap[uid] || interaction.user.username;
+        const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
+        if (!text) return interaction.editReply('Comment cannot be empty.');
 
-          const comment = { text, uid, user: userName, time: admin.database.ServerValue.TIMESTAMP };
-          await withTimeout(rtdb.ref(`${path}/comments`).push(comment), 4000, `push comment`);
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('Link your KC account with /link first.');
 
-          await interaction.editReply('✅ Comment posted!');
-        } catch (e) {
-          console.error('clips comment modal error:', e);
-          try { if (interaction.deferred && !interaction.replied) await interaction.editReply('Failed to post comment.'); } catch {}
-        }
+        const names = await getAllUserNames();
+        const userName = names[uid] || interaction.user.username;
+
+        const comment = {
+          text,
+          uid,
+          user: userName,
+          time: admin.database.ServerValue.TIMESTAMP,
+        };
+
+        await rtdb.ref(`${payload.postPath}/comments`).push(comment);
+        await interaction.editReply('✅ Comment posted!');
         return;
+      }
+      if (interaction.customId.startsWith('c:cm:')) {
+        await interaction.deferReply({ ephemeral: true });
+
+        const idx = parseInt(interaction.customId.split(':')[2], 10);
+        const { item } = getClipByIdx(interaction, idx);
+        const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
+        if (!text) return interaction.editReply('Comment can’t be empty.');
+
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+
+        const nameMap = await getAllUserNames();
+        const userName = nameMap[uid] || interaction.user.username;
+
+        const comment = { text, uid, user: userName, time: admin.database.ServerValue.TIMESTAMP };
+        await rtdb.ref(`${clipDbPath(item)}/comments`).push(comment);
+
+        return interaction.editReply('✅ Comment posted!');
       }
 
       await interaction.deferReply({ flags: EPHEMERAL_FLAG });
@@ -1600,76 +1725,121 @@ client.on('interactionCreate', async (interaction) => {
         const embed = buildLbEmbed(rows, catIdx, page);
         await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
       }
-      else if (interaction.customId.startsWith('clips:')) {
+      else if (interaction.customId.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
         }
 
-        // Load state
-        const key = interaction.message.interaction?.id || '';
-        interaction.client.clipsCache ??= new Map();
-        let state = interaction.client.clipsCache.get(key);
-        if (!state) {
-          // fallback: refetch (rare if cache evicted)
-          const all = await fetchAllPosts({ platform: 'all' });
-          all.sort((a,b)=>b.score-a.score);
-          state = { list: all.slice(0, CLIPS.MAX_LIST), nameMap: await getAllUserNames(), page:0 };
-          interaction.client.clipsCache.set(key, state);
-        }
-
-        const parts = interaction.customId.split(':'); // clips:<action>:...
-        const action = parts[1];
-
-        if (action === 'page') {
-          const page = Math.max(0, parseInt(parts[2]||'0',10) || 0);
-          state.page = page;
-          const embed = buildClipsListEmbed(state.list, page, state.nameMap);
-          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, page) });
-        }
-        else if (action === 'refresh') {
-          const all = await fetchAllPosts({ platform: 'all' });
-          all.sort((a,b)=>b.score-a.score);
-          state.list = all.slice(0, CLIPS.MAX_LIST);
-          state.nameMap = await getAllUserNames();
-          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
-        }
-        else if (action === 'openIdx') {
-          const idx = Math.max(0, Math.min(parseInt(parts[2]||'0',10), state.list.length-1));
-          const base = state.list[idx];
-          // refresh this post from RTDB so counts are current
-          const fresh = await loadNode(`users/${base.ownerUid}/posts/${base.postId}`) || {};
-          const item = { ...base, data: { ...base.data, ...fresh } };
-
+        const [c, action, a, b] = interaction.customId.split(':'); // c:<action>:...
+        
+        if (action === 'o') {
+          // open detail view for idx = a
+          const { state, item, idx } = getClipByIdx(interaction, parseInt(a,10));
+          const postPath = clipDbPath(item);
           const embed = buildClipDetailEmbed(item, state.nameMap);
-          const rows = clipsDetailRows(item);
+          const rows = clipsDetailRows(interaction, postPath);
           return safeEdit(interaction, { embeds:[embed], components: rows });
         }
-        else if (action === 'react') {
-          const path = decPath(parts[2]);
-          const emoji = decodeURIComponent(parts[3] || '');
-          const discordId = interaction.user.id;
-          const reactorUid = await getKCUidForDiscord(discordId);
-          if (!reactorUid) return safeEdit(interaction, { content: 'Link your KC account first with /link.' });
-
-          const likedSnap = await withTimeout(rtdb.ref(`${path}/reactions/${emoji}/${reactorUid}`).get(), 3000, `reactions read`);
-          await rtdb.ref(`${path}/reactions/${emoji}/${reactorUid}`).transaction(cur => cur ? null : true);
-
-          // reload node & re-render detail
-          const node = await loadNode(path);
-          const item = {
-            ownerUid: path.split('/')[1],
-            postId: path.split('/')[3],
-            data: node || {}
-          };
-          const embed = buildClipDetailEmbed(item, state.nameMap);
-          return safeEdit(interaction, { embeds:[embed], components: clipsDetailRows(item) });
-        }
-        else if (action === 'back') {
+        else if (action === 'b') {
+          // back to list
+          const state = getClipsState(interaction);
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
           return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
+        else if (action === 'p') {
+          // page change
+          const state = getClipsState(interaction);
+          state.page = Math.max(0, parseInt(a,10) || 0);
+          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        }
+        else if (action === 'rf') {
+          // refresh list (recompute top)
+          const state = getClipsState(interaction);
+          state.list.sort((x,y)=>y.score-x.score);
+          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        }
+      }
+      else if (interaction.customId.startsWith('clips:react:')) {
+        await interaction.deferUpdate().catch(()=>{});
+        const shortId = interaction.customId.split(':')[2];
+        const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
+        if (!payload) {
+          return safeEdit(interaction, { content: 'Reaction expired. Reopen the clip and try again.' });
+        }
+
+        const { postPath, emoji } = payload;
+
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return safeEdit(interaction, { content: 'Link your KC account with /link to react.' });
+        }
+
+        // --- TOGGLE behaviour ---
+        const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
+        const tx = await myRef.transaction(cur => (cur ? null : true), { applyLocally: false });
+
+        // --- Optional: allow only ONE reaction per user per post ---
+        const SINGLE_REACTION_PER_USER = true; // set false if you want multi
+        if (SINGLE_REACTION_PER_USER && tx.committed && tx.snapshot?.val() === true) {
+          // Remove user from any other emoji buckets
+          await Promise.all(
+            POST_EMOJIS
+              .filter(e => e !== emoji)
+              .map(e => rtdb.ref(`${postPath}/reactions/${e}/${uid}`).remove().catch(()=>{}))
+          );
+        }
+
+        // Quick visual nudge; the embed body will refresh on next open anyway
+        try { await interaction.followUp({ content: '✅ Reaction updated.', flags: 64 }); } catch {}
+
+        // Rebuild the same rows so the cached ids remain valid for a while
+        try {
+          const rows = clipsDetailRows(interaction, postPath, true);
+          await safeEdit(interaction, { components: rows }); // keep existing embed
+        } catch {}
+      }
+      else if (interaction.customId.startsWith('clips:reactors:')) {
+        await interaction.deferUpdate().catch(()=>{});
+        const sid = interaction.customId.split(':')[2];
+        const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
+        if (!payload) {
+          return safeEdit(interaction, { content: 'That list expired. Reopen the clip to refresh.' });
+        }
+        const { postPath } = payload;
+
+        // Load reactions { emoji: { uid: true, ... }, ... }
+        const snap = await withTimeout(rtdb.ref(`${postPath}/reactions`).get(), 4000, `RTDB ${postPath}/reactions`);
+        const data = snap.exists() ? (snap.val() || {}) : {};
+
+        // Pull a name map once to translate uids → display names
+        const nameMap = await getAllUserNames();
+
+        // Build readable lines like: 🔥 User A, User B (3)
+        const lines = [];
+        for (const emo of POST_EMOJIS) {
+          const uids = Object.keys(data[emo] || {});
+          if (!uids.length) continue;
+          const pretty = uids.map(u => nameMap[u] || 'unknown').slice(0, 20).join(', ');
+          const more = uids.length > 20 ? ` … +${uids.length - 20} more` : '';
+          lines.push(`${emo} ${pretty}${more}`);
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('Reactors')
+          .setDescription(lines.join('\n') || '_No reactions yet._')
+          .setColor(DEFAULT_EMBED_COLOR)
+          .setFooter({ text: 'KC Bot • /clips' });
+
+        await interaction.followUp({ embeds:[embed], flags: 64 });
+      }
+      else if (interaction.customId.startsWith('clips:back')) {
+        const state = getClipsState(interaction);
+        const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
+        return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
       }
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
