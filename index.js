@@ -142,12 +142,45 @@ const rtdb = admin.database();
 
 // ---------- Helpers ----------
 function isPermsError(err){ return err?.code === 50013; }
-function isExpiredToken(err){ return err?.code === 10062 || err?.code === 50027 || err?.status === 401; }
+function isUnknown(e){ return e?.code === 10062 || e?.code === 50027 || e?.status === 401; }
+function isAlreadyAcked(e){ return e?.code === 40060; } // "already acknowledged"
 
 function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
-// 4) Make safeEdit() resilient to race conditions
+// Try to defer. Swallow duplicate/late errors and let the flow continue.
+async function safeDefer(interaction, { ephemeral = false } = {}) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral }); // use the documented field
+      return true; // deferred successfully
+    }
+  } catch (e) {
+    if (isUnknown(e) || isAlreadyAcked(e)) {
+      console.warn('[defer ignored]', e.code);
+      return false; // continue without crashing
+    }
+    throw e; // real error
+  }
+  return false;
+}
+
+// Defer (if possible) and try to show a “working” ping
+async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Fetching data…' } = {}) {
+  const ok = await safeDefer(interaction, { ephemeral });
+  try {
+    if (ok) {
+      await interaction.editReply({ content: text });
+    } else {
+      // If another instance already ACKed, we can still follow up
+      await interaction.followUp({ content: text, ephemeral });
+    }
+  } catch (e) {
+    // If even followUp fails, just ignore—real content will be sent later
+    if (!isUnknown(e) && !isAlreadyAcked(e)) throw e;
+  }
+}
+
 async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please run the command again.') {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -156,25 +189,19 @@ async function safeEdit(interaction, data, fallbackText = 'Reply expired. Please
       return await interaction.reply(data);
     }
   } catch (err) {
-    // If we guessed wrong and it's already acknowledged, try editReply instead of reply
+    // If we guessed wrong (already ACKed), try the other method
     if (err?.code === 40060) {
       try { return await interaction.editReply(data); } catch (e2) { err = e2; }
     }
-    if (isExpiredToken(err) || isPermsError(err)) {
+    // If the original webhook token is no longer usable in this proc,
+    // a followUp often still works (because another proc ACKed)
+    if (isUnknown(err)) {
       try { return await interaction.followUp(data); } catch {}
       try { return await interaction.channel?.send(fallbackText); } catch {}
       return null;
     }
     throw err;
   }
-}
-
-// 2) Never mix reply() after deferReply()
-async function deferAndPing(interaction, { ephemeral = false, text = '⏳ Working…' } = {}) {
-  if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply(ephemeral ? { flags: EPHEMERAL_FLAG } : {});
-  }
-  try { await interaction.editReply({ content: text }); } catch {}
 }
 
 function startReplyWatchdog(interaction, ms = 5000) {
@@ -1268,27 +1295,22 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // --- Immediate Reply/Modal Commands (no defer) ---
     if (interaction.isChatInputCommand()) {
-      const commandName = interaction.commandName;
-      if (commandName === 'link') {
-        if (!process.env.AUTH_BRIDGE_START_URL) {
-          return interaction.reply({ content: 'Linking is not configured.', ephemeral: true });
-        }
+      const name = interaction.commandName;
+
+      // Commands that must NOT be deferred (reply immediately / or show modal)
+      if (name === 'link') {
         const start = process.env.AUTH_BRIDGE_START_URL;
-        const url = `${start}?state=${encodeURIComponent(interaction.user.id)}`;
-        await interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
-        return;
+        const url = start ? `${start}?state=${encodeURIComponent(interaction.user.id)}` : null;
+        return interaction.reply({ content: url ? `Click to link your account: ${url}` : 'Linking is not configured.', ephemeral: true });
       }
-      if (commandName === 'vote') {
-        // Handle all logic here and return, no defer before a modal
+      if (name === 'vote') {
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          await interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
-          return;
+          return interaction.reply({ content:'Link your KC account first with /link.', ephemeral: true });
         }
         if (!(await userIsVerified(uid))) {
-          await interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
-          return;
+          return interaction.reply({ content:'You must verify your email on KC before voting.', ephemeral: true });
         }
         const existingSnap = await rtdb.ref(`votes/${uid}`).get();
         if (existingSnap.exists()) {
@@ -1305,29 +1327,20 @@ client.on('interactionCreate', async (interaction) => {
             new ButtonBuilder().setCustomId(`vote:change:${uid}`).setLabel('Change vote').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`vote:delete:${uid}`).setLabel('Delete vote').setStyle(ButtonStyle.Danger),
           );
-          await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-          return;
+          return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
         }
-        await showVoteModal(interaction);
-        return;
+        return showVoteModal(interaction); // no defer before showModal
       }
-      
-      // --- Defer all other commands once ---
-      const ephemeral = isEphemeralCommand(commandName);
-      await deferAndPing(interaction, { ephemeral, text: '⏳ Fetching data…' });
+
+      // Everyone else: try to defer — and **do not** crash if it fails
+      await deferAndPing(interaction, { ephemeral: isEphemeralCommand(name), text: '⏳ Fetching data…' });
     }
 
     // --- Button/Modal handlers ---
     // 5) Button handlers: ACK with deferUpdate() once
     if (interaction.isButton()) {
-      if (interaction.customId.startsWith('vote:change:')) {
-        const uid = interaction.customId.split(':')[2];
-        const snap = await withTimeout(rtdb.ref(`votes/${uid}`).get(), 4000, `RTDB votes/${uid}`);
-        const v = snap.exists() ? snap.val() : {};
-        await showVoteModal(interaction, { off: v.bestOffence || '', def: v.bestDefence || '', rating: v.rating || '' });
-        return;
-      }
-      if (interaction.customId.startsWith('msg:') && interaction.customId.split(':')[1] === 'reply') {
+      // Modal buttons – show modal immediately and return
+      if (interaction.customId.startsWith('msg:reply')) {
          const path = decPath(interaction.customId.split(':')[2]);
          const modal = new ModalBuilder()
            .setCustomId(`msg:replyModal:${encPath(path)}`)
@@ -1338,10 +1351,9 @@ client.on('interactionCreate', async (interaction) => {
            .setStyle(TextInputStyle.Paragraph)
            .setMaxLength(500);
          modal.addComponents(new ActionRowBuilder().addComponents(input));
-         await interaction.showModal(modal);
-         return;
+         return interaction.showModal(modal);
       }
-      if (interaction.customId.startsWith('clips:comment:')) {
+      if (interaction.customId.startsWith('clips:comment')) {
         // IMPORTANT: do NOT defer before showModal
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
@@ -1363,24 +1375,10 @@ client.on('interactionCreate', async (interaction) => {
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
       }
-      const [prefix, action, a, b] = interaction.customId.split(':');
-      if (prefix === 'c' && action === 'cm') {
-        // open comment modal for clip idx = a
-        const { item } = getClipByIdx(interaction, parseInt(a,10));
-        const modal = new ModalBuilder()
-          .setCustomId(`c:cm:${a}`)  // reuse same id for submit handler
-          .setTitle('Add a comment');
-        const input = new TextInputBuilder()
-          .setCustomId('commentText')
-          .setLabel('Your comment')
-          .setStyle(TextInputStyle.Paragraph)
-          .setMaxLength(500)
-          .setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-        return interaction.showModal(modal);
-      }
-      // For all other buttons, defer the update immediately
-      await interaction.deferUpdate();
+
+      // Everything else: best-effort defer
+      try { await interaction.deferUpdate(); }
+      catch (e) { if (!isUnknown(e) && !isAlreadyAcked(e)) throw e; }
     }
     if (interaction.isModalSubmit()) {
       // 3) Modal flows: don’t defer first
