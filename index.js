@@ -74,6 +74,12 @@ const LB = {
   PAGE_SIZE: 10,
 };
 
+const CLIPS = {
+  PAGE_SIZE: 5,                      // 5 per page in the list
+  REACTS: ['🔥','😂','😮','👍','💯'],  // match your site’s set
+  MAX_LIST: 50                       // cap how many we score & browse
+};
+
 const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
 // Simple in-memory cache for frequently accessed, non-critical data
@@ -257,6 +263,26 @@ function parseVideoLink(link='') {
   if (tt) return { type: 'tiktok', videoId: tt[1] };
 
   return null;
+}
+
+function clipLink(d={}) {
+  if (d.type === 'youtube' && d.ytId) return `https://youtu.be/${d.ytId}`;
+  if (d.type === 'tiktok'  && d.videoId) return `https://www.tiktok.com/embed/v2/${d.videoId}`;
+  return '';
+}
+function clipThumb(d={}) {
+  if (d.type === 'youtube' && d.ytId) return `https://i.ytimg.com/vi/${d.ytId}/hqdefault.jpg`;
+  return null; // TikTok: no stable thumbnail without scraping
+}
+function reactCount(reactions={}) {
+  const perEmoji = {};
+  for (const e of Object.keys(reactions||{})) perEmoji[e] = Object.keys(reactions[e]||{}).length;
+  const total = Object.values(perEmoji).reduce((a,b)=>a+b,0);
+  return { perEmoji, total };
+}
+function sitePostUrl(ownerUid, postId) {
+  // If you have a deep link on the site, put it here; otherwise link to feed:
+  return `https://kcevents.uk/#socialfeed`;
 }
 
 async function postingUnlocked(uid) {
@@ -584,6 +610,103 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
 
   rows.push(ctrl);
   return rows;
+}
+
+function buildClipsListEmbed(list=[], page=0, nameMap={}) {
+  const start = page * CLIPS.PAGE_SIZE;
+  const slice = list.slice(start, start + CLIPS.PAGE_SIZE);
+
+  const lines = slice.map((p, i) => {
+    const d = p.data || {};
+    const who = nameMap[p.ownerUid] || '(unknown)';
+    const cap = (d.caption || '').trim() || '(no caption)';
+    const link = clipLink(d);
+    const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
+    const idx = start + i + 1;
+    return `**${idx}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
+  }).join('\n\n') || 'No clips found.';
+
+  return new EmbedBuilder()
+    .setTitle(`Top ${Math.min(list.length, CLIPS.PAGE_SIZE)} Clips`)
+    .setDescription(lines)
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /clips' });
+}
+
+function clipsListRows(listLen, page=0) {
+  const rows = [];
+  const start = page * CLIPS.PAGE_SIZE;
+  const visible = Math.min(CLIPS.PAGE_SIZE, Math.max(0, listLen - start));
+  // numbers row (1..N for the current page)
+  const num = new ActionRowBuilder();
+  for (let i = 0; i < visible; i++) {
+    num.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`clips:openIdx:${start+i}`)
+        .setLabel(String(start + i + 1))
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (num.components.length) rows.push(num);
+
+  // paging + refresh
+  const maxPage = Math.max(0, Math.ceil(listLen/CLIPS.PAGE_SIZE)-1);
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`clips:page:${Math.max(page-1,0)}`).setLabel('◀ Page').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
+      new ButtonBuilder().setCustomId(`clips:page:${Math.min(page+1,maxPage)}`).setLabel('Page ▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=maxPage),
+      new ButtonBuilder().setCustomId('clips:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary),
+    )
+  );
+  return rows;
+}
+
+function buildClipDetailEmbed(item, nameMap={}) {
+  const d = item.data || {};
+  const who = nameMap[item.ownerUid] || '(unknown)';
+  const link = clipLink(d);
+  const cap = (d.caption || '').trim() || '(no caption)';
+  const { perEmoji, total } = reactCount(d.reactions || {});
+  const reactsLine = CLIPS.REACTS.map(e => `${e} ${perEmoji[e]||0}`).join('  ');
+  const comments = Object.keys(d.comments || {}).length;
+
+  const e = new EmbedBuilder()
+    .setTitle(cap.slice(0,256))
+    .setURL(link || undefined)
+    .setDescription([
+      `Uploader: **${who}**`,
+      `Reactions: ${reactsLine}  (total ${total})`,
+      `Comments: **${comments}**`,
+    ].join('\n'))
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /clips' });
+
+  const thumb = clipThumb(d);
+  if (thumb) e.setImage(thumb); // shows a preview; Discord will auto-embed YT URLs when clicked
+
+  return e;
+}
+
+function clipsDetailRows(item) {
+  const path = `users/${item.ownerUid}/posts/${item.postId}`;
+  const row1 = new ActionRowBuilder();
+  for (const emoji of CLIPS.REACTS) {
+    row1.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`clips:react:${encPath(path)}:${encodeURIComponent(emoji)}`)
+        .setLabel(emoji)
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  const link = clipLink(item.data||{});
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`clips:comment:${encPath(path)}`).setLabel('↩️ Comment').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('clips:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
+    ...(link ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Open Video').setURL(link)] : []),
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Open on Site').setURL(sitePostUrl(item.ownerUid, item.postId)),
+  );
+
+  return [row1, row2];
 }
 
 
@@ -1148,11 +1271,43 @@ client.on('interactionCreate', async (interaction) => {
          await interaction.showModal(modal);
          return;
       }
+      if (interaction.customId.startsWith('clips:comment:')) {
+        const path = decPath(interaction.customId.split(':')[2]);
+        const modal = new ModalBuilder().setCustomId(`clips:commentModal:${encPath(path)}`).setTitle('Add a comment');
+        const input = new TextInputBuilder().setCustomId('commentText').setLabel('Your comment').setStyle(TextInputStyle.Paragraph).setMaxLength(500).setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
       // For all other buttons, defer the update immediately
       await interaction.deferUpdate();
     }
     if (interaction.isModalSubmit()) {
       // 3) Modal flows: don’t defer first
+      if (interaction.customId.startsWith('clips:commentModal:')) {
+        try {
+          await interaction.deferReply({ ephemeral: true });
+          const path = decPath(interaction.customId.split(':')[2]);
+          const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
+          if (!text) return interaction.editReply('Comment can’t be empty.');
+
+          const discordId = interaction.user.id;
+          const uid = await getKCUidForDiscord(discordId);
+          if (!uid) return interaction.editReply('You must link your KC account first with /link.');
+
+          const nameMap = await getAllUserNames();
+          const userName = nameMap[uid] || interaction.user.username;
+
+          const comment = { text, uid, user: userName, time: admin.database.ServerValue.TIMESTAMP };
+          await withTimeout(rtdb.ref(`${path}/comments`).push(comment), 4000, `push comment`);
+
+          await interaction.editReply('✅ Comment posted!');
+        } catch (e) {
+          console.error('clips comment modal error:', e);
+          try { if (interaction.deferred && !interaction.replied) await interaction.editReply('Failed to post comment.'); } catch {}
+        }
+        return;
+      }
+
       await interaction.deferReply({ flags: EPHEMERAL_FLAG });
       if (interaction.customId.startsWith('msg:replyModal:')) {
         const path = decPath(interaction.customId.split(':')[2]);
@@ -1246,30 +1401,22 @@ client.on('interactionCreate', async (interaction) => {
           await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
       }
       else if (commandName === 'clips') {
-          const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
-          const all = await fetchAllPosts({ platform });
-          if (!all.length) {
-            return await interaction.editReply({ content: 'No clips found.' });
-          }
-          all.sort((a, b) => b.score - a.score);
-          const top = all.slice(0, 5);
-          const nameMap = await getAllUserNames();
-          const lines = top.map((p, i) => {
-            const d = p.data || {};
-            const who = nameMap[p.ownerUid] || '(unknown)';
-            const cap = (d.caption || '').trim().slice(0, 120) || '(no caption)';
-            let link = '';
-            if (d.type === 'youtube' && d.ytId) link = `https://youtu.be/${d.ytId}`;
-            else if (d.type === 'tiktok' && d.videoId) link = `https://www.tiktok.com/embed/v2/${d.videoId}`;
-            const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
-            return `**${i + 1}.** ${cap}${link ? ` — ${link}` : ''}\nUploader: **${who}** • ${meta}`;
-          });
-          const embed = new EmbedBuilder()
-            .setTitle(`Top ${Math.min(top.length, 5)} ${platform === 'all' ? 'Clips' : platform.charAt(0).toUpperCase()+platform.slice(1)}`)
-            .setDescription(lines.join('\n\n'))
-            .setColor(DEFAULT_EMBED_COLOR)
-            .setFooter({ text: 'KC Bot • /clips' });
-          await interaction.editReply({ embeds: [embed] });
+        await interaction.editReply({ content: '⏳ Fetching data...' });
+
+        const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
+        const all = await fetchAllPosts({ platform });
+        if (!all.length) return interaction.editReply({ content: 'No clips found.' });
+
+        all.sort((a,b)=>b.score-a.score);
+        const list = all.slice(0, CLIPS.MAX_LIST);
+        const nameMap = await getAllUserNames();
+
+        interaction.client.clipsCache ??= new Map();
+        const state = { list, nameMap, page: 0 };
+        interaction.client.clipsCache.set(interaction.id, state);
+
+        const embed = buildClipsListEmbed(list, 0, nameMap);
+        return interaction.editReply({ content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
       }
       else if (commandName === 'messages') {
         const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
@@ -1453,6 +1600,77 @@ client.on('interactionCreate', async (interaction) => {
         const embed = buildLbEmbed(rows, catIdx, page);
         await safeEdit(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
       }
+      else if (interaction.customId.startsWith('clips:')) {
+        const invokerId = interaction.message.interaction?.user?.id;
+        if (invokerId && invokerId !== interaction.user.id) {
+          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+        }
+
+        // Load state
+        const key = interaction.message.interaction?.id || '';
+        interaction.client.clipsCache ??= new Map();
+        let state = interaction.client.clipsCache.get(key);
+        if (!state) {
+          // fallback: refetch (rare if cache evicted)
+          const all = await fetchAllPosts({ platform: 'all' });
+          all.sort((a,b)=>b.score-a.score);
+          state = { list: all.slice(0, CLIPS.MAX_LIST), nameMap: await getAllUserNames(), page:0 };
+          interaction.client.clipsCache.set(key, state);
+        }
+
+        const parts = interaction.customId.split(':'); // clips:<action>:...
+        const action = parts[1];
+
+        if (action === 'page') {
+          const page = Math.max(0, parseInt(parts[2]||'0',10) || 0);
+          state.page = page;
+          const embed = buildClipsListEmbed(state.list, page, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, page) });
+        }
+        else if (action === 'refresh') {
+          const all = await fetchAllPosts({ platform: 'all' });
+          all.sort((a,b)=>b.score-a.score);
+          state.list = all.slice(0, CLIPS.MAX_LIST);
+          state.nameMap = await getAllUserNames();
+          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        }
+        else if (action === 'openIdx') {
+          const idx = Math.max(0, Math.min(parseInt(parts[2]||'0',10), state.list.length-1));
+          const base = state.list[idx];
+          // refresh this post from RTDB so counts are current
+          const fresh = await loadNode(`users/${base.ownerUid}/posts/${base.postId}`) || {};
+          const item = { ...base, data: { ...base.data, ...fresh } };
+
+          const embed = buildClipDetailEmbed(item, state.nameMap);
+          const rows = clipsDetailRows(item);
+          return safeEdit(interaction, { embeds:[embed], components: rows });
+        }
+        else if (action === 'react') {
+          const path = decPath(parts[2]);
+          const emoji = decodeURIComponent(parts[3] || '');
+          const discordId = interaction.user.id;
+          const reactorUid = await getKCUidForDiscord(discordId);
+          if (!reactorUid) return safeEdit(interaction, { content: 'Link your KC account first with /link.' });
+
+          const likedSnap = await withTimeout(rtdb.ref(`${path}/reactions/${emoji}/${reactorUid}`).get(), 3000, `reactions read`);
+          await rtdb.ref(`${path}/reactions/${emoji}/${reactorUid}`).transaction(cur => cur ? null : true);
+
+          // reload node & re-render detail
+          const node = await loadNode(path);
+          const item = {
+            ownerUid: path.split('/')[1],
+            postId: path.split('/')[3],
+            data: node || {}
+          };
+          const embed = buildClipDetailEmbed(item, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsDetailRows(item) });
+        }
+        else if (action === 'back') {
+          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
+          return safeEdit(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        }
+      }
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
@@ -1535,8 +1753,8 @@ client.on('interactionCreate', async (interaction) => {
           if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', ephemeral: true });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 3000, `RTDB ${path}/likedBy`);
-          const wasLiked = likedSnap.exists();
           await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
+          const wasLiked = likedSnap.exists();
           await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
           const node = await loadNode(path);
           const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
