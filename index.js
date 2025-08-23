@@ -505,7 +505,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.name ||
     '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
-  const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
+  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
@@ -1290,7 +1290,7 @@ client.on('interactionCreate', async (interaction) => {
       
       // --- Command Logic (post-ACK) ---
       if (commandName === 'whoami') {
-        const kcUid = await getKcUidForDiscord(interaction.user.id) || 'not linked';
+        const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
         await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
       }
       else if (commandName === 'dumpme') {
@@ -1900,3 +1900,75 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     process.exit(1);
   });
 })();
+" in the canvas. I want you to replace the selected code with this: "
+// ===== Bot lock =====
+const LOCK_KEY = '_runtime/botLock';
+const LOCK_TTL_MS = 90_000; // 90s
+const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
+
+async function claimBotLock() {
+  const now = Date.now();
+  // IMPORTANT: correct transaction signature (no options object)
+  const result = await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) {
+      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
+    }
+    if (cur.expiresAt && cur.expiresAt < now) {
+      // stale -> take over
+      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
+    }
+    // someone else owns it
+    return; // abort
+  }, undefined /* onComplete */, false /* applyLocally */);
+
+  // result has .committed (compat) or .committed-like semantics; if using admin,
+  // just treat "snapshot.val()?.owner === OWNER_ID" as success:
+  const snap = await rtdb.ref(LOCK_KEY).get();
+  const val = snap.val() || {};
+  return val.owner === OWNER_ID;
+}
+
+async function renewBotLock() {
+  const now = Date.now();
+  await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) return;               // nothing to renew
+    if (cur.owner !== OWNER_ID) return; // not ours anymore
+    cur.expiresAt = now + LOCK_TTL_MS;
+    return cur;
+  }, undefined, false);
+}
+
+async function startWhenLocked() {
+  // standby retry loop (keep web server alive)
+  for (;;) {
+    try {
+      const got = await claimBotLock();
+      if (got) break;
+      console.log('Standby — lock held by another instance. Retrying in 20s…');
+    } catch (e) {
+      console.warn('Lock claim error:', e.message);
+    }
+    await new Promise(r => setTimeout(r, 20_000));
+  }
+
+  console.log('Lock acquired — registering commands & logging into Discord…');
+
+  // (optional) Only the lock-holder should register commands
+  try {
+    await registerCommands();
+    console.log('Slash command registration complete.');
+  } catch (e) {
+    console.error('registerCommands FAILED:', e?.rawError || e);
+  }
+
+  // Only the lock-holder logs in
+  await client.login(process.env.DISCORD_BOT_TOKEN);
+
+  // keep lock alive
+  setInterval(() => renewBotLock().catch(() => {}), 30_000).unref();
+}
+
+// Replace your old IIFE that logged in immediately with only this:
+startWhenLocked().catch(e => {
+  console.error('Failed to start bot:', e);
+})
