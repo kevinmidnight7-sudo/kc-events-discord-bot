@@ -163,14 +163,30 @@ function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
 // --- New Safe Interaction Handlers ---
-async function ack(inter, {ephemeral=false, text='⏳ Fetching data…'} = {}) {
+async function ack(inter, { ephemeral=false, text='⏳ Fetching data…' } = {}) {
   try {
-    await inter.reply({ content: text, flags: ephemeral ? EPHEMERAL_FLAG : 0 });
+    if (!inter.deferred && !inter.replied) {
+      await inter.deferReply({ flags: ephemeral ? EPHEMERAL_FLAG : 0 });
+    }
     return true;
-  } catch (e) {
-    // 40060 = already acknowledged, 10062 = too late/expired
-    console.warn('[ack failed]', e.code || e?.rawError?.code, e.message);
-    return e.code === 40060;
+  } catch (e1) {
+    // If defer was rejected but we still have time, try a regular reply.
+    try {
+      if (!inter.deferred && !inter.replied) {
+        await inter.reply({ content: text, flags: ephemeral ? EPHEMERAL_FLAG : 0 });
+      }
+      return true;
+    } catch (e2) {
+      const code = e2.code || e2?.rawError?.code;
+      // 40060 = already acknowledged (okay). 10062 = too late/expired.
+      if (code === 40060) return true;
+      if (code === 10062) {
+        console.warn('[ack ignored] interaction expired');
+        return false;
+      }
+      console.warn('[ack failed]', code, e2.message);
+      return false;
+    }
   }
 }
 
@@ -1258,11 +1274,11 @@ async function registerCommands() {
 }
 
 // ---------- Interaction handling ----------
-const MAX_AGE_MS = 2500; // 2.5s
+const MAX_AGE_MS = 15000; // be generous; we’ll still try to ack
 client.on('interactionCreate', async (interaction) => {
-  if (Date.now() - interaction.createdTimestamp > MAX_AGE_MS) {
-    console.warn(`[old interaction] skipping ${interaction.id}`);
-    return;
+  const age = Date.now() - interaction.createdTimestamp;
+  if (age > MAX_AGE_MS) {
+    console.warn(`[old interaction ~${age}ms] attempting to acknowledge anyway`);
   }
   
   const seen = globalThis.__seen ??= new Set();
@@ -1292,7 +1308,7 @@ client.on('interactionCreate', async (interaction) => {
 
       // Everyone else: ACK now, work later
       const ok = await ack(interaction, { ephemeral: isEphemeralCommand(commandName) });
-      if (!ok) return; // don’t try to edit/followUp if we didn’t ACK
+      if (!ok) return console.warn(`[ack] gave up on ${commandName}`);
       
       // --- Command Logic (post-ACK) ---
       if (commandName === 'whoami') {
