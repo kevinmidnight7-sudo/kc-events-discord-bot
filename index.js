@@ -135,6 +135,43 @@ admin.initializeApp({
 
 const rtdb = admin.database();
 
+// ===== Bot lock =====
+const LOCK_KEY = '_runtime/botLock';
+const LOCK_TTL_MS = 90_000; // 90s
+const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
+
+async function claimBotLock() {
+  const now = Date.now();
+  // IMPORTANT: correct transaction signature (no options object)
+  const result = await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) {
+      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
+    }
+    if (cur.expiresAt && cur.expiresAt < now) {
+      // stale -> take over
+      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
+    }
+    // someone else owns it
+    return; // abort
+  }, undefined /* onComplete */, false /* applyLocally */);
+
+  // result has .committed (compat) or .committed-like semantics; if using admin,
+  // just treat "snapshot.val()?.owner === OWNER_ID" as success:
+  const snap = await rtdb.ref(LOCK_KEY).get();
+  const val = snap.val() || {};
+  return val.owner === OWNER_ID;
+}
+
+async function renewBotLock() {
+  const now = Date.now();
+  await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) return;               // nothing to renew
+    if (cur.owner !== OWNER_ID) return; // not ours anymore
+    cur.expiresAt = now + LOCK_TTL_MS;
+    return cur;
+  }, undefined, false);
+}
+
 // ---------- Helpers ----------
 function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
@@ -162,8 +199,9 @@ async function ack(inter, { ephemeral = false, text = '⏳ Working…' } = {}) {
   }
 }
 
-function isExpired(err){
-  return err?.code === 10062 || err?.code === 50027 || err?.status === 401;
+function isInteractionGone(err) {
+  const code = err?.code ?? err?.rawError?.code;
+  return code === 10062 || code === 50027 || err?.status === 401;
 }
 
 async function safeEdit(inter, data) {
@@ -171,9 +209,7 @@ async function safeEdit(inter, data) {
     if (inter.deferred || inter.replied) return await inter.editReply(data);
     return await inter.reply({ ...data, ephemeral: isEphemeralCommand(inter.commandName) });
   } catch (e) {
-    if (isExpired(e)) {
-      try { return await inter.followUp({ ...data, ephemeral: isEphemeralCommand(inter.commandName) }); } catch {}
-    }
+    if (isInteractionGone(e)) return;
     throw e;
   }
 }
@@ -1971,4 +2007,3 @@ async function startWhenLocked() {
 // Replace your old IIFE that logged in immediately with only this:
 startWhenLocked().catch(e => {
   console.error('Failed to start bot:', e);
-})
