@@ -136,23 +136,33 @@ admin.initializeApp({
 const rtdb = admin.database();
 
 // --- Singleton Bot Lock ---
-const instanceId = process.env.RENDER_INSTANCE_ID || `local-${process.pid}`;
-const BOT_LOCK_PATH = 'botRuntime/discordLock';
+// CHANGE A: Replace the “exit if lock not acquired” with a standby loop
+const LOCK_KEY = '_runtime/botLock';
+const LOCK_TTL_MS = 90_000; // 90s
+const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
 
-async function claimBotLock(leaseMs = 120000) {
+// Claim the lock (create or steal expired)
+async function claimBotLock() {
   const now = Date.now();
-  const ref = rtdb.ref(BOT_LOCK_PATH);
-  const tx = await ref.transaction(cur => {
-    if (!cur || (now - (cur.heartbeat || 0)) > leaseMs) {
-      return { holder: instanceId, started: now, heartbeat: now };
+  const res = await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
+    if (cur.expiresAt && cur.expiresAt < now) {
+      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
     }
-    return; // someone else holds it
-  });
-  return tx.committed && tx.snapshot?.val()?.holder === instanceId;
+    return; // abort, someone else owns it and it's not expired
+  }, { applyLocally: false });
+  return !!res.committed;
 }
 
+// Extend our own lock
 async function renewBotLock() {
-  await rtdb.ref(BOT_LOCK_PATH).child('heartbeat').set(Date.now());
+  const now = Date.now();
+  await rtdb.ref(LOCK_KEY).transaction(cur => {
+    if (!cur) return; // nothing to renew
+    if (cur.owner !== OWNER_ID) return; // not ours
+    cur.expiresAt = now + LOCK_TTL_MS;
+    return cur;
+  }, { applyLocally: false });
 }
 
 
@@ -161,7 +171,6 @@ function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
 // --- New Safe Interaction Handlers ---
-// CHANGE 1: Replaced ack helper
 async function ack(inter, { ephemeral = false, text = '⏳ Working…' } = {}) {
   try {
     if (!inter.deferred && !inter.replied) {
@@ -527,7 +536,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.name ||
     '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
-  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
+  const rawText = msg.text ?? msg.message ?? msg.content ?? m.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
@@ -866,7 +875,6 @@ function lbRow(catIdx, page) {
   );
 }
 
-// CHANGE 4: Made link lookup tolerant and longer
 async function getKCUidForDiscord(discordId) {
   try {
     const snap = await withTimeout(
@@ -1293,11 +1301,9 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
-      // CHANGE 2: Ack every slash command before any DB work
       // Commands that reply right away with a link/modal:
       if (commandName === 'link') {
         const url = `${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`;
-        // CHANGE 1 (Example): Use ephemeral: true
         return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
       }
       if (commandName === 'vote') {
@@ -1315,7 +1321,7 @@ client.on('interactionCreate', async (interaction) => {
       
       // --- Command Logic (post-ACK) ---
       if (commandName === 'whoami') {
-        const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
+        const kcUid = await getKcUidForDiscord(interaction.user.id) || 'not linked';
         await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
       }
       else if (commandName === 'dumpme') {
@@ -1428,7 +1434,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       else if (commandName === 'syncavatar') {
           const discordId = interaction.user.id;
-          const uid = await getKcUidForDiscord(discordId);
+          const uid = await getKCUidForDiscord(discordId);
           if (!uid) {
             return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
           }
@@ -1795,7 +1801,6 @@ client.on('interactionCreate', async (interaction) => {
     }
     // --- Modal Submissions ---
     else if (interaction.isModalSubmit()) {
-      // CHANGE 3: Ack every modal submit
       await interaction.deferReply({ ephemeral: true });
 
       if (interaction.customId.startsWith('clips:commentModal:')) {
@@ -1887,14 +1892,7 @@ client.on('interactionCreate', async (interaction) => {
 
 
 // ---------- Startup ----------
-// CHANGE 5: Use the single-instance bot lock
 client.once('ready', async () => {
-  const ok = await claimBotLock();
-  if (!ok) {
-    console.warn('Another instance holds the bot lock. Exiting.');
-    process.exit(0);
-  }
-  setInterval(() => renewBotLock().catch(()=>{}), 30_000);
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -1910,12 +1908,26 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     console.error('registerCommands FAILED:', e?.rawError || e);
   }
 
-  try {
-    console.log('Logging into Discord…');
+  // CHANGE B: Claim lock before client login
+  // Start bot only after we own the lock
+  async function startWhenLocked() {
+    while (true) {
+      try {
+        const got = await claimBotLock();
+        if (got) break;
+        console.log('Standby — lock held by another instance. Retrying in 20s…');
+      } catch (e) {
+        console.warn('Lock claim error:', e.message);
+      }
+      await new Promise(r => setTimeout(r, 20_000));
+    }
+    console.log('Lock acquired — logging into Discord…');
     await client.login(process.env.DISCORD_BOT_TOKEN);
-    console.log('Login promise resolved.');
-  } catch (e) {
-    console.error('client.login FAILED:', e?.rawError || e);
-    process.exit(1); // don’t keep a “healthy” web server without the bot
+    setInterval(() => renewBotLock().catch(() => {}), 30_000).unref();
   }
+
+  startWhenLocked().catch(e => {
+    console.error('Failed to start bot:', e);
+    process.exit(1);
+  });
 })();
