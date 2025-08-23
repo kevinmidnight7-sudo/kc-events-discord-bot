@@ -135,37 +135,6 @@ admin.initializeApp({
 
 const rtdb = admin.database();
 
-// --- Singleton Bot Lock ---
-// CHANGE A: Replace the “exit if lock not acquired” with a standby loop
-const LOCK_KEY = '_runtime/botLock';
-const LOCK_TTL_MS = 90_000; // 90s
-const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
-
-// Claim the lock (create or steal expired)
-async function claimBotLock() {
-  const now = Date.now();
-  const res = await rtdb.ref(LOCK_KEY).transaction(cur => {
-    if (!cur) return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
-    if (cur.expiresAt && cur.expiresAt < now) {
-      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
-    }
-    return; // abort, someone else owns it and it's not expired
-  }, { applyLocally: false });
-  return !!res.committed;
-}
-
-// Extend our own lock
-async function renewBotLock() {
-  const now = Date.now();
-  await rtdb.ref(LOCK_KEY).transaction(cur => {
-    if (!cur) return; // nothing to renew
-    if (cur.owner !== OWNER_ID) return; // not ours
-    cur.expiresAt = now + LOCK_TTL_MS;
-    return cur;
-  }, { applyLocally: false });
-}
-
-
 // ---------- Helpers ----------
 function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
@@ -536,7 +505,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.name ||
     '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
-  const rawText = msg.text ?? msg.message ?? msg.content ?? m.body ?? '';
+  const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
