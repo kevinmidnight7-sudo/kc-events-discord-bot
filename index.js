@@ -51,8 +51,6 @@ const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 
-const EPHEMERAL_FLAG = 64; // Discord message flag for ephemeral
-
 const EMOJI = {
   offence:  '<:red:1407696672229818579>',
   defence:  '<:blue:1407696743474139260>',
@@ -163,27 +161,23 @@ function encPath(p){ return String(p).replace(/\//g, '|'); }
 function decPath(s){ return String(s).replace(/\|/g, '/'); }
 
 // --- New Safe Interaction Handlers ---
-async function ack(inter, { ephemeral=false, text='⏳ Fetching data…' } = {}) {
+// CHANGE 1: Replaced ack helper
+async function ack(inter, { ephemeral = false, text = '⏳ Working…' } = {}) {
   try {
     if (!inter.deferred && !inter.replied) {
-      await inter.deferReply({ flags: ephemeral ? EPHEMERAL_FLAG : 0 });
+      await inter.deferReply({ ephemeral }); // <- use ephemeral, not flags
     }
     return true;
   } catch (e1) {
-    // If defer was rejected but we still have time, try a regular reply.
     try {
       if (!inter.deferred && !inter.replied) {
-        await inter.reply({ content: text, flags: ephemeral ? EPHEMERAL_FLAG : 0 });
+        await inter.reply({ content: text, ephemeral }); // <- use ephemeral
       }
       return true;
     } catch (e2) {
       const code = e2.code || e2?.rawError?.code;
-      // 40060 = already acknowledged (okay). 10062 = too late/expired.
-      if (code === 40060) return true;
-      if (code === 10062) {
-        console.warn('[ack ignored] interaction expired');
-        return false;
-      }
+      if (code === 40060) return true;   // already acked elsewhere
+      if (code === 10062) return false;  // too late/expired
       console.warn('[ack failed]', code, e2.message);
       return false;
     }
@@ -197,10 +191,10 @@ function isExpired(err){
 async function safeEdit(inter, data) {
   try {
     if (inter.deferred || inter.replied) return await inter.editReply(data);
-    return await inter.reply({ ...data, flags: 0 });
+    return await inter.reply({ ...data, ephemeral: isEphemeralCommand(inter.commandName) });
   } catch (e) {
     if (isExpired(e)) {
-      try { return await inter.followUp({ ...data, flags: 0 }); } catch {}
+      try { return await inter.followUp({ ...data, ephemeral: isEphemeralCommand(inter.commandName) }); } catch {}
     }
     throw e;
   }
@@ -872,15 +866,18 @@ function lbRow(catIdx, page) {
   );
 }
 
+// CHANGE 4: Made link lookup tolerant and longer
 async function getKCUidForDiscord(discordId) {
+  try {
     const snap = await withTimeout(
-    rtdb.ref(`discordLinks/${discordId}`).get(),
-    6000,
-    `RTDB discordLinks/${discordId}`
-  );
-  if (!snap.exists()) return null;
-  const { uid } = snap.val() || {};
-  return uid || null;
+      rtdb.ref(`discordLinks/${discordId}`).get(),
+      8000, // increased timeout
+      `RTDB discordLinks/${discordId}`
+    );
+    return snap.exists() ? (snap.val() || {}).uid || null : null;
+  } catch {
+    return null; // don't throw prior to replying
+  }
 }
 
 function clampStr(val, max, fallback = '—') {
@@ -1296,19 +1293,25 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
+      // CHANGE 2: Ack every slash command before any DB work
       // Commands that reply right away with a link/modal:
       if (commandName === 'link') {
         const url = `${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`;
-        return interaction.reply({ content: `Click to link your account: ${url}`, flags: EPHEMERAL_FLAG });
+        // CHANGE 1 (Example): Use ephemeral: true
+        return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
       }
       if (commandName === 'vote') {
         // Modal must be shown within 3s; do NOT defer before showModal.
-        return showVoteModal(interaction);
+        await showVoteModal(interaction);
+        return; // don't fall through
       }
 
       // Everyone else: ACK now, work later
       const ok = await ack(interaction, { ephemeral: isEphemeralCommand(commandName) });
-      if (!ok) return console.warn(`[ack] gave up on ${commandName}`);
+      if (!ok) {
+        console.warn(`[ack] gave up on ${commandName}`);
+        return;
+      }
       
       // --- Command Logic (post-ACK) ---
       if (commandName === 'whoami') {
@@ -1425,7 +1428,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       else if (commandName === 'syncavatar') {
           const discordId = interaction.user.id;
-          const uid = await getKCUidForDiscord(discordId);
+          const uid = await getKcUidForDiscord(discordId);
           if (!uid) {
             return await interaction.editReply({ content: 'You are not linked. Use `/link` first.' });
           }
@@ -1478,6 +1481,7 @@ client.on('interactionCreate', async (interaction) => {
               `• **Caption:** ${caption || '(none)'}`,
               publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
             ].join('\n'),
+            ephemeral: true,
           });
       }
       else if (commandName === 'postmessage') {
@@ -1561,7 +1565,7 @@ client.on('interactionCreate', async (interaction) => {
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
-          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: EPHEMERAL_FLAG });
+          return interaction.reply({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
         }
         const modal = new ModalBuilder()
           .setCustomId(`clips:commentModal:${sid}`)
@@ -1593,7 +1597,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
         }
 
         const [c, action, a, b] = interaction.customId.split(':'); // c:<action>:...
@@ -1631,14 +1635,14 @@ client.on('interactionCreate', async (interaction) => {
         const shortId = interaction.customId.split(':')[2];
         const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
         if (!payload) {
-          return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', flags: EPHEMERAL_FLAG });
+          return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
         }
 
         const { postPath, emoji } = payload;
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          return interaction.followUp({ content: 'Link your KC account with /link to react.', flags: EPHEMERAL_FLAG });
+          return interaction.followUp({ content: 'Link your KC account with /link to react.', ephemeral: true });
         }
 
         const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
@@ -1647,13 +1651,13 @@ client.on('interactionCreate', async (interaction) => {
 
         await rtdb.ref(`${postPath}/reactionCounts/${emoji}`).transaction(cur => (cur || 0) + (wasReacted ? -1 : 1));
 
-        try { await interaction.followUp({ content: '✅ Reaction updated.', flags: EPHEMERAL_FLAG }); } catch {}
+        try { await interaction.followUp({ content: '✅ Reaction updated.', ephemeral: true }); } catch {}
       }
       else if (interaction.customId.startsWith('clips:reactors:')) {
         const sid = interaction.customId.split(':')[2];
         const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
         if (!payload) {
-          return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', flags: EPHEMERAL_FLAG });
+          return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
         }
         const { postPath } = payload;
 
@@ -1676,7 +1680,7 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /clips' });
 
-        await interaction.followUp({ embeds:[embed], flags: EPHEMERAL_FLAG });
+        await interaction.followUp({ embeds:[embed], ephemeral: true });
       }
       else if (interaction.customId.startsWith('clips:back')) {
         const state = getClipsState(interaction);
@@ -1686,7 +1690,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', flags: EPHEMERAL_FLAG });
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
         }
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
@@ -1762,7 +1766,7 @@ client.on('interactionCreate', async (interaction) => {
         else if (action === 'like') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', flags: EPHEMERAL_FLAG });
+          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', ephemeral: true });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 6000, `RTDB ${path}/likedBy`);
           const wasLiked = likedSnap.exists();
@@ -1791,7 +1795,8 @@ client.on('interactionCreate', async (interaction) => {
     }
     // --- Modal Submissions ---
     else if (interaction.isModalSubmit()) {
-      await interaction.deferReply({ flags: EPHEMERAL_FLAG });
+      // CHANGE 3: Ack every modal submit
+      await interaction.deferReply({ ephemeral: true });
 
       if (interaction.customId.startsWith('clips:commentModal:')) {
         const sid = interaction.customId.split(':')[2];
@@ -1882,7 +1887,14 @@ client.on('interactionCreate', async (interaction) => {
 
 
 // ---------- Startup ----------
-client.once('ready', () => {
+// CHANGE 5: Use the single-instance bot lock
+client.once('ready', async () => {
+  const ok = await claimBotLock();
+  if (!ok) {
+    console.warn('Another instance holds the bot lock. Exiting.');
+    process.exit(0);
+  }
+  setInterval(() => renewBotLock().catch(()=>{}), 30_000);
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -1897,13 +1909,6 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
   } catch (e) {
     console.error('registerCommands FAILED:', e?.rawError || e);
   }
-
-  // Claim lock before logging in
-  if (!(await claimBotLock())) {
-    console.log(`Another instance holds the Discord lock. Serving health only. id=${instanceId}`);
-    return; // do NOT login this process
-  }
-  setInterval(() => renewBotLock().catch(()=>{}), 30_000);
 
   try {
     console.log('Logging into Discord…');
