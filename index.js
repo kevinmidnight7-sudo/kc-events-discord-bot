@@ -823,23 +823,30 @@ function buildClipCommentsEmbed(item, comments, page, nameMap) {
 }
 
 function commentsRows(sid, page, maxPage) {
-    const row = new ActionRowBuilder()
-        .addComponents(
+    const row = new ActionRowBuilder();
+    const prevTarget = Math.max(page - 1, 0);
+    const nextTarget = Math.min(page + 1, maxPage);
+
+    if (maxPage > 0) {
+        row.addComponents(
             new ButtonBuilder()
-                .setCustomId(`clips:comments:page:${sid}:${Math.max(page - 1, 0)}`)
+                .setCustomId(`clips:comments:prev:${sid}:${prevTarget}`)
                 .setLabel('◀ Page')
                 .setStyle(ButtonStyle.Secondary)
                 .setDisabled(page <= 0),
             new ButtonBuilder()
-                .setCustomId(`clips:comments:page:${sid}:${Math.min(page + 1, maxPage)}`)
+                .setCustomId(`clips:comments:next:${sid}:${nextTarget}`)
                 .setLabel('Page ▶')
                 .setStyle(ButtonStyle.Secondary)
                 .setDisabled(page >= maxPage),
-            new ButtonBuilder()
-                .setCustomId('clips:back')
-                .setLabel('Back to clip')
-                .setStyle(ButtonStyle.Secondary)
         );
+    }
+    row.addComponents(
+        new ButtonBuilder()
+            .setCustomId('clips:back')
+            .setLabel('Back to clip')
+            .setStyle(ButtonStyle.Secondary)
+    );
     return row;
 }
 
@@ -1630,9 +1637,10 @@ client.on('interactionCreate', async (interaction) => {
     } 
     // --- Button Handlers ---
     else if (interaction.isButton()) {
+      const id = interaction.customId;
       // For buttons opening modals, we must reply/showModal, not defer.
-      if (interaction.customId.startsWith('msg:reply')) {
-         const path = decPath(interaction.customId.split(':')[2]);
+      if (id.startsWith('msg:reply')) {
+         const path = decPath(id.split(':')[2]);
          const modal = new ModalBuilder()
            .setCustomId(`msg:replyModal:${encPath(path)}`)
            .setTitle('Reply to message');
@@ -1644,8 +1652,8 @@ client.on('interactionCreate', async (interaction) => {
          modal.addComponents(new ActionRowBuilder().addComponents(input));
          return interaction.showModal(modal);
       }
-      if (interaction.customId.startsWith('clips:comment:')) {
-        const sid = interaction.customId.split(':')[2];
+      if (id.startsWith('clips:comment:')) {
+        const sid = id.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
           return interaction.reply({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
@@ -1666,8 +1674,8 @@ client.on('interactionCreate', async (interaction) => {
       // All other buttons can be deferred immediately.
       await interaction.deferUpdate();
       
-      if (interaction.customId.startsWith('lb:')) {
-        const [, , catStr, pageStr] = interaction.customId.split(':');
+      if (id.startsWith('lb:')) {
+        const [, , catStr, pageStr] = id.split(':');
         const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
         const page   = Math.max(0, parseInt(pageStr,10) || 0);
         let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
@@ -1677,13 +1685,13 @@ client.on('interactionCreate', async (interaction) => {
         const embed = buildLbEmbed(rows, catIdx, page);
         await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
       }
-      else if (interaction.customId.startsWith('c:')) {
+      else if (id.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
           return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
         }
 
-        const [c, action, a, b] = interaction.customId.split(':'); // c:<action>:...
+        const [c, action, a, b] = id.split(':'); // c:<action>:...
         
         if (action === 'o') {
           // open detail view for idx = a
@@ -1714,8 +1722,8 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
       }
-      else if (interaction.customId.startsWith('clips:react:')) {
-        const shortId = interaction.customId.split(':')[2];
+      else if (id.startsWith('clips:react:')) {
+        const shortId = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
         if (!payload) {
           return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
@@ -1736,8 +1744,8 @@ client.on('interactionCreate', async (interaction) => {
 
         try { await interaction.followUp({ content: '✅ Reaction updated.', ephemeral: true }); } catch {}
       }
-      else if (interaction.customId.startsWith('clips:reactors:')) {
-        const sid = interaction.customId.split(':')[2];
+      else if (id.startsWith('clips:reactors:')) {
+        const sid = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
         if (!payload) {
           return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
@@ -1765,49 +1773,54 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.followUp({ embeds:[embed], ephemeral: true });
       }
-      else if (interaction.customId.startsWith('clips:comments:page:')) {
-          const parts = interaction.customId.split(':');
+      else if (id.startsWith('clips:comments:prev:') || id.startsWith('clips:comments:next:')) {
+          const parts = id.split(':'); // ['clips','comments','prev|next', sid, page]
           const sid = parts[3];
-          const newPage = Number(parts[4]) || 0;
-
-          const payload = _readFromCache(client.commentsCache, interaction.message ?? interaction, sid);
+          const page = parseInt(parts[4], 10) || 0;
+          const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              return interaction.followUp({ content: 'That view expired. Please reopen the comments.', ephemeral: true });
+              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
           }
-
-          const comments = payload.comments ?? await loadClipComments(payload.postPath);
-          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
-          payload.page = Math.max(0, Math.min(newPage, maxPage));
-
+          const { postPath } = payload;
+          // find the clip item from state (fallback to direct read if needed)
           const state = getClipsState(interaction);
-          const nameMap = state?.nameMap || await getAllUserNames();
-          const item = state.list.find(x => clipDbPath(x) === payload.postPath);
-
-          const embed = buildClipCommentsEmbed(item, comments, payload.page, nameMap);
-          const rows = commentsRows(sid, payload.page, maxPage);
-          await interaction.editReply({ embeds: [embed], components: [rows] });
-      }
-      else if (interaction.customId.startsWith('clips:comments:')) {
-          const parts = interaction.customId.split(':');
-          if (parts.length === 3) {
-              const sid = parts[2];
-              const payload = _readFromCache(client.commentsCache, interaction.message ?? interaction, sid);
-              if (!payload) {
-                  return interaction.followUp({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
-              }
-
-              const state = getClipsState(interaction);
-              const nameMap = state?.nameMap || await getAllUserNames();
-              const comments = await loadClipComments(payload.postPath);
-              payload.comments = comments; // Cache for pagination
-              
-              const item = state.list.find(x => clipDbPath(x) === payload.postPath);
-              const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
-              const embed = buildClipCommentsEmbed(item, comments, 0, nameMap);
-              const rows = commentsRows(sid, 0, maxPage);
-              
-              await interaction.editReply({ embeds: [embed], components: [rows] });
+          let item = state?.list?.find(x => clipDbPath(x) === postPath);
+          if (!item) {
+              const snap = await rtdb.ref(postPath).get();
+              item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
+              if (!item) return; // nothing to show
           }
+          const nameMap = state?.nameMap || await getAllUserNames();
+          const comments = await loadClipComments(postPath);
+          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
+          const p = Math.max(0, Math.min(page, maxPage));
+          const embed = buildClipCommentsEmbed(item, comments, p, nameMap);
+          const rows = [commentsRows(sid, p, maxPage)];
+          await interaction.editReply({ content: '', embeds: [embed], components: rows });
+          return;
+      }
+      else if (id.startsWith('clips:comments:')) {
+          const sid = id.split(':')[2];
+          const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
+          if (!payload) {
+              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
+          }
+          const { postPath } = payload;
+          const state = getClipsState(interaction);
+          let item = state?.list?.find(x => clipDbPath(x) === postPath);
+          if (!item) {
+              const snap = await rtdb.ref(postPath).get();
+              item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
+              if (!item) return;
+          }
+          const nameMap = state?.nameMap || await getAllUserNames();
+          const comments = await loadClipComments(postPath);
+          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
+          const page = 0;
+          const embed = buildClipCommentsEmbed(item, comments, page, nameMap);
+          const rows = [commentsRows(sid, page, maxPage)];
+          await interaction.editReply({ content: '', embeds: [embed], components: rows });
+          return;
       }
       else if (interaction.customId.startsWith('clips:back')) {
         const state = getClipsState(interaction);
