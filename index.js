@@ -1403,10 +1403,15 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
+      if (!['link','vote'].includes(commandName)) {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        }
+      }
+
       // Commands that reply right away with a link/modal:
       if (commandName === 'link') {
-        const url = `${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`;
-        return interaction.reply({ content: `Click to link your account: ${url}`, ephemeral: true });
+        return interaction.reply({ content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true });
       }
       if (commandName === 'vote') {
         // Modal must be shown within 3s; do NOT defer before showModal.
