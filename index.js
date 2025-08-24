@@ -45,6 +45,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  PermissionsBitField,
+  ChannelType,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -82,11 +84,12 @@ const DEFAULT_EMBED_COLOR = 0xF1C40F;
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
   userNames: { data: {}, fetchedAt: 0 },
+  clipDestinations: {},
 };
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link']).has(name);
+  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -733,13 +736,15 @@ function buildClipDetailEmbed(item, nameMap={}) {
   return e;
 }
 
-function clipsDetailRows(interaction, postPath) {
+function clipsDetailRows(interactionOrMessage, postPath) {
   const rows = [];
   const row1 = new ActionRowBuilder();
+  const client = interactionOrMessage.client;
+
   for (const emo of POST_EMOJIS) {
     const sid = _cacheForMessage(
-      interaction.client.reactCache,
-      interaction.message ?? interaction,
+      client.reactCache,
+      interactionOrMessage,
       { postPath, emoji: emo }
     );
     row1.addComponents(
@@ -752,12 +757,12 @@ function clipsDetailRows(interaction, postPath) {
   if (row1.components.length) rows.push(row1);
 
   const sidView = _cacheForMessage(
-    interaction.client.reactorsCache,
-    interaction.message ?? interaction,
+    client.reactorsCache,
+    interactionOrMessage,
     { postPath }
   );
   
-  const sidComments = _cacheForMessage(interaction.client.commentsCache, interaction.message ?? interaction, { postPath, page: 0 });
+  const sidComments = _cacheForMessage(client.commentsCache, interactionOrMessage, { postPath, page: 0 });
 
   const commentSid = cacheModalTarget({ postPath });
   const row2 = new ActionRowBuilder().addComponents(
@@ -1329,10 +1334,24 @@ const compareCmd = new SlashCommandBuilder()
      .setRequired(true)
   );
 
+const setClipsChannelCmd = new SlashCommandBuilder()
+    .setName('setclipschannel')
+    .setDescription('Choose a channel where new KC clips will be auto-posted')
+    .addChannelOption(o => 
+        o.setName('channel')
+         .setDescription('The channel to post clips in')
+         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+         .setRequired(true))
+    .addBooleanOption(o =>
+        o.setName('disable')
+         .setDescription('Set to true to clear the current setting')
+         .setRequired(false))
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild);
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
-  avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd
+  avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd
 ].map(c => c.toJSON());
 
 
@@ -1633,6 +1652,35 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /compare' });
         await interaction.editReply({ content: '', embeds:[embed] });
+      }
+       else if (commandName === 'setclipschannel') {
+        const disable = interaction.options.getBoolean('disable') || false;
+        if (disable) {
+            await rtdb.ref(`config/clipChannels/${interaction.guildId}`).remove();
+            return interaction.editReply({ content: '✅ Auto-posting disabled for this server.' });
+        }
+
+        const channel = interaction.options.getChannel('channel');
+        const requiredPerms = [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.EmbedLinks,
+            PermissionsBitField.Flags.ReadMessageHistory,
+            PermissionsBitField.Flags.AddReactions,
+            PermissionsBitField.Flags.UseExternalEmojis,
+        ];
+        const perms = channel.permissionsFor(client.user);
+        if (!perms || !perms.has(requiredPerms)) {
+            return interaction.editReply({ content: `❌ I'm missing some permissions in <#${channel.id}>. I need: View, Send Messages, Embed Links, Read History, Add Reactions, Use External Emojis.` });
+        }
+
+        await rtdb.ref(`config/clipChannels/${interaction.guildId}`).set({
+            channelId: channel.id,
+            setBy: interaction.user.id,
+            setAt: Date.now(),
+        });
+
+        await interaction.editReply({ content: `✅ I’ll post new clips in <#${channel.id}>.` });
       }
     } 
     // --- Button Handlers ---
@@ -2039,10 +2087,102 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+async function maybeBroadcast(uid, postId, data) {
+    if (!data || data.draft === true) return;
+    if (data.publishAt && Date.now() < data.publishAt) return;
+    if (!['youtube', 'tiktok'].includes(data.type)) return;
+
+    const maxAge = parseInt(process.env.CLIP_BROADCAST_MAX_AGE_MS || '15601000', 10);
+    if (data.createdAt && (Date.now() - data.createdAt > maxAge)) return;
+
+    for (const guildId of Object.keys(globalCache.clipDestinations)) {
+        const dest = globalCache.clipDestinations[guildId];
+        if (!dest || !dest.channelId) continue;
+
+        const flagRef = rtdb.ref(`users/${uid}/posts/${postId}/postedToDiscord/${guildId}`);
+        try {
+            const tx = await flagRef.transaction(cur => {
+                if (cur) return; // Abort if already posted or pending
+                return { pending: true, by: client.user.id, at: Date.now() };
+            });
+
+            if (!tx.committed) {
+                console.log(`[broadcast] clip ${postId} already posted to guild ${guildId}`);
+                continue;
+            }
+
+            const item = { ownerUid: uid, postId, data };
+            const userSnap = await rtdb.ref(`users/${uid}`).get();
+            const nameMap = { [uid]: userSnap.val()?.displayName || userSnap.val()?.email || '(unknown)' };
+            
+            const embed = buildClipDetailEmbed(item, nameMap);
+            
+            const channel = await client.channels.fetch(dest.channelId);
+            if (!channel) {
+                await flagRef.remove();
+                continue;
+            }
+
+            const msg = await channel.send({ embeds: [embed] });
+            const postPath = `users/${uid}/posts/${postId}`;
+            const rows = clipsDetailRows(msg, postPath);
+            await msg.edit({ components: rows });
+
+            await flagRef.set({
+                messageId: msg.id,
+                channelId: channel.id,
+                by: client.user.id,
+                at: admin.database.ServerValue.TIMESTAMP,
+            });
+            console.log(`[broadcast] successfully posted clip ${postId} to ${guildId}/${channel.id}`);
+
+        } catch (e) {
+            console.error(`[broadcast] failed to post clip ${postId} to guild ${guildId}:`, e);
+            await flagRef.remove(); // Rollback
+        }
+    }
+}
+
+
+const listenedUids = new Set();
+function attachPostsListener(uid) {
+    if (!uid || listenedUids.has(uid)) return;
+    listenedUids.add(uid);
+    const ref = rtdb.ref(`users/${uid}/posts`);
+    ref.on('child_added', s => {
+        maybeBroadcast(uid, s.key, s.val()).catch(e => console.error(`[broadcast] unhandled error in maybeBroadcast for ${uid}/${s.key}`, e));
+    });
+    console.log(`[broadcast] attached listener for user ${uid}`);
+}
 
 // ---------- Startup ----------
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  
+  // Load clip channel destinations
+  const snap = await rtdb.ref('config/clipChannels').get();
+  globalCache.clipDestinations = snap.exists() ? snap.val() : {};
+  console.log('[broadcast] loaded initial clip destinations:', Object.keys(globalCache.clipDestinations).length);
+
+  rtdb.ref('config/clipChannels').on('child_added', s => {
+      globalCache.clipDestinations[s.key] = s.val();
+      console.log(`[broadcast] added channel for guild ${s.key}`);
+  });
+  rtdb.ref('config/clipChannels').on('child_changed', s => {
+      globalCache.clipDestinations[s.key] = s.val();
+      console.log(`[broadcast] updated channel for guild ${s.key}`);
+  });
+  rtdb.ref('config/clipChannels').on('child_removed', s => {
+      delete globalCache.clipDestinations[s.key];
+      console.log(`[broadcast] removed channel for guild ${s.key}`);
+  });
+
+  // Attach listeners for all existing and new users
+  const usersSnap = await rtdb.ref('users').get();
+  if (usersSnap.exists()) {
+      Object.keys(usersSnap.val()).forEach(attachPostsListener);
+  }
+  rtdb.ref('users').on('child_added', s => attachPostsListener(s.key));
 });
 
 process.on('unhandledRejection', e => console.error('unhandledRejection', e));
