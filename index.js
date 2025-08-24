@@ -360,7 +360,7 @@ async function postsDisabledGlobally() {
 function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
 
 function countReactions(reactionsObj = {}) {
-  // reactions: { "�": { uid:true, ... }, "🔥": { uid:true }, ... }
+  // reactions: { "😀": { uid:true, ... }, "🔥": { uid:true }, ... }
   let n = 0;
   for (const emo of Object.keys(reactionsObj || {})) {
     n += Object.keys(reactionsObj[emo] || {}).length;
@@ -1337,10 +1337,10 @@ const compareCmd = new SlashCommandBuilder()
 
 const setClipsChannelCmd = new SlashCommandBuilder()
     .setName('setclipschannel')
-    .setDescription('Pick the server text channel where new clips will be posted')
+    .setDescription('Select the channel where new clips will be posted')
     .addChannelOption(o =>
         o.setName('channel')
-         .setDescription('Channel for clip posts')
+         .setDescription('Text channel')
          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
          .setRequired(true)
     );
@@ -1412,13 +1412,6 @@ client.on('interactionCreate', async (interaction) => {
         // Modal must be shown within 3s; do NOT defer before showModal.
         await showVoteModal(interaction);
         return; // don't fall through
-      }
-
-      // Everyone else: ACK now, work later
-      const ok = await ack(interaction, { ephemeral: isEphemeralCommand(commandName) });
-      if (!ok) {
-        console.warn(`[ack] gave up on ${commandName}`);
-        return;
       }
       
       // --- Command Logic (post-ACK) ---
@@ -1658,41 +1651,48 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '', embeds:[embed] });
       }
        else if (commandName === 'setclipschannel') {
-        // Must be in a guild
-        if (!interaction.inGuild()) {
-          return interaction.reply({ content: 'Run this inside a server (not in DMs).', flags: 64 });
-        }
-        // Robust Manage Channels check
-        const canManage =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
-          new PermissionsBitField(interaction.member?.permissions).has(PermissionFlagsBits.ManageChannels);
-        if (!canManage) {
-          return interaction.reply({ content: 'You need **Manage Channels** to set the clips channel.', flags: 64 });
-        }
+        try {
+            await interaction.deferReply({ flags: 64 });
+            // Must be in a guild
+            if (!interaction.inGuild()) {
+              return interaction.editReply('Run this inside a server (not DMs).');
+            }
+            // Robust Manage Channels check
+            const canManage =
+              interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
+              new PermissionsBitField(interaction.member?.permissions).has(PermissionFlagsBits.ManageChannels);
+            if (!canManage) {
+              return interaction.editReply('You need **Manage Channels** to set the clips channel.');
+            }
 
-        const picked = interaction.options.getChannel('channel', true);
-        const channel = await interaction.client.channels.fetch(picked.id).catch(() => null);
-        // Only allow real guild text/announcement channels (not threads/voice/categories/DMs)
-        const isValidType = channel &&
-          (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement);
-        if (!isValidType || typeof channel.permissionsFor !== 'function') {
-          return interaction.reply({ content: 'Pick a text channel in this server (not threads/voice/categories/DMs).', flags: 64 });
-        }
-        // Confirm the bot can post there
-        const botCanPost = channel.permissionsFor(interaction.client.user)?.has([
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.EmbedLinks,
-        ]);
-        if (!botCanPost) {
-          return interaction.reply({
-            content: 'I can’t post in that channel. Give me **View Channel**, **Send Messages**, and **Embed Links**.',
-            flags: 64
-          });
-        }
+            const picked = interaction.options.getChannel('channel', true);
+            const channel = await interaction.client.channels.fetch(picked.id).catch(() => null);
+            // Only allow real guild text/announcement channels (not threads/voice/categories/DMs)
+            const isValidType = channel &&
+              (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement);
+            if (!isValidType || typeof channel.permissionsFor !== 'function') {
+              return interaction.editReply('Pick a text channel in this server (not threads/voice/categories/DMs).');
+            }
+            // Confirm the bot can post there
+            const botCanPost = channel.permissionsFor(interaction.client.user)?.has([
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.EmbedLinks,
+            ]);
+            if (!botCanPost) {
+              return interaction.editReply('I can’t post in that channel. Grant **View Channel**, **Send Messages**, and **Embed Links**.');
+            }
 
-        await rtdb.ref(`guilds/${interaction.guildId}/clipChannel`).set(channel.id);
-        await interaction.reply({ content: `✅ New clips will be posted in <#${channel.id}>.`, flags: 64 });
+            await rtdb.ref(`guilds/${interaction.guildId}/clipChannel`).set(channel.id);
+            await interaction.editReply({ content: `✅ New clips will be posted in <#${channel.id}>.` });
+        } catch (e) {
+            console.error('setclipschannel error:', e);
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply('Sorry — something went wrong.');
+            } else {
+                await interaction.reply({ content: 'Sorry — something went wrong.', flags: 64 });
+            }
+        }
       }
     } 
     // --- Button Handlers ---
