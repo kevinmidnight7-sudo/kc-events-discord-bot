@@ -545,7 +545,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.name ||
     '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
-  const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
+  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
@@ -1337,12 +1337,14 @@ const compareCmd = new SlashCommandBuilder()
 
 const setClipsChannelCmd = new SlashCommandBuilder()
     .setName('setclipschannel')
-    .setDescription('Choose a channel where new KC clips will be auto-posted')
-    .addChannelOption(o => 
+    .setDescription('Choose where new clips are auto-posted')
+    .setDMPermission(false)
+    .addChannelOption(o =>
         o.setName('channel')
-         .setDescription('Where new clips will be auto-posted')
+         .setDescription('Text or announcement channel only')
          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-         .setRequired(true))
+         .setRequired(true)
+    )
     .addBooleanOption(o =>
         o.setName('disable')
          .setDescription('Set to true to clear the current setting')
@@ -1655,40 +1657,44 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '', embeds:[embed] });
       }
        else if (commandName === 'setclipschannel') {
-        const disable = interaction.options.getBoolean('disable') || false;
-        if (disable) {
-            await rtdb.ref(`config/clipChannels/${interaction.guildId}`).remove();
-            return interaction.editReply({ content: '✅ Auto-posting disabled for this server.' });
+        try { await interaction.deferReply({ flags: 64 }); } catch {}
+
+        const picked = interaction.options.getChannel('channel', true);
+        const channelId = picked.id;
+        const guild = interaction.guild;
+
+        // Re-fetch to guarantee a full Channel instance
+        const ch = await guild.channels.fetch(channelId).catch(() => null);
+        if (!ch) return interaction.editReply('I couldn’t access that channel. Check my permissions and try again.');
+
+        // Block threads/forums/voice/categories explicitly
+        if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(ch.type)) {
+          return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/forums).');
         }
 
-        const target = interaction.options.getChannel('channel', true);
-        if (!target || target.guildId !== interaction.guildId || typeof target.permissionsFor !== 'function' || !target.isTextBased()) {
-          return interaction.editReply({ content: 'Pick a text channel in this server (not threads/voice/categories/DMs).' });
-        }
-
-        const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe();
-        const needed = [
+        // Bot perms in that channel
+        const me = guild.members.me ?? await guild.members.fetchMe();
+        const needed = new PermissionsBitField([
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.EmbedLinks,
           PermissionFlagsBits.ReadMessageHistory,
           PermissionFlagsBits.AddReactions,
-          PermissionFlagsBits.UseExternalEmojis
-        ];
-        const perms = target.permissionsFor(me);
-        if (!perms || !perms.has(needed, true)) {
-          return interaction.editReply({
-            content: 'I’m missing required permissions in that channel: ViewChannel, SendMessages, EmbedLinks, ReadMessageHistory, AddReactions, UseExternalEmojis.'
-          });
+          PermissionFlagsBits.UseExternalEmojis,
+        ]);
+        const perms = ch.permissionsFor(me);
+        if (!perms?.has(needed, true)) {
+          return interaction.editReply('I’m missing: ViewChannel, SendMessages, EmbedLinks, ReadMessageHistory, AddReactions, UseExternalEmojis in that channel.');
         }
 
-        await rtdb.ref(`config/clipChannels/${interaction.guildId}`).set({
-            channelId: target.id,
-            setBy: interaction.user.id,
-            setAt: Date.now(),
+        // Save mapping
+        await rtdb.ref(`config/clipChannels/${guild.id}`).set({
+          channelId: ch.id,
+          setBy: interaction.user.id,
+          setAt: Date.now(),
         });
 
-        await interaction.editReply({ content: `✅ I’ll post new clips in #${target.name}.` });
+        return interaction.editReply(`✅ I’ll post new clips in #${ch.name}.`);
       }
     } 
     // --- Button Handlers ---
