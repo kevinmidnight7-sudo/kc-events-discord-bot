@@ -757,11 +757,17 @@ function clipsDetailRows(interaction, postPath) {
     { postPath }
   );
   
+  const sidComments = _cacheForMessage(interaction.client.commentsCache, interaction.message ?? interaction, { postPath, page: 0 });
+
   const commentSid = cacheModalTarget({ postPath });
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`clips:reactors:${sidView}`)
       .setLabel('👀 View reactors')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`clips:comments:${sidComments}`)
+      .setLabel('💬 View comments')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`clips:comment:${commentSid}`)
@@ -775,6 +781,66 @@ function clipsDetailRows(interaction, postPath) {
   rows.push(row2);
 
   return rows;
+}
+
+async function loadClipComments(postPath) {
+    const snap = await rtdb.ref(`${postPath}/comments`).get();
+    if (!snap.exists()) return [];
+    const comments = [];
+    snap.forEach(child => {
+        const data = child.val();
+        comments.push({
+            key: child.key,
+            uid: data.uid,
+            user: data.user, // Will be replaced by nameMap lookup later
+            text: data.text,
+            time: data.time,
+            repliesCount: data.replies ? Object.keys(data.replies).length : 0,
+        });
+    });
+    return comments.sort((a, b) => b.time - a.time);
+}
+
+function buildClipCommentsEmbed(item, comments, page, nameMap) {
+    const pageSize = 10;
+    const start = page * pageSize;
+    const pageComments = comments.slice(start, start + pageSize);
+
+    const description = pageComments.length > 0
+        ? pageComments.map((c, i) => {
+            const displayName = nameMap[c.uid] || c.user || '(unknown)';
+            const truncatedText = c.text.length > 120 ? `${c.text.substring(0, 117)}...` : c.text;
+            const time = new Date(c.time).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }) + ', ' + new Date(c.time).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+            return `${start + i + 1}) **${displayName}** — ${truncatedText}  *(${time})*`;
+        }).join('\n')
+        : "No comments yet.";
+
+    return new EmbedBuilder()
+        .setTitle(`Comments — "${item.data.caption}"`)
+        .setDescription(description)
+        .setColor(DEFAULT_EMBED_COLOR)
+        .setFooter({ text: 'KC Bot • /clips' });
+}
+
+function commentsRows(sid, page, maxPage) {
+    const row = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId(`clips:comments:page:${sid}:${Math.max(page - 1, 0)}`)
+                .setLabel('◀ Page')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(page <= 0),
+            new ButtonBuilder()
+                .setCustomId(`clips:comments:page:${sid}:${Math.min(page + 1, maxPage)}`)
+                .setLabel('Page ▶')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(page >= maxPage),
+            new ButtonBuilder()
+                .setCustomId('clips:back')
+                .setLabel('Back to clip')
+                .setStyle(ButtonStyle.Secondary)
+        );
+    return row;
 }
 
 
@@ -1125,6 +1191,7 @@ const client = new Client({
 // --- Short-id caches for /clips actions ---// Map key = "<messageId>|<shortId>"
 client.reactCache = new Map();
 client.reactorsCache = new Map();
+client.commentsCache = new Map();
 client.modalCache = new Map();
 
 function _makeShortId(len = 8) {
@@ -1510,14 +1577,19 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '✅ Message posted!' });
       }
       else if (commandName === 'help') {
-        await interaction.editReply({
-          content: [
-            'KC Events Bot v1',
-            'Full Messageboard : https://kcevents.uk/#chatscroll',
-            'Full Clips       : https://kcevents.uk/#socialfeed',
-            'Full Voting      : https://kcevents.uk/#voting',
-          ].join('\n'),
-        });
+        const embed = new EmbedBuilder()
+            .setTitle('KC Events — Help')
+            .setImage('https://kevinmidnight7-sudo.github.io/messageboardkc/link.png')
+            .setColor(DEFAULT_EMBED_COLOR)
+            .addFields({
+                name: 'Links',
+                value: [
+                    'Full Messageboard : https://kcevents.uk/#chatscroll',
+                    'Full Clips       : https://kcevents.uk/#socialfeed',
+                    'Full Voting      : https://kcevents.uk/#voting',
+                ].join('\n')
+            });
+        await interaction.editReply({ content: '', embeds: [embed] });
       }
       else if (commandName === 'compare') {
         const youDiscordId = interaction.user.id;
@@ -1572,7 +1644,7 @@ client.on('interactionCreate', async (interaction) => {
          modal.addComponents(new ActionRowBuilder().addComponents(input));
          return interaction.showModal(modal);
       }
-      if (interaction.customId.startsWith('clips:comment')) {
+      if (interaction.customId.startsWith('clips:comment:')) {
         const sid = interaction.customId.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
@@ -1693,8 +1765,67 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.followUp({ embeds:[embed], ephemeral: true });
       }
+      else if (interaction.customId.startsWith('clips:comments:page:')) {
+          const parts = interaction.customId.split(':');
+          const sid = parts[3];
+          const newPage = Number(parts[4]) || 0;
+
+          const payload = _readFromCache(client.commentsCache, interaction.message ?? interaction, sid);
+          if (!payload) {
+              return interaction.followUp({ content: 'That view expired. Please reopen the comments.', ephemeral: true });
+          }
+
+          const comments = payload.comments ?? await loadClipComments(payload.postPath);
+          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
+          payload.page = Math.max(0, Math.min(newPage, maxPage));
+
+          const state = getClipsState(interaction);
+          const nameMap = state?.nameMap || await getAllUserNames();
+          const item = state.list.find(x => clipDbPath(x) === payload.postPath);
+
+          const embed = buildClipCommentsEmbed(item, comments, payload.page, nameMap);
+          const rows = commentsRows(sid, payload.page, maxPage);
+          await interaction.editReply({ embeds: [embed], components: [rows] });
+      }
+      else if (interaction.customId.startsWith('clips:comments:')) {
+          const parts = interaction.customId.split(':');
+          if (parts.length === 3) {
+              const sid = parts[2];
+              const payload = _readFromCache(client.commentsCache, interaction.message ?? interaction, sid);
+              if (!payload) {
+                  return interaction.followUp({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
+              }
+
+              const state = getClipsState(interaction);
+              const nameMap = state?.nameMap || await getAllUserNames();
+              const comments = await loadClipComments(payload.postPath);
+              payload.comments = comments; // Cache for pagination
+              
+              const item = state.list.find(x => clipDbPath(x) === payload.postPath);
+              const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
+              const embed = buildClipCommentsEmbed(item, comments, 0, nameMap);
+              const rows = commentsRows(sid, 0, maxPage);
+              
+              await interaction.editReply({ embeds: [embed], components: [rows] });
+          }
+      }
       else if (interaction.customId.startsWith('clips:back')) {
         const state = getClipsState(interaction);
+        // This button can be clicked from either the comments page or the detail page.
+        // We need to determine where to go back to.
+        // A simple way is to check the current embed title.
+        const currentEmbed = interaction.message.embeds[0];
+        if (currentEmbed && currentEmbed.title.startsWith('Comments —')) {
+            // We are on the comments page, go back to the clip detail view.
+            const item = state.list.find(x => clipDbPath(x) === state.currentPostPath);
+            if(item) {
+                const embed = buildClipDetailEmbed(item, state.nameMap);
+                const rows = clipsDetailRows(interaction, clipDbPath(item));
+                return interaction.editReply({ embeds: [embed], components: rows });
+            }
+        }
+        
+        // Default back to list
         const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
         return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
       }
@@ -1936,74 +2067,3 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     process.exit(1);
   });
 })();
-" in the canvas. I want you to replace the selected code with this: "
-// ===== Bot lock =====
-const LOCK_KEY = '_runtime/botLock';
-const LOCK_TTL_MS = 90_000; // 90s
-const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
-
-async function claimBotLock() {
-  const now = Date.now();
-  // IMPORTANT: correct transaction signature (no options object)
-  const result = await rtdb.ref(LOCK_KEY).transaction(cur => {
-    if (!cur) {
-      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
-    }
-    if (cur.expiresAt && cur.expiresAt < now) {
-      // stale -> take over
-      return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
-    }
-    // someone else owns it
-    return; // abort
-  }, undefined /* onComplete */, false /* applyLocally */);
-
-  // result has .committed (compat) or .committed-like semantics; if using admin,
-  // just treat "snapshot.val()?.owner === OWNER_ID" as success:
-  const snap = await rtdb.ref(LOCK_KEY).get();
-  const val = snap.val() || {};
-  return val.owner === OWNER_ID;
-}
-
-async function renewBotLock() {
-  const now = Date.now();
-  await rtdb.ref(LOCK_KEY).transaction(cur => {
-    if (!cur) return;               // nothing to renew
-    if (cur.owner !== OWNER_ID) return; // not ours anymore
-    cur.expiresAt = now + LOCK_TTL_MS;
-    return cur;
-  }, undefined, false);
-}
-
-async function startWhenLocked() {
-  // standby retry loop (keep web server alive)
-  for (;;) {
-    try {
-      const got = await claimBotLock();
-      if (got) break;
-      console.log('Standby — lock held by another instance. Retrying in 20s…');
-    } catch (e) {
-      console.warn('Lock claim error:', e.message);
-    }
-    await new Promise(r => setTimeout(r, 20_000));
-  }
-
-  console.log('Lock acquired — registering commands & logging into Discord…');
-
-  // (optional) Only the lock-holder should register commands
-  try {
-    await registerCommands();
-    console.log('Slash command registration complete.');
-  } catch (e) {
-    console.error('registerCommands FAILED:', e?.rawError || e);
-  }
-
-  // Only the lock-holder logs in
-  await client.login(process.env.DISCORD_BOT_TOKEN);
-
-  // keep lock alive
-  setInterval(() => renewBotLock().catch(() => {}), 30_000).unref();
-}
-
-// Replace your old IIFE that logged in immediately with only this:
-startWhenLocked().catch(e => {
-  console.error('Failed to start bot:', e);
