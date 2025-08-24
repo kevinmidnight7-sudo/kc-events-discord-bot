@@ -360,7 +360,7 @@ async function postsDisabledGlobally() {
 function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
 
 function countReactions(reactionsObj = {}) {
-  // reactions: { "😀": { uid:true, ... }, "🔥": { uid:true }, ... }
+  // reactions: { "�": { uid:true, ... }, "🔥": { uid:true }, ... }
   let n = 0;
   for (const emo of Object.keys(reactionsObj || {})) {
     n += Object.keys(reactionsObj[emo] || {}).length;
@@ -1658,52 +1658,41 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '', embeds:[embed] });
       }
        else if (commandName === 'setclipschannel') {
-        // Always acknowledge fast, ephemeral
-        try { await interaction.deferReply({ flags: 64 }); } catch {}
-
-        // Must be in a guild and invoker needs Manage Channels
+        // Must be in a guild
         if (!interaction.inGuild()) {
-          return interaction.editReply('Run this inside a server (not in DMs).');
+          return interaction.reply({ content: 'Run this inside a server (not in DMs).', flags: 64 });
         }
-        const member = interaction.member;
-        if (!member?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
-          return interaction.editReply('You need **Manage Channels** to set the clips channel.');
+        // Robust Manage Channels check
+        const canManage =
+          interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
+          new PermissionsBitField(interaction.member?.permissions).has(PermissionFlagsBits.ManageChannels);
+        if (!canManage) {
+          return interaction.reply({ content: 'You need **Manage Channels** to set the clips channel.', flags: 64 });
         }
 
-        // Get the picked channel, then refetch a full Channel instance via the *client* (not guild)
         const picked = interaction.options.getChannel('channel', true);
         const channel = await interaction.client.channels.fetch(picked.id).catch(() => null);
-        if (!channel) {
-          return interaction.editReply('I couldn’t access that channel. Check my permissions and try again.');
+        // Only allow real guild text/announcement channels (not threads/voice/categories/DMs)
+        const isValidType = channel &&
+          (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement);
+        if (!isValidType || typeof channel.permissionsFor !== 'function') {
+          return interaction.reply({ content: 'Pick a text channel in this server (not threads/voice/categories/DMs).', flags: 64 });
+        }
+        // Confirm the bot can post there
+        const botCanPost = channel.permissionsFor(interaction.client.user)?.has([
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+        ]);
+        if (!botCanPost) {
+          return interaction.reply({
+            content: 'I can’t post in that channel. Give me **View Channel**, **Send Messages**, and **Embed Links**.',
+            flags: 64
+          });
         }
 
-        // Only allow normal text/announcement channels (threads/voice/categories/forums are blocked)
-        if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) {
-          return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/forums).');
-        }
-
-        // Verify the bot’s permissions IN THAT CHANNEL using permissionsIn (more reliable than channel.permissionsFor on partials)
-        const me = interaction.guild?.members?.me || await interaction.guild.members.fetch(interaction.client.user.id).catch(() => null);
-        const have = me?.permissionsIn(channel);
-        if (!have || !have.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
-          return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
-        }
-
-        // Store destination: config/clipDestinations/<guildId> = { channelId, updatedBy, updatedAt }
-        const payload = {
-          channelId: channel.id,
-          updatedBy: interaction.user.id,
-          updatedAt: Date.now(),
-        };
-        try {
-          await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set(payload);
-        } catch (e) {
-          console.error('setclipschannel write failed:', e);
-          return interaction.editReply('Database write failed — try again.');
-        }
-
-        // Success
-        return interaction.editReply(`✅ New clips will be posted in <#${channel.id}>.`);
+        await rtdb.ref(`guilds/${interaction.guildId}/clipChannel`).set(channel.id);
+        await interaction.reply({ content: `✅ New clips will be posted in <#${channel.id}>.`, flags: 64 });
       }
     } 
     // --- Button Handlers ---
