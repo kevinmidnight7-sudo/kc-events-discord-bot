@@ -1657,44 +1657,54 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '', embeds:[embed] });
       }
        else if (commandName === 'setclipschannel') {
-        try { await interaction.deferReply({ flags: 64 }); } catch {}
+        try { await interaction.deferReply({ ephemeral: true }); } catch {}
 
         const picked = interaction.options.getChannel('channel', true);
-        const channelId = picked.id;
+        const disable = !!interaction.options.getBoolean('disable');
         const guild = interaction.guild;
 
-        // Re-fetch to guarantee a full Channel instance
-        const ch = await guild.channels.fetch(channelId).catch(() => null);
+        // Ensure we have a full GuildChannel object
+        const ch = await guild.channels.fetch(picked.id).catch(() => null);
         if (!ch) return interaction.editReply('I couldn’t access that channel. Check my permissions and try again.');
 
-        // Block threads/forums/voice/categories explicitly
+        // Only allow normal text/announcement channels
         if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(ch.type)) {
           return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/forums).');
         }
 
-        // Bot perms in that channel
+        // Bot permissions required in that channel
         const me = guild.members.me ?? await guild.members.fetchMe();
-        const needed = new PermissionsBitField([
+        const missing = ch.permissionsFor(me).missing([
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.EmbedLinks,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.AddReactions,
-          PermissionFlagsBits.UseExternalEmojis,
+          PermissionFlagsBits.EmbedLinks
         ]);
-        const perms = ch.permissionsFor(me);
-        if (!perms?.has(needed, true)) {
-          return interaction.editReply('I’m missing: ViewChannel, SendMessages, EmbedLinks, ReadMessageHistory, AddReactions, UseExternalEmojis in that channel.');
+        if (missing.length) {
+          return interaction.editReply(`I’m missing these permissions in <#${ch.id}>: ${missing.join(', ')}`);
         }
 
-        // Save mapping
-        await rtdb.ref(`config/clipChannels/${guild.id}`).set({
-          channelId: ch.id,
-          setBy: interaction.user.id,
-          setAt: Date.now(),
-        });
+        const ref = rtdb.ref(`config/clipDestinations/${guild.id}`);
 
-        return interaction.editReply(`✅ I’ll post new clips in #${ch.name}.`);
+        try {
+          if (disable) {
+            await ref.remove();
+            return interaction.editReply('✅ Clips auto-post destination cleared for this server.');
+          } else {
+            await ref.set({
+              channelId: ch.id,
+              updatedBy: interaction.user.id,
+              updatedAt: Date.now()
+            });
+            return interaction.editReply(`✅ Saved. New clips will be posted in <#${ch.id}>.`);
+          }
+        } catch (e) {
+          const code = e?.errorInfo?.code || e?.code || '';
+          if (String(code).includes('permission') || String(e?.message).toLowerCase().includes('permission_denied')) {
+            return interaction.editReply('❌ Database rules blocked this write. Make sure RTDB allows admins to write to config/clipDestinations.');
+          }
+          console.error('setclipschannel write failed:', e);
+          return interaction.editReply('Sorry, something went wrong.');
+        }
       }
     } 
     // --- Button Handlers ---
