@@ -1337,19 +1337,13 @@ const compareCmd = new SlashCommandBuilder()
 
 const setClipsChannelCmd = new SlashCommandBuilder()
     .setName('setclipschannel')
-    .setDescription('Choose where new clips are auto-posted')
-    .setDMPermission(false)
+    .setDescription('Pick the server text channel where new clips will be posted')
     .addChannelOption(o =>
         o.setName('channel')
-         .setDescription('Text or announcement channel only')
+         .setDescription('Channel for clip posts')
          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
          .setRequired(true)
-    )
-    .addBooleanOption(o =>
-        o.setName('disable')
-         .setDescription('Set to true to clear the current setting')
-         .setRequired(false))
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild);
+    );
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -1657,54 +1651,64 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply({ content: '', embeds:[embed] });
       }
        else if (commandName === 'setclipschannel') {
-        try { await interaction.deferReply({ ephemeral: true }); } catch {}
-
-        const picked = interaction.options.getChannel('channel', true);
-        const disable = !!interaction.options.getBoolean('disable');
-        const guild = interaction.guild;
-
-        // Ensure we have a full GuildChannel object
-        const ch = await guild.channels.fetch(picked.id).catch(() => null);
-        if (!ch) return interaction.editReply('I couldn’t access that channel. Check my permissions and try again.');
-
-        // Only allow normal text/announcement channels
-        if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(ch.type)) {
-          return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/forums).');
+        // must be run in a server
+        if (!interaction.inGuild()) {
+          return interaction.reply({ content: 'Run this inside a server (not in DMs).', flags: 64 });
         }
 
-        // Bot permissions required in that channel
-        const me = guild.members.me ?? await guild.members.fetchMe();
-        const missing = ch.permissionsFor(me).missing([
+        // only allow people who can manage channels (adjust if you want a different gate)
+        const invoker = interaction.member;
+        if (!invoker?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+          return interaction.reply({ content: 'You need **Manage Channels** to set the clips channel.', flags: 64 });
+        }
+
+        // channel chosen in the option
+        const chan = interaction.options.getChannel('channel', true);
+
+        // sanity: only normal text/announcement channels, no threads/voice/categories
+        const isOkType =
+          chan.type === ChannelType.GuildText ||
+          chan.type === ChannelType.GuildAnnouncement;
+
+        if (!isOkType) {
+          return interaction.reply({ content: 'Pick a text or announcement channel (not threads/voice/categories).', flags: 64 });
+        }
+
+        // check the bot has enough perms in that channel
+        const meId = interaction.client.user.id;
+        const perms = chan.permissionsFor(meId);
+
+        if (!perms || !perms.has([
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.EmbedLinks
-        ]);
-        if (missing.length) {
-          return interaction.editReply(`I’m missing these permissions in <#${ch.id}>: ${missing.join(', ')}`);
+        ])) {
+          return interaction.reply({
+            content: 'I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.',
+            flags: 64
+          });
         }
 
-        const ref = rtdb.ref(`config/clipDestinations/${guild.id}`);
+        // store destination (guild-scoped) so your poster can read it later
+        // structure: config/clipDestinations/<guildId> = { channelId, updatedBy, updatedAt }
+        const payload = {
+          channelId: chan.id,
+          updatedBy: interaction.user.id,
+          updatedAt: Date.now(),
+        };
 
         try {
-          if (disable) {
-            await ref.remove();
-            return interaction.editReply('✅ Clips auto-post destination cleared for this server.');
-          } else {
-            await ref.set({
-              channelId: ch.id,
-              updatedBy: interaction.user.id,
-              updatedAt: Date.now()
-            });
-            return interaction.editReply(`✅ Saved. New clips will be posted in <#${ch.id}>.`);
-          }
+          await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set(payload);
         } catch (e) {
-          const code = e?.errorInfo?.code || e?.code || '';
-          if (String(code).includes('permission') || String(e?.message).toLowerCase().includes('permission_denied')) {
-            return interaction.editReply('❌ Database rules blocked this write. Make sure RTDB allows admins to write to config/clipDestinations.');
-          }
           console.error('setclipschannel write failed:', e);
-          return interaction.editReply('Sorry, something went wrong.');
+          return interaction.reply({ content: 'Database write failed — try again.', flags: 64 });
         }
+
+        // success message
+        return interaction.reply({
+          content: `✅ New clips will be posted in <#${chan.id}>.`,
+          flags: 64
+        });
       }
     } 
     // --- Button Handlers ---
