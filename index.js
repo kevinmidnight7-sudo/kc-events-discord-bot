@@ -47,6 +47,7 @@ const {
   TextInputStyle,
   PermissionsBitField,
   ChannelType,
+  PermissionFlagsBits,
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -544,7 +545,7 @@ function buildMessageDetailEmbed(msg, nameMap = {}) {
     msg.name ||
     '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
-  const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
+  const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
   const text = String(rawText || '');
   const likes = msg.likes || (msg.likedBy ? Object.keys(msg.likedBy).length : 0) || 0;
   const replies = msg.replies ? Object.keys(msg.replies).length : 0;
@@ -1339,7 +1340,7 @@ const setClipsChannelCmd = new SlashCommandBuilder()
     .setDescription('Choose a channel where new KC clips will be auto-posted')
     .addChannelOption(o => 
         o.setName('channel')
-         .setDescription('The channel to post clips in')
+         .setDescription('Where new clips will be auto-posted')
          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
          .setRequired(true))
     .addBooleanOption(o =>
@@ -1660,27 +1661,34 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.editReply({ content: '✅ Auto-posting disabled for this server.' });
         }
 
-        const channel = interaction.options.getChannel('channel');
-        const requiredPerms = [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.EmbedLinks,
-            PermissionsBitField.Flags.ReadMessageHistory,
-            PermissionsBitField.Flags.AddReactions,
-            PermissionsBitField.Flags.UseExternalEmojis,
+        const target = interaction.options.getChannel('channel', true);
+        if (!target || target.guildId !== interaction.guildId || typeof target.permissionsFor !== 'function' || !target.isTextBased()) {
+          return interaction.editReply({ content: 'Pick a text channel in this server (not threads/voice/categories/DMs).' });
+        }
+
+        const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe();
+        const needed = [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AddReactions,
+          PermissionFlagsBits.UseExternalEmojis
         ];
-        const perms = channel.permissionsFor(client.user);
-        if (!perms || !perms.has(requiredPerms)) {
-            return interaction.editReply({ content: `❌ I'm missing some permissions in <#${channel.id}>. I need: View, Send Messages, Embed Links, Read History, Add Reactions, Use External Emojis.` });
+        const perms = target.permissionsFor(me);
+        if (!perms || !perms.has(needed, true)) {
+          return interaction.editReply({
+            content: 'I’m missing required permissions in that channel: ViewChannel, SendMessages, EmbedLinks, ReadMessageHistory, AddReactions, UseExternalEmojis.'
+          });
         }
 
         await rtdb.ref(`config/clipChannels/${interaction.guildId}`).set({
-            channelId: channel.id,
+            channelId: target.id,
             setBy: interaction.user.id,
             setAt: Date.now(),
         });
 
-        await interaction.editReply({ content: `✅ I’ll post new clips in <#${channel.id}>.` });
+        await interaction.editReply({ content: `✅ I’ll post new clips in #${target.name}.` });
       }
     } 
     // --- Button Handlers ---
