@@ -2094,9 +2094,9 @@ async function maybeBroadcast(uid, postId, data) {
     const maxAge = parseInt(process.env.CLIP_BROADCAST_MAX_AGE_MS || '15601000', 10);
     if (data.createdAt && (Date.now() - data.createdAt > maxAge)) return;
 
-    for (const guildId of Object.keys(globalCache.clipDestinations)) {
-        const dest = globalCache.clipDestinations[guildId];
-        if (!dest || !dest.channelId) continue;
+    for (const guildId of globalCache.clipDestinations.keys()) {
+        const channelId = globalCache.clipDestinations.get(guildId);
+        if (!channelId) continue;
 
         const flagRef = rtdb.ref(`users/${uid}/posts/${postId}/postedToDiscord/${guildId}`);
         try {
@@ -2116,8 +2116,19 @@ async function maybeBroadcast(uid, postId, data) {
             
             const embed = buildClipDetailEmbed(item, nameMap);
             
-            const channel = await client.channels.fetch(dest.channelId);
-            if (!channel) {
+            const guild = await client.guilds.cache.get(guildId);
+            if (!guild) {
+                await flagRef.remove(); continue;
+            }
+            const channel = await guild.channels.fetch(channelId).catch(() => null);
+            if (!channel || !channel.isTextBased?.()) {
+                await flagRef.remove(); continue;
+            }
+            
+            const me = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
+            const botPerms = channel.permissionsFor(me);
+            if (!botPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+                console.warn(`[broadcast] missing perms in ${guildId}/${channelId}, skipping`);
                 await flagRef.remove();
                 continue;
             }
@@ -2164,7 +2175,7 @@ client.once('ready', async () => {
   if (snap.exists()) {
     snap.forEach(guildSnap => {
         const guildId = guildSnap.key;
-        const channelId = guildSnap.child('clipsChannelId').val();
+        const channelId = guildSnap.child('clipsChannel/channelId').val();
         if (channelId) {
             globalCache.clipDestinations.set(guildId, channelId);
         }
@@ -2173,14 +2184,14 @@ client.once('ready', async () => {
   console.log('[broadcast] loaded initial clip destinations:', globalCache.clipDestinations.size);
 
   rtdb.ref('guildConfig').on('child_added', s => {
-      const channelId = s.child('clipsChannelId').val();
+      const channelId = s.child('clipsChannel/channelId').val();
       if (channelId) {
         globalCache.clipDestinations.set(s.key, channelId);
         console.log(`[broadcast] added channel for guild ${s.key}`);
       }
   });
   rtdb.ref('guildConfig').on('child_changed', s => {
-      const channelId = s.child('clipsChannelId').val();
+      const channelId = s.child('clipsChannel/channelId').val();
       if (channelId) {
         globalCache.clipDestinations.set(s.key, channelId);
         console.log(`[broadcast] updated channel for guild ${s.key}`);
