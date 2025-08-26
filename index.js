@@ -1158,75 +1158,71 @@ async function loadCustomBadges(uid) {
 
 async function handleSetClipsChannel(interaction) {
   try {
-    // Must be in a server; ACK immediately so we don’t hit the 3s window.
-    if (!interaction.inGuild()) {
-      return interaction.reply({ content: 'Use this in a server, not DMs.', flags: 64 });
-    }
-    await interaction.deferReply({ flags: 64 });
+    if (!interaction.isChatInputCommand() || interaction.commandName !== 'setclipschannel') return;
 
-    // Get the selected channel from the option.
+    if (!interaction.inGuild()) {
+      return interaction.reply({ content: 'Run this in a server.', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+
     const picked = interaction.options.getChannel('channel', true);
 
-    // Must be a channel from THIS guild (not a different server).
+    // Must be this guild and not a thread
     if (picked.guildId !== interaction.guildId) {
       return interaction.editReply('That channel isn’t in this server.');
     }
+    if (picked.isThread && picked.isThread()) {
+      return interaction.editReply('Pick a text channel, not a thread.');
+    }
 
-    // Resolve a full Channel object via the global ChannelManager (reliable even if picked.guild is null).
+    // Re-fetch via the global ChannelManager to avoid partials/null guild references
     const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
     if (!chan || !chan.isTextBased?.()) {
-      return interaction.editReply('Pick a normal text or announcement channel I can post in (not a thread/voice/category).');
-    }
-    if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(chan.type)) {
-      return interaction.editReply('Pick a text or announcement channel (not a thread/voice/category).');
+      return interaction.editReply('Pick a text or announcement channel I can post in.');
     }
 
-    // Invoker needs Manage Server.
+    // Invoker must have Manage Server
     const invokerOk =
       interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
       interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
     if (!invokerOk) {
-      return interaction.editReply('You need **Manage Server** to set this.');
+      return interaction.editReply('You need the **Manage Server** permission to set this.');
     }
 
-    // Check the bot’s perms IN THAT CHANNEL.
+    // Bot perms in that channel
     const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
     if (!me) {
-      return interaction.editReply('I couldn’t resolve my own member record. Reinvite me or check my permissions.');
+      return interaction.editReply('I couldn’t resolve my member record. Reinvite me or check my permissions.');
     }
-    const botOk = chan.permissionsFor(me)?.has([
+    const botOk = chan.permissionsFor(me).has([
       PermissionFlagsBits.ViewChannel,
       PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.EmbedLinks
+      PermissionFlagsBits.EmbedLinks,
     ]);
     if (!botOk) {
-      return interaction.editReply('I need **View Channel**, **Send Messages** and **Embed Links** in that channel.');
+      return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
     }
 
-    // Save destination in RTDB: config/clipDestinations/<guildId> = { channelId, ... }
-    await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set({
+    // Persist in RTDB and update cache
+    await rtdb.ref(`guildConfig/${interaction.guildId}/clipsChannel`).set({
       channelId: chan.id,
-      updatedBy: interaction.user.id,
-      updatedAt: Date.now(),
+      name: chan.name,
+      setBy: interaction.user.id,
+      setAt: admin.database.ServerValue.TIMESTAMP,
     });
 
-    return interaction.editReply(`✅ New clips will be posted in <#${chan.id}>.`);
-  } catch (err) {
-    console.error('/setclipschannel failed', err);
-    if (interaction.deferred || interaction.replied) {
-      return interaction.editReply('Sorry, something went wrong.');
-    }
-    return interaction.reply({ content: 'Sorry, something went wrong.', flags: 64 });
+    globalCache.clipDestinations.set(interaction.guildId, chan.id);
+
+    return interaction.editReply(`✅ Clips will be posted in <#${chan.id}>.`);
+  } catch (e) {
+    console.error('/setclipschannel failed', e);
+    try { await interaction.editReply('Something went wrong while saving.'); } catch {}
   }
 }
 
 // ---------- Discord Client ----------
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
+  intents: [GatewayIntentBits.Guilds],
   partials: [Partials.Channel],
 });
 
@@ -1366,15 +1362,13 @@ const compareCmd = new SlashCommandBuilder()
 
 const setClipsChannelCmd = new SlashCommandBuilder()
   .setName('setclipschannel')
-  .setDescription('Choose the channel where new KC clips will be auto-posted')
+  .setDescription('Choose the channel where new KC clips will be posted.')
   .addChannelOption(opt =>
     opt.setName('channel')
-       .setDescription('Text channel for auto-posted clips')
-       .setRequired(true)
-       .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-  )
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .setDMPermission(false);
+      .setDescription('Text or Announcement channel in this server')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(true)
+  );
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -1879,7 +1873,7 @@ client.on('interactionCreate', async (interaction) => {
           rows = await loadLeaderboardData();
         }
         const embed = buildLbEmbed(rows, catIdx, page);
-        await interaction.editReply({ embeds: [embed], components: [lbRow(catIdx, page)] });
+        await interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
       }
       else if (id.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
@@ -1895,27 +1889,27 @@ client.on('interactionCreate', async (interaction) => {
           const postPath = clipDbPath(item);
           const embed = buildClipDetailEmbed(item, state.nameMap);
           const rows = clipsDetailRows(interaction, postPath);
-          return interaction.editReply({ embeds:[embed], components: rows });
+          return interaction.update({ embeds:[embed], components: rows });
         }
         else if (action === 'b') {
           // back to list
           const state = getClipsState(interaction);
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
         else if (action === 'p') {
           // page change
           const state = getClipsState(interaction);
           state.page = Math.max(0, parseInt(a,10) || 0);
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
         else if (action === 'rf') {
           // refresh list (recompute top)
           const state = getClipsState(interaction);
           state.list.sort((x,y)=>y.score-x.score);
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
       }
       else if (id.startsWith('clips:react:')) {
@@ -1992,7 +1986,7 @@ client.on('interactionCreate', async (interaction) => {
           const p = Math.max(0, Math.min(page, maxPage));
           const embed = buildClipCommentsEmbed(item, comments, p, nameMap);
           const rows = [commentsRows(sid, p, maxPage)];
-          await interaction.editReply({ content: '', embeds: [embed], components: rows });
+          await interaction.update({ content: '', embeds: [embed], components: rows });
           return;
       }
       else if (id.startsWith('clips:comments:')) {
@@ -2015,7 +2009,7 @@ client.on('interactionCreate', async (interaction) => {
           const page = 0;
           const embed = buildClipCommentsEmbed(item, comments, page, nameMap);
           const rows = [commentsRows(sid, page, maxPage)];
-          await interaction.editReply({ content: '', embeds: [embed], components: rows });
+          await interaction.update({ content: '', embeds: [embed], components: rows });
           return;
       }
       else if (interaction.customId.startsWith('clips:back')) {
@@ -2030,13 +2024,13 @@ client.on('interactionCreate', async (interaction) => {
             if(item) {
                 const embed = buildClipDetailEmbed(item, state.nameMap);
                 const rows = clipsDetailRows(interaction, clipDbPath(item));
-                return interaction.editReply({ embeds: [embed], components: rows });
+                return interaction.update({ embeds: [embed], components: rows });
             }
         }
         
         // Default back to list
         const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-        return interaction.editReply({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
       }
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
@@ -2058,18 +2052,18 @@ client.on('interactionCreate', async (interaction) => {
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await interaction.editReply({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          await interaction.update({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         else if (action === 'back' || action === 'list') {
           const embed = buildMessagesEmbed(state.list, state.nameMap);
-          await interaction.editReply({ embeds: [embed], components: messageIndexRows(state.list.length || 0) });
+          await interaction.update({ embeds: [embed], components: messageIndexRows(state.list.length || 0) });
         }
         else if (action === 'refresh') {
           const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
           state.list = list;
           state.nameMap = nameMap;
           const embed = buildMessagesEmbed(list, nameMap);
-          await interaction.editReply({ embeds: [embed], components: messageIndexRows(list.length || 0) });
+          await interaction.update({ embeds: [embed], components: messageIndexRows(list.length || 0) });
         }
         else if (action === 'refreshOne') {
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
@@ -2077,7 +2071,7 @@ client.on('interactionCreate', async (interaction) => {
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await interaction.editReply({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          await interaction.update({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         else if (action === 'openPath') {
           const path = decPath(a);
@@ -2086,7 +2080,7 @@ client.on('interactionCreate', async (interaction) => {
           const fresh = await loadNode(path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
           const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
-          await interaction.editReply({ embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
+          await interaction.update({ embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
         else if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
           const path = decPath(a);
@@ -2094,7 +2088,7 @@ client.on('interactionCreate', async (interaction) => {
           const parent = await loadNode(path);
           const children = await loadReplies(path);
           const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
-          await interaction.editReply({ embeds: [embed], components: threadRows(path, children, page, 10) });
+          await interaction.update({ embeds: [embed], components: threadRows(path, children, page, 10) });
         }
         else if (action === 'openChild') {
           const path = decPath(a);
@@ -2112,7 +2106,7 @@ client.on('interactionCreate', async (interaction) => {
               new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
             ),
           ];
-          await interaction.editReply({ embeds: [embed], components: rows });
+          await interaction.update({ embeds: [embed], components: rows });
         }
         else if (action === 'like') {
           const discordId = interaction.user.id;
@@ -2127,7 +2121,7 @@ client.on('interactionCreate', async (interaction) => {
           const embed = buildMessageDetailEmbed(node, state?.nameMap || new Map());
           const i = state.list.findIndex(m=>m.path===path);
           if (i>=0) state.list[i] = { ...state.list[i], ...node };
-          await interaction.editReply({ embeds: [embed] });
+          await interaction.update({ embeds: [embed] });
         }
       }
       else if (interaction.customId === 'votes:refresh') {
@@ -2136,12 +2130,12 @@ client.on('interactionCreate', async (interaction) => {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
         );
-        await interaction.editReply({ embeds: [embed], components: [row] });
+        await interaction.update({ embeds: [embed], components: [row] });
       }
       else if (interaction.customId.startsWith('vote:delete:')) {
         const uid = interaction.customId.split(':')[2];
         await withTimeout(rtdb.ref(`votes/${uid}`).remove(), 6000, `delete vote ${uid}`);
-        await interaction.editReply({ content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
+        await interaction.update({ content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
       }
     } catch (err) {
       console.error(`[button:${id}]`, err);
@@ -2320,28 +2314,42 @@ client.on('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
-  const snap = await rtdb.ref('config/clipDestinations').get();
-  if (snap.exists()) {
-    snap.forEach(g => {
-      const guildId = g.key;
-      const channelId = g.val()?.channelId;
-      if (channelId) globalCache.clipDestinations.set(guildId, channelId);
-    });
-  }
-  console.log('[broadcast] loaded initial clip destinations:', globalCache.clipDestinations.size);
+  try {
+    const snap = await rtdb.ref('guildConfig').get();
+    globalCache.clipDestinations.clear();
+    if (snap.exists()) {
+      const all = snap.val() || {};
+      for (const [guildId, cfg] of Object.entries(all)) {
+        if (cfg?.clipsChannel?.channelId) {
+          globalCache.clipDestinations.set(guildId, cfg.clipsChannel.channelId);
+        }
+      }
+    }
+    console.log(`[broadcast] loaded initial clip destinations: ${globalCache.clipDestinations.size}`);
 
-  rtdb.ref('config/clipDestinations').on('child_added', s => {
-    const ch = s.val()?.channelId;
-    if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] added channel for guild ${s.key}`); }
-  });
-  rtdb.ref('config/clipDestinations').on('child_changed', s => {
-    const ch = s.val()?.channelId;
-    if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] updated channel for guild ${s.key}`); }
-  });
-  rtdb.ref('config/clipDestinations').on('child_removed', s => {
-    globalCache.clipDestinations.delete(s.key);
-    console.log(`[broadcast] removed channel for guild ${s.key}`);
-  });
+    // Live updates
+    rtdb.ref('guildConfig').on('child_changed', s => {
+      const gid = s.key;
+      const cfg = s.val() || {};
+      if (cfg?.clipsChannel?.channelId) {
+        globalCache.clipDestinations.set(gid, cfg.clipsChannel.channelId);
+      } else {
+        globalCache.clipDestinations.delete(gid);
+      }
+    });
+    rtdb.ref('guildConfig').on('child_added', s => {
+      const gid = s.key;
+      const cfg = s.val() || {};
+      if (cfg?.clipsChannel?.channelId) {
+        globalCache.clipDestinations.set(gid, cfg.clipsChannel.channelId);
+      }
+    });
+    rtdb.ref('guildConfig').on('child_removed', s => {
+      globalCache.clipDestinations.delete(s.key);
+    });
+  } catch (e) {
+    console.error('[broadcast] failed to load clip destinations', e);
+  }
 
   // Attach listeners for all existing and new users
   const usersSnap = await rtdb.ref('users').get();
