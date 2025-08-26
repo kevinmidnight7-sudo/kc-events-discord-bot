@@ -1814,7 +1814,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (commandName === 'setclipschannel') {
-      return handleSetClipsChannel(interaction);
+      await handleSetClipsChannel(interaction);
     }
   } 
   // --- Button Handlers ---
