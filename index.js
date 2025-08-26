@@ -32,22 +32,12 @@ console.log('ENV sanity', {
 
 
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  SlashCommandBuilder,
-  Routes,
-  REST,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  PermissionsBitField,
-  ChannelType,
-  PermissionFlagsBits,
+  Client, GatewayIntentBits, Partials,
+  SlashCommandBuilder, Routes, REST,
+  ChannelType, PermissionFlagsBits,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
+  EmbedBuilder
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -84,8 +74,9 @@ const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
-  userNames: { data: {}, fetchedAt: 0 },
-  clipDestinations: new Map(),
+  userNames: new Map(), // uid -> displayName
+  userNamesFetchedAt: 0,
+  clipDestinations: new Map() // guildId -> channelId
 };
 
 // only these will be private
@@ -186,6 +177,17 @@ async function withTimeout(promise, ms, label='op'){
     new Promise((_,rej)=>setTimeout(()=>rej(new Error(`Timeout ${ms}ms: ${label}`)), ms))
   ]);
 }
+
+// --- Interaction Ack Helpers ---
+function alreadyAcked(i) { return i.deferred || i.replied; }
+async function safeDefer(i, opts) { if (!alreadyAcked(i)) { try { await i.deferReply(opts); } catch {} } }
+async function safeReply(i, payload, ephemeral = true) {
+  try {
+    if (alreadyAcked(i)) return await i.editReply(payload);
+    return await i.reply({ ...payload, ephemeral });
+  } catch {}
+}
+
 
 async function hasEmerald(uid) {
   // Prefer RTDB; fall back to Firestore if needed
@@ -345,21 +347,21 @@ function countComments(commentsObj = {}) {
 async function getAllUserNames() {
   const CACHE_DURATION = 60 * 1000; // 60 seconds
   const now = Date.now();
-  if (now - globalCache.userNames.fetchedAt < CACHE_DURATION) {
-    return globalCache.userNames.data;
+  if (now - globalCache.userNamesFetchedAt < CACHE_DURATION) {
+    return globalCache.userNames;
   }
 
   const snap = await withTimeout(rtdb.ref('users').get(), 8000, 'RTDB users');
-  const out = {};
+  const out = new Map();
   if (snap.exists()) {
     const all = snap.val() || {};
     for (const uid of Object.keys(all)) {
       const u = all[uid] || {};
-      out[uid] = u.displayName || u.email || '(unknown)';
+      out.set(uid, u.displayName || u.email || '(unknown)');
     }
   }
-  globalCache.userNames.data = out;
-  globalCache.userNames.fetchedAt = now;
+  globalCache.userNames = out;
+  globalCache.userNamesFetchedAt = now;
   return out;
 }
 
@@ -446,11 +448,11 @@ async function fetchLatestMessages(limit = 10) {
 }
 
 // Build an embed showing a page of 10 messages (title, text, reply count)
-function buildMessagesEmbed(list, nameMap = {}) {
+function buildMessagesEmbed(list, nameMap) {
   const desc = list.map((m, i) => {
     const who =
       m.user ||
-      nameMap[m.uid] ||
+      nameMap.get(m.uid) ||
       m.username ||
       m.displayName ||
       m.name ||
@@ -498,10 +500,10 @@ function fmtTime(ms){
   return d.toLocaleString();
 }
 
-function buildMessageDetailEmbed(msg, nameMap = {}) {
+function buildMessageDetailEmbed(msg, nameMap) {
   const who =
     msg.user ||
-    nameMap[msg.uid] ||
+    nameMap.get(msg.uid) ||
     msg.username ||
     msg.displayName ||
     msg.name ||
@@ -555,13 +557,13 @@ async function loadReplies(path) {
   return list;
 }
 
-function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
+function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap) {
   const start = page*pageSize;
   const slice = children.slice(start, start+pageSize);
   const lines = slice.map((r,i)=>{
     const who =
       r.user ||
-      nameMap[r.uid] ||
+      nameMap.get(r.uid) ||
       r.username ||
       r.displayName ||
       r.name ||
@@ -571,7 +573,7 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap={}) {
     return `**${i+1}. ${who}** — ${txt}`;
   }).join('\n\n') || '_No replies yet_';
 
-  const parentWho = parent?.user || nameMap[parent?.uid] || parent?.username || parent?.displayName || parent?.name || '(unknown)';
+  const parentWho = parent?.user || nameMap.get(parent?.uid) || parent?.username || parent?.displayName || parent?.name || '(unknown)';
 
   return new EmbedBuilder()
     .setTitle(`Thread — ${parentWho}`)
@@ -624,13 +626,13 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
   return rows;
 }
 
-function buildClipsListEmbed(list=[], page=0, nameMap={}) {
+function buildClipsListEmbed(list=[], page=0, nameMap) {
   const start = page * CLIPS.PAGE_SIZE;
   const slice = list.slice(start, start + CLIPS.PAGE_SIZE);
 
   const lines = slice.map((p, i) => {
     const d = p.data || {};
-    const who = nameMap[p.ownerUid] || '(unknown)';
+    const who = nameMap.get(p.ownerUid) || '(unknown)';
     const cap = (d.caption || '').trim() || '(no caption)';
     const link = clipLink(d);
     const meta = `👍 ${p.reacts} • 💬 ${p.comments}`;
@@ -672,9 +674,9 @@ function clipsListRows(listLen, page=0) {
   return rows;
 }
 
-function buildClipDetailEmbed(item, nameMap={}) {
+function buildClipDetailEmbed(item, nameMap) {
   const d = item.data || {};
-  const who = nameMap[item.ownerUid] || '(unknown)';
+  const who = nameMap.get(item.ownerUid) || '(unknown)';
   const link = clipLink(d);
   const cap = (d.caption || '').trim() || '(no caption)';
   const { perEmoji, total } = reactCount(d.reactions || {});
@@ -776,7 +778,7 @@ function buildClipCommentsEmbed(item, comments, page, nameMap) {
 
     const description = pageComments.length > 0
         ? pageComments.map((c, i) => {
-            const displayName = nameMap[c.uid] || c.user || '(unknown)';
+            const displayName = nameMap.get(c.uid) || c.user || '(unknown)';
             const truncatedText = c.text.length > 120 ? `${c.text.substring(0, 117)}...` : c.text;
             const time = new Date(c.time).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }) + ', ' + new Date(c.time).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
             return `${start + i + 1}) **${displayName}** — ${truncatedText}  *(${time})*`;
@@ -1156,56 +1158,62 @@ async function loadCustomBadges(uid) {
 
 async function handleSetClipsChannel(interaction) {
   try {
-    if (!interaction.inGuild()) {
+    // Must be used in a server
+    if (!interaction.inGuild?.() && !interaction.guildId) {
       return interaction.reply({ content: 'Use this in a server, not DMs.', ephemeral: true });
     }
-    await interaction.deferReply({ ephemeral: true });
+
+    await safeDefer(interaction, { ephemeral: true });
+
+    // Resolve the picked channel from options
     const picked = interaction.options.getChannel('channel', true);
-    // Must be a text/announcement channel in this same guild and not a thread
-    if (picked.guildId !== interaction.guildId) {
+
+    // Type guard: allow only normal text or announcement channels
+    if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(picked.type)) {
+      return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/DMs).');
+    }
+
+    // Must be from the same guild as the command
+    if (picked.guildId && interaction.guildId && picked.guildId !== interaction.guildId) {
       return interaction.editReply('That channel isn’t in this server.');
     }
-    if (picked.isThread && picked.isThread()) {
-      return interaction.editReply('Pick a text channel, not a thread.');
-    }
-    // Re-fetch the channel via the global ChannelManager (avoids guild=null issues)
-    const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
-    if (!chan || !chan.isTextBased?.()) {
-      return interaction.editReply('Pick a text or announcement channel I can post in.');
-    }
-    // Require Manage Server for the invoker
+
+    // Check the invoker has Manage Server
     const invokerOk =
-      interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
-      interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+      (interaction.memberPermissions && interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) ||
+      (interaction.member?.permissions && interaction.member.permissions.has(PermissionFlagsBits.ManageGuild));
     if (!invokerOk) {
-      return interaction.editReply('You need the Manage Server permission to set this.');
+      return interaction.editReply('You need **Manage Server** to set the clips channel.');
     }
-    // Check the bot’s perms in that channel
-    const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
-    if (!me) {
-      return interaction.editReply('I couldn’t resolve my member record. Try reinviting me or check my permissions.');
+
+    // Resolve bot member and verify bot perms in that channel
+    const guild = interaction.guild || await interaction.client.guilds.fetch(interaction.guildId).catch(() => null);
+    if (!guild) return interaction.editReply('Could not resolve this server. Try again.');
+    const me = guild.members?.me || await guild.members.fetchMe().catch(() => null);
+    if (!me) return interaction.editReply('Could not resolve my bot member in this server.');
+
+    // Use permissionsIn (handles partials reliably)
+    const have = me.permissionsIn(picked);
+    const need = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
+    if (!have?.has(need)) {
+      return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
     }
-    const botOk = chan.permissionsFor(me).has([
-      PermissionFlagsBits.ViewChannel,
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.EmbedLinks
-    ]);
-    if (!botOk) {
-      return interaction.editReply('I need View Channel, Send Messages and Embed Links in that channel.');
-    }
-    // Persist to RTDB in the single, canonical place used by your broadcaster
+
+    // Persist to RTDB at the single canonical path your broadcaster reads:
+    // guildConfig/<guildId>/clipsChannel/channelId
     await rtdb.ref(`guildConfig/${interaction.guildId}/clipsChannel`).set({
-      channelId: chan.id,
-      name: chan.name,
+      channelId: picked.id,
       setBy: interaction.user.id,
-      setAt: admin.database.ServerValue.TIMESTAMP
+      updatedAt: admin.database.ServerValue.TIMESTAMP,
     });
-    // Update in-memory cache immediately so new posts start flowing without restart
-    globalCache.clipDestinations.set(interaction.guildId, chan.id);
-    return interaction.editReply(`✅ Clips will be posted in <#${chan.id}>.`);
-  } catch (e) {
-    console.error('/setclipschannel failed', e);
-    try { await interaction.editReply('Something went wrong while saving.'); } catch {}
+
+    // Update in-memory cache immediately
+    globalCache.clipDestinations.set(interaction.guildId, picked.id);
+
+    return interaction.editReply(`✅ New clips will be posted in <#${picked.id}>.`);
+  } catch (err) {
+    console.error('/setclipschannel failed', err);
+    return safeReply(interaction, { content: 'Sorry, something went wrong.' }, true);
   }
 }
 
@@ -1352,16 +1360,16 @@ const compareCmd = new SlashCommandBuilder()
   );
 
 const setClipsChannelCmd = new SlashCommandBuilder()
-    .setName('setclipschannel')
-    .setDescription('Choose which channel new KC clips should be posted to.')
-    .addChannelOption(o =>
-        o.setName('channel')
-         .setDescription('A text or announcement channel in this server')
-         .setRequired(true)
-         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-    )
-    .setDMPermission(false) // important to avoid null guild in DMs
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  .setName('setclipschannel')
+  .setDescription('Choose the channel where new KC clips will be auto-posted')
+  .addChannelOption(opt =>
+    opt.setName('channel')
+       .setDescription('Pick a normal text or announcement channel (no threads/voice/categories/DMs)')
+       .setRequired(true)
+       .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDMPermission(false);
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -1553,7 +1561,7 @@ client.on('interactionCreate', async (interaction) => {
       try {
         await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
         const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-        const embed = buildMessagesEmbed(list || [], nameMap || {});
+        const embed = buildMessagesEmbed(list || [], nameMap || new Map());
         await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
       } catch (err) {
         console.error(`[${commandName}]`, err);
@@ -1724,7 +1732,7 @@ client.on('interactionCreate', async (interaction) => {
           return await interaction.editReply({ content: 'You must link your KC account first with /link.' });
         }
         const nameMap = await getAllUserNames();
-        const userName = nameMap[uid] || interaction.user.username;
+        const userName = nameMap.get(uid) || interaction.user.username;
         const text = interaction.options.getString('text');
         const now = Date.now();
         const message = { text, uid, user: userName, time: now, createdAt: now };
@@ -1814,7 +1822,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (commandName === 'setclipschannel') {
-      await handleSetClipsChannel(interaction);
+      return handleSetClipsChannel(interaction);
     }
   } 
   // --- Button Handlers ---
@@ -1943,7 +1951,7 @@ client.on('interactionCreate', async (interaction) => {
         for (const emo of POST_EMOJIS) {
           const uids = Object.keys(data[emo] || {});
           if (!uids.length) continue;
-          const pretty = uids.map(u => nameMap[u] || 'unknown').slice(0, 20).join(', ');
+          const pretty = uids.map(u => nameMap.get(u) || 'unknown').slice(0, 20).join(', ');
           const more = uids.length > 20 ? ` … +${uids.length - 20} more` : '';
           lines.push(`${emo} ${pretty}${more}`);
         }
@@ -2111,7 +2119,7 @@ client.on('interactionCreate', async (interaction) => {
           await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
           await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
           const node = await loadNode(path);
-          const embed = buildMessageDetailEmbed(node, state?.nameMap || {});
+          const embed = buildMessageDetailEmbed(node, state?.nameMap || new Map());
           const i = state.list.findIndex(m=>m.path===path);
           if (i>=0) state.list[i] = { ...state.list[i], ...node };
           await interaction.editReply({ embeds: [embed] });
@@ -2156,7 +2164,7 @@ client.on('interactionCreate', async (interaction) => {
         if (!uid) return interaction.editReply('Link your KC account with /link first.');
 
         const names = await getAllUserNames();
-        const userName = names[uid] || interaction.user.username;
+        const userName = names.get(uid) || interaction.user.username;
 
         const comment = {
           text,
@@ -2176,7 +2184,7 @@ client.on('interactionCreate', async (interaction) => {
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) return interaction.editReply('You must link your KC account first with /link.');
         let nameMap = await getAllUserNames();
-        const userName = nameMap[uid] || interaction.user.username;
+        const userName = nameMap.get(uid) || interaction.user.username;
         const reply = { user: userName, uid, text, time: admin.database.ServerValue.TIMESTAMP };
         await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 6000, `RTDB ${path}/replies.push`);
         await interaction.editReply('✅ Reply posted!');
@@ -2205,7 +2213,7 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.editReply('Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.');
         }
         const nameMap = await getAllUserNames();
-        const username = nameMap[uid] || interaction.user.username;
+        const username = nameMap.get(uid) || interaction.user.username;
         const vote = { uid, username, bestOffence: offFinal, bestDefence: defFinal, rating, time: admin.database.ServerValue.TIMESTAMP };
         const ref = rtdb.ref(`votes/${uid}`);
         
@@ -2257,16 +2265,14 @@ async function maybeBroadcast(uid, postId, data) {
             }
 
             const item = { ownerUid: uid, postId, data };
-            const userSnap = await rtdb.ref(`users/${uid}`).get();
-            const nameMap = { [uid]: userSnap.val()?.displayName || userSnap.val()?.email || '(unknown)' };
+            const nameMap = await getAllUserNames();
             
             const embed = buildClipDetailEmbed(item, nameMap);
             
             const channel = await client.channels.fetch(channelId).catch(() => null);
             if (!channel || !channel.isTextBased?.()) { await flagRef.remove(); continue; }
             
-            const guild = channel.guild;
-            const me = guild?.members.me ?? await guild?.members.fetchMe().catch(() => null);
+            const me = channel.guild?.members.me || await channel.guild?.members.fetchMe().catch(() => null);
             if (!me) { await flagRef.remove(); continue; }
 
             const ok = channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]);
@@ -2309,36 +2315,27 @@ client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
-  // Load clip channel destinations
   const snap = await rtdb.ref('guildConfig').get();
   if (snap.exists()) {
-    snap.forEach(guildSnap => {
-        const guildId = guildSnap.key;
-        const channelId = guildSnap.child('clipsChannel/channelId').val();
-        if (channelId) {
-            globalCache.clipDestinations.set(guildId, channelId);
-        }
+    snap.forEach(g => {
+      const guildId = g.key;
+      const channelId = g.child('clipsChannel/channelId').val();
+      if (channelId) globalCache.clipDestinations.set(guildId, channelId);
     });
   }
   console.log('[broadcast] loaded initial clip destinations:', globalCache.clipDestinations.size);
 
   rtdb.ref('guildConfig').on('child_added', s => {
-      const channelId = s.child('clipsChannel/channelId').val();
-      if (channelId) {
-        globalCache.clipDestinations.set(s.key, channelId);
-        console.log(`[broadcast] added channel for guild ${s.key}`);
-      }
+    const ch = s.child('clipsChannel/channelId').val();
+    if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] added channel for guild ${s.key}`); }
   });
   rtdb.ref('guildConfig').on('child_changed', s => {
-      const channelId = s.child('clipsChannel/channelId').val();
-      if (channelId) {
-        globalCache.clipDestinations.set(s.key, channelId);
-        console.log(`[broadcast] updated channel for guild ${s.key}`);
-      }
+    const ch = s.child('clipsChannel/channelId').val();
+    if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] updated channel for guild ${s.key}`); }
   });
   rtdb.ref('guildConfig').on('child_removed', s => {
-      globalCache.clipDestinations.delete(s.key);
-      console.log(`[broadcast] removed channel for guild ${s.key}`);
+    globalCache.clipDestinations.delete(s.key);
+    console.log(`[broadcast] removed channel for guild ${s.key}`);
   });
 
   // Attach listeners for all existing and new users
