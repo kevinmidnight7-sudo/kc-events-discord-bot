@@ -34,7 +34,7 @@ console.log('ENV sanity', {
 const {
   Client, GatewayIntentBits, Partials,
   SlashCommandBuilder, Routes, REST,
-  ChannelType, PermissionFlagsBits,
+  ChannelType, PermissionFlagsBits, GuildMember,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
   EmbedBuilder
@@ -1163,57 +1163,73 @@ async function handleSetClipsChannel(interaction) {
       return interaction.reply({ content: 'Use this in a server, not DMs.', ephemeral: true });
     }
 
-    await safeDefer(interaction, { ephemeral: true });
+    await interaction.deferReply({ ephemeral: true }).catch(() => {});
 
     // Resolve the picked channel from options
     const picked = interaction.options.getChannel('channel', true);
 
-    // Type guard: allow only normal text or announcement channels
+    // Only allow normal text or announcement channels (no threads/voice/categories/DMs)
     if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(picked.type)) {
-      return interaction.editReply('Pick a normal text or announcement channel (not threads/voice/categories/DMs).');
+      return interaction.editReply('Pick a text or announcement channel (not threads/voice/categories/DMs).');
     }
-
-    // Must be from the same guild as the command
+    // Must be in the same guild
     if (picked.guildId && interaction.guildId && picked.guildId !== interaction.guildId) {
       return interaction.editReply('That channel isn’t in this server.');
     }
 
+    // Resolve the guild (prefer the channel’s guild)
+    const guild =
+      picked.guild ??
+      interaction.guild ??
+      (interaction.guildId ? await interaction.client.guilds.fetch(interaction.guildId).catch(() => null) : null);
+
+    if (!guild) {
+      return interaction.editReply('Could not resolve this server. Try again.');
+    }
+
     // Check the invoker has Manage Server
-    const invokerOk =
-      (interaction.memberPermissions && interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) ||
-      (interaction.member?.permissions && interaction.member.permissions.has(PermissionFlagsBits.ManageGuild));
-    if (!invokerOk) {
+    let member = null;
+    if (interaction.member instanceof GuildMember) {
+      member = interaction.member;
+    } else {
+      member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    }
+
+    if (!member?.permissions?.has(PermissionFlagsBits.ManageGuild)) {
       return interaction.editReply('You need **Manage Server** to set the clips channel.');
     }
 
-    // Resolve bot member and verify bot perms in that channel
-    const guild = interaction.guild || await interaction.client.guilds.fetch(interaction.guildId).catch(() => null);
-    if (!guild) return interaction.editReply('Could not resolve this server. Try again.');
+    // Resolve the bot member and verify bot perms in that channel
     const me = guild.members?.me || await guild.members.fetchMe().catch(() => null);
-    if (!me) return interaction.editReply('Could not resolve my bot member in this server.');
+    if (!me) {
+      return interaction.editReply('Could not resolve my bot member in this server.');
+    }
 
-    // Use permissionsIn (handles partials reliably)
-    const have = me.permissionsIn(picked);
     const need = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
+    const have = me.permissionsIn(picked);
+
     if (!have?.has(need)) {
       return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
     }
 
-    // Persist to RTDB at the single canonical path your broadcaster reads:
-    // guildConfig/<guildId>/clipsChannel/channelId
-    await rtdb.ref(`guildConfig/${interaction.guildId}/clipsChannel`).set({
+    // Save to RTDB and update in-memory map
+    await rtdb.ref(`guildConfig/${guild.id}/clipsChannel`).set({
       channelId: picked.id,
       setBy: interaction.user.id,
-      updatedAt: admin.database.ServerValue.TIMESTAMP,
+      setAt: admin.database.ServerValue.TIMESTAMP
     });
 
-    // Update in-memory cache immediately
-    globalCache.clipDestinations.set(interaction.guildId, picked.id);
+    globalCache.clipDestinations.set(guild.id, picked.id);
 
-    return interaction.editReply(`✅ New clips will be posted in <#${picked.id}>.`);
+    return interaction.editReply(`✅ Set clips channel to <#${picked.id}>.`);
   } catch (err) {
     console.error('/setclipschannel failed', err);
-    return safeReply(interaction, { content: 'Sorry, something went wrong.' }, true);
+    const msg = 'Sorry, something went wrong.';
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg }).catch(() => {});
+    } else {
+      await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+    }
   }
 }
 
@@ -1364,7 +1380,7 @@ const setClipsChannelCmd = new SlashCommandBuilder()
   .setDescription('Choose the channel where new KC clips will be auto-posted')
   .addChannelOption(opt =>
     opt.setName('channel')
-       .setDescription('Pick a normal text or announcement channel (no threads/voice/categories/DMs)')
+       .setDescription('Text channel for auto-posted clips')
        .setRequired(true)
        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
   )
@@ -1822,7 +1838,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (commandName === 'setclipschannel') {
-      return handleSetClipsChannel(interaction);
+      await handleSetClipsChannel(interaction);
     }
   } 
   // --- Button Handlers ---
