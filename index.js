@@ -1154,6 +1154,60 @@ async function loadCustomBadges(uid) {
   return out.slice(0, 10); // clamp to fit embed field
 }
 
+async function handleSetClipsChannel(interaction) {
+  try {
+    if (!interaction.inGuild()) {
+      return interaction.reply({ content: 'Use this in a server, not DMs.', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const picked = interaction.options.getChannel('channel', true);
+    // Must be a text/announcement channel in this same guild and not a thread
+    if (picked.guildId !== interaction.guildId) {
+      return interaction.editReply('That channel isn’t in this server.');
+    }
+    if (picked.isThread && picked.isThread()) {
+      return interaction.editReply('Pick a text channel, not a thread.');
+    }
+    // Re-fetch the channel via the global ChannelManager (avoids guild=null issues)
+    const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
+    if (!chan || !chan.isTextBased?.()) {
+      return interaction.editReply('Pick a text or announcement channel I can post in.');
+    }
+    // Require Manage Server for the invoker
+    const invokerOk =
+      interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+      interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+    if (!invokerOk) {
+      return interaction.editReply('You need the Manage Server permission to set this.');
+    }
+    // Check the bot’s perms in that channel
+    const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
+    if (!me) {
+      return interaction.editReply('I couldn’t resolve my member record. Try reinviting me or check my permissions.');
+    }
+    const botOk = chan.permissionsFor(me).has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks
+    ]);
+    if (!botOk) {
+      return interaction.editReply('I need View Channel, Send Messages and Embed Links in that channel.');
+    }
+    // Persist to RTDB in the single, canonical place used by your broadcaster
+    await rtdb.ref(`guildConfig/${interaction.guildId}/clipsChannel`).set({
+      channelId: chan.id,
+      name: chan.name,
+      setBy: interaction.user.id,
+      setAt: admin.database.ServerValue.TIMESTAMP
+    });
+    // Update in-memory cache immediately so new posts start flowing without restart
+    globalCache.clipDestinations.set(interaction.guildId, chan.id);
+    return interaction.editReply(`✅ Clips will be posted in <#${chan.id}>.`);
+  } catch (e) {
+    console.error('/setclipschannel failed', e);
+    try { await interaction.editReply('Something went wrong while saving.'); } catch {}
+  }
+}
 
 // ---------- Discord Client ----------
 const client = new Client({
@@ -1299,13 +1353,15 @@ const compareCmd = new SlashCommandBuilder()
 
 const setClipsChannelCmd = new SlashCommandBuilder()
     .setName('setclipschannel')
-    .setDescription('Select the channel where new clips will be posted')
+    .setDescription('Choose which channel new KC clips should be posted to.')
     .addChannelOption(o =>
         o.setName('channel')
-         .setDescription('Text channel')
-         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+         .setDescription('A text or announcement channel in this server')
          .setRequired(true)
-    );
+         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+    )
+    .setDMPermission(false) // important to avoid null guild in DMs
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -1758,63 +1814,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (commandName === 'setclipschannel') {
-      try {
-        if (!interaction.inGuild()) {
-          // This is a pre-check. Reply immediately and stop. This is a valid ACK path.
-          return interaction.reply({ content: 'Run this inside a server (not in DMs).', ephemeral: true });
-        }
-    
-        // ACK once for the main path
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
-    
-        // Fetch the chosen channel via the client (guild may be null/uncached)
-        const picked = interaction.options.getChannel('channel', true);
-        const channel = await interaction.client.channels.fetch(picked.id).catch(() => null);
-    
-        // Validate: same guild, top-level, text capable, not a thread/voice/category/DM
-        const isTextType = channel?.type === ChannelType.GuildText || channel?.type === ChannelType.GuildAnnouncement;
-        const sameGuild  = channel?.guildId === interaction.guildId;
-        const notThread  = !channel?.isThread?.();
-    
-        if (!channel || !sameGuild || !isTextType || !notThread || !channel.isTextBased?.()) {
-          return interaction.editReply('Pick a text channel in this server (not threads/voice/categories/DMs).');
-        }
-    
-        // Caller must have Manage Channels
-        const canManage =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
-          interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageChannels);
-        if (!canManage) {
-          return interaction.editReply('You need **Manage Channels** to set the clips channel.');
-        }
-    
-        // Bot must be able to post there
-        // Get a Guild instance (cached or fetched), then resolve "me"
-        const guild = interaction.guild ?? await interaction.client.guilds.fetch(interaction.guildId).catch(() => null);
-        const me    = guild?.members?.me ?? await guild?.members?.fetchMe?.().catch(() => null);
-        const botPerms = channel.permissionsFor(me?.id || interaction.client.user.id);
-    
-        if (!botPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
-          return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
-        }
-    
-        // Save config
-        await rtdb.ref(`guildConfig/${interaction.guildId}/clipsChannel`).set({
-          channelId: channel.id,
-          setBy: interaction.user.id,
-          updatedAt: admin.database.ServerValue.TIMESTAMP,
-        });
-    
-        return interaction.editReply(`✅ New clips will be posted in <#${channel.id}>.`);
-      } catch (err) {
-        console.error('/setclipschannel failed', err);
-        const msg = 'Sorry, something went wrong.';
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply({ content: msg }).catch(() => {});
-        } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
-        }
-      }
+      return handleSetClipsChannel(interaction);
     }
   } 
   // --- Button Handlers ---
@@ -2262,22 +2262,15 @@ async function maybeBroadcast(uid, postId, data) {
             
             const embed = buildClipDetailEmbed(item, nameMap);
             
-            const guild = await client.guilds.cache.get(guildId);
-            if (!guild) {
-                await flagRef.remove(); continue;
-            }
-            const channel = await guild.channels.fetch(channelId).catch(() => null);
-            if (!channel || !channel.isTextBased?.()) {
-                await flagRef.remove(); continue;
-            }
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (!channel || !channel.isTextBased?.()) { await flagRef.remove(); continue; }
             
-            const me = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
-            const botPerms = channel.permissionsFor(me);
-            if (!botPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
-                console.warn(`[broadcast] missing perms in ${guildId}/${channelId}, skipping`);
-                await flagRef.remove();
-                continue;
-            }
+            const guild = channel.guild;
+            const me = guild?.members.me ?? await guild?.members.fetchMe().catch(() => null);
+            if (!me) { await flagRef.remove(); continue; }
+
+            const ok = channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]);
+            if (!ok) { await flagRef.remove(); continue; }
 
             const msg = await channel.send({ embeds: [embed] });
             const postPath = `users/${uid}/posts/${postId}`;
