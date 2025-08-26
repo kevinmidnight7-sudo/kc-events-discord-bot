@@ -181,10 +181,10 @@ async function withTimeout(promise, ms, label='op'){
 // --- Interaction Ack Helpers ---
 function alreadyAcked(i) { return i.deferred || i.replied; }
 async function safeDefer(i, opts) { if (!alreadyAcked(i)) { try { await i.deferReply(opts); } catch {} } }
-async function safeReply(i, payload, ephemeral = true) {
+async function safeReply(i, payload) {
   try {
     if (alreadyAcked(i)) return await i.editReply(payload);
-    return await i.reply({ ...payload, ephemeral });
+    return await i.reply(payload);
   } catch {}
 }
 
@@ -1158,78 +1158,65 @@ async function loadCustomBadges(uid) {
 
 async function handleSetClipsChannel(interaction) {
   try {
-    // Must be used in a server
-    if (!interaction.inGuild?.() && !interaction.guildId) {
-      return interaction.reply({ content: 'Use this in a server, not DMs.', ephemeral: true });
+    // Must be in a server; ACK immediately so we don’t hit the 3s window.
+    if (!interaction.inGuild()) {
+      return interaction.reply({ content: 'Use this in a server, not DMs.', flags: 64 });
     }
+    await interaction.deferReply({ flags: 64 });
 
-    await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-    // Resolve the picked channel from options
+    // Get the selected channel from the option.
     const picked = interaction.options.getChannel('channel', true);
 
-    // Only allow normal text or announcement channels (no threads/voice/categories/DMs)
-    if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(picked.type)) {
-      return interaction.editReply('Pick a text or announcement channel (not threads/voice/categories/DMs).');
-    }
-    // Must be in the same guild
-    if (picked.guildId && interaction.guildId && picked.guildId !== interaction.guildId) {
+    // Must be a channel from THIS guild (not a different server).
+    if (picked.guildId !== interaction.guildId) {
       return interaction.editReply('That channel isn’t in this server.');
     }
 
-    // Resolve the guild (prefer the channel’s guild)
-    const guild =
-      picked.guild ??
-      interaction.guild ??
-      (interaction.guildId ? await interaction.client.guilds.fetch(interaction.guildId).catch(() => null) : null);
-
-    if (!guild) {
-      return interaction.editReply('Could not resolve this server. Try again.');
+    // Resolve a full Channel object via the global ChannelManager (reliable even if picked.guild is null).
+    const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
+    if (!chan || !chan.isTextBased?.()) {
+      return interaction.editReply('Pick a normal text or announcement channel I can post in (not a thread/voice/category).');
+    }
+    if (![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(chan.type)) {
+      return interaction.editReply('Pick a text or announcement channel (not a thread/voice/category).');
     }
 
-    // Check the invoker has Manage Server
-    let member = null;
-    if (interaction.member instanceof GuildMember) {
-      member = interaction.member;
-    } else {
-      member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    // Invoker needs Manage Server.
+    const invokerOk =
+      interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+      interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+    if (!invokerOk) {
+      return interaction.editReply('You need **Manage Server** to set this.');
     }
 
-    if (!member?.permissions?.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply('You need **Manage Server** to set the clips channel.');
-    }
-
-    // Resolve the bot member and verify bot perms in that channel
-    const me = guild.members?.me || await guild.members.fetchMe().catch(() => null);
+    // Check the bot’s perms IN THAT CHANNEL.
+    const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
     if (!me) {
-      return interaction.editReply('Could not resolve my bot member in this server.');
+      return interaction.editReply('I couldn’t resolve my own member record. Reinvite me or check my permissions.');
+    }
+    const botOk = chan.permissionsFor(me)?.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks
+    ]);
+    if (!botOk) {
+      return interaction.editReply('I need **View Channel**, **Send Messages** and **Embed Links** in that channel.');
     }
 
-    const need = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
-    const have = me.permissionsIn(picked);
-
-    if (!have?.has(need)) {
-      return interaction.editReply('I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.');
-    }
-
-    // Save to RTDB and update in-memory map
-    await rtdb.ref(`guildConfig/${guild.id}/clipsChannel`).set({
-      channelId: picked.id,
-      setBy: interaction.user.id,
-      setAt: admin.database.ServerValue.TIMESTAMP
+    // Save destination in RTDB: config/clipDestinations/<guildId> = { channelId, ... }
+    await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set({
+      channelId: chan.id,
+      updatedBy: interaction.user.id,
+      updatedAt: Date.now(),
     });
 
-    globalCache.clipDestinations.set(guild.id, picked.id);
-
-    return interaction.editReply(`✅ Set clips channel to <#${picked.id}>.`);
+    return interaction.editReply(`✅ New clips will be posted in <#${chan.id}>.`);
   } catch (err) {
     console.error('/setclipschannel failed', err);
-    const msg = 'Sorry, something went wrong.';
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg }).catch(() => {});
-    } else {
-      await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+      return interaction.editReply('Sorry, something went wrong.');
     }
+    return interaction.reply({ content: 'Sorry, something went wrong.', flags: 64 });
   }
 }
 
@@ -1237,6 +1224,8 @@ async function handleSetClipsChannel(interaction) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Channel],
 });
@@ -1421,7 +1410,7 @@ const MAX_AGE_MS = 15000; // be generous; we’ll still try to ack
 client.on('interactionCreate', async (interaction) => {
   if (!clientReady) {
     try {
-      await interaction.reply({ content: 'Starting up, try again in a second.', ephemeral: true });
+      await interaction.reply({ content: 'Starting up, try again in a second.', flags: 64 });
     } catch {}
     return;
   }
@@ -1447,7 +1436,7 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'link') {
       try {
         // This command is an immediate, ephemeral reply. This is its ACK.
-        await interaction.reply({ content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true });
+        await interaction.reply({ content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, flags: 64 });
       } catch (err) {
         console.error(`[${commandName}]`, err);
         // If the initial reply fails, there's nothing else to do.
@@ -1464,7 +1453,7 @@ client.on('interactionCreate', async (interaction) => {
         const msg = 'Sorry, something went wrong.';
         // If showing the modal fails, try to send a reply as a fallback.
         if (!interaction.replied) {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
       return;
@@ -1473,7 +1462,7 @@ client.on('interactionCreate', async (interaction) => {
     // --- All other commands are deferred ---
     if (commandName === 'whoami') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
         await interaction.editReply({ content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
       } catch (err) {
@@ -1482,13 +1471,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'dumpme') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
@@ -1524,13 +1513,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'leaderboard') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const rows = await loadLeaderboardData();
         const catIdx = 0, page = 0;
         const embed = buildLbEmbed(rows, catIdx, page);
@@ -1543,13 +1532,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'clips') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
         const all = await fetchAllPosts({ platform });
         if (!all.length) {
@@ -1569,13 +1558,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'messages') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
         const embed = buildMessagesEmbed(list || [], nameMap || new Map());
         await interaction.editReply({ content: '', embeds: [embed], components: messageIndexRows((list || []).length) });
@@ -1585,13 +1574,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'votingscores') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const scores = await loadVoteScores();
         const embed = buildVoteEmbed(scores);
         const row = new ActionRowBuilder().addComponents(
@@ -1604,13 +1593,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'badges') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const target = interaction.options.getUser('user') || interaction.user;
         const discordId = target.id;
         const kcUid = await getKCUidForDiscord(discordId);
@@ -1655,13 +1644,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'syncavatar') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
@@ -1688,13 +1677,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'post') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
@@ -1727,7 +1716,7 @@ client.on('interactionCreate', async (interaction) => {
             `• **Caption:** ${caption || '(none)'}`,
             publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
           ].join('\n'),
-          ephemeral: true,
+          flags: 64,
         });
       } catch (err) {
         console.error(`[${commandName}]`, err);
@@ -1735,13 +1724,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'postmessage') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
@@ -1760,13 +1749,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'help') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply({ flags: 64 }).catch(() => {});
         const embed = new EmbedBuilder()
             .setTitle('KC Events — Help')
             .setImage('https://kevinmidnight7-sudo.github.io/messageboardkc/link.png')
@@ -1786,13 +1775,13 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'compare') {
       try {
-        await interaction.deferReply({ ephemeral: isEphemeralCommand(commandName) }).catch(() => {});
+        await interaction.deferReply().catch(() => {});
         const youDiscordId = interaction.user.id;
         const otherUser = interaction.options.getUser('user');
         const youUid = await getKCUidForDiscord(youDiscordId);
@@ -1833,12 +1822,12 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply({ content: msg }).catch(() => {});
         } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
         }
       }
     }
     else if (commandName === 'setclipschannel') {
-      await handleSetClipsChannel(interaction);
+      return handleSetClipsChannel(interaction);
     }
   } 
   // --- Button Handlers ---
@@ -1863,7 +1852,7 @@ client.on('interactionCreate', async (interaction) => {
         const sid = id.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
-          return interaction.reply({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
+          return interaction.reply({ content: 'That action expired. Please reopen the clip.', flags: 64 });
         }
         const modal = new ModalBuilder()
           .setCustomId(`clips:commentModal:${sid}`)
@@ -1895,7 +1884,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (id.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
         }
 
         const [c, action, a, b] = id.split(':'); // c:<action>:...
@@ -1933,14 +1922,14 @@ client.on('interactionCreate', async (interaction) => {
         const shortId = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
         if (!payload) {
-          return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
+          return interaction.followUp({ content: 'Reaction expired. Reopen the clip and try again.', flags: 64 });
         }
 
         const { postPath, emoji } = payload;
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          return interaction.followUp({ content: 'Link your KC account with /link to react.', ephemeral: true });
+          return interaction.followUp({ content: 'Link your KC account with /link to react.', flags: 64 });
         }
 
         const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
@@ -1949,13 +1938,13 @@ client.on('interactionCreate', async (interaction) => {
 
         await rtdb.ref(`${postPath}/reactionCounts/${emoji}`).transaction(cur => (cur || 0) + (wasReacted ? -1 : 1));
 
-        try { await interaction.followUp({ content: '✅ Reaction updated.', ephemeral: true }); } catch {}
+        try { await interaction.followUp({ content: '✅ Reaction updated.', flags: 64 }); } catch {}
       }
       else if (id.startsWith('clips:reactors:')) {
         const sid = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
         if (!payload) {
-          return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
+          return interaction.followUp({ content: 'That list expired. Reopen the clip to refresh.', flags: 64 });
         }
         const { postPath } = payload;
 
@@ -1978,7 +1967,7 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /clips' });
 
-        await interaction.followUp({ embeds:[embed], ephemeral: true });
+        await interaction.followUp({ embeds:[embed], flags: 64 });
       }
       else if (id.startsWith('clips:comments:prev:') || id.startsWith('clips:comments:next:')) {
           const parts = id.split(':'); // ['clips','comments','prev|next', sid, page]
@@ -1986,7 +1975,7 @@ client.on('interactionCreate', async (interaction) => {
           const page = parseInt(parts[4], 10) || 0;
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
+              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', flags: 64 });
           }
           const { postPath } = payload;
           // find the clip item from state (fallback to direct read if needed)
@@ -2010,7 +1999,7 @@ client.on('interactionCreate', async (interaction) => {
           const sid = id.split(':')[2];
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
+              return interaction.followUp({ content: 'That comments list expired. Reopen the clip and try again.', flags: 64 });
           }
           const { postPath } = payload;
           const state = getClipsState(interaction);
@@ -2052,7 +2041,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+          return interaction.followUp({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
         }
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
@@ -2128,7 +2117,7 @@ client.on('interactionCreate', async (interaction) => {
         else if (action === 'like') {
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', ephemeral: true });
+          if (!uid) return await interaction.followUp({ content: 'Link your KC account first with /link.', flags: 64 });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 6000, `RTDB ${path}/likedBy`);
           const wasLiked = likedSnap.exists();
@@ -2158,14 +2147,14 @@ client.on('interactionCreate', async (interaction) => {
       console.error(`[button:${id}]`, err);
       // For buttons, we can't edit the reply with content, so a followup is best
       const msg = 'Sorry, something went wrong.';
-      await interaction.followUp({ content: msg, ephemeral: true }).catch(() => {});
+      await interaction.followUp({ content: msg, flags: 64 }).catch(() => {});
     }
   }
   // --- Modal Submissions ---
   else if (interaction.isModalSubmit()) {
     const { customId } = interaction;
     try {
-      await interaction.deferReply({ ephemeral: true }).catch(() => {});
+      await interaction.deferReply({ flags: 64 }).catch(() => {});
 
       if (customId.startsWith('clips:commentModal:')) {
         const sid = customId.split(':')[2];
@@ -2250,7 +2239,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: msg }).catch(() => {});
       } else {
-        await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+        await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
       }
     }
   }
@@ -2327,29 +2316,29 @@ function attachPostsListener(uid) {
 }
 
 // ---------- Startup ----------
-client.once('ready', async () => {
+client.on('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
-  const snap = await rtdb.ref('guildConfig').get();
+  const snap = await rtdb.ref('config/clipDestinations').get();
   if (snap.exists()) {
     snap.forEach(g => {
       const guildId = g.key;
-      const channelId = g.child('clipsChannel/channelId').val();
+      const channelId = g.val()?.channelId;
       if (channelId) globalCache.clipDestinations.set(guildId, channelId);
     });
   }
   console.log('[broadcast] loaded initial clip destinations:', globalCache.clipDestinations.size);
 
-  rtdb.ref('guildConfig').on('child_added', s => {
-    const ch = s.child('clipsChannel/channelId').val();
+  rtdb.ref('config/clipDestinations').on('child_added', s => {
+    const ch = s.val()?.channelId;
     if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] added channel for guild ${s.key}`); }
   });
-  rtdb.ref('guildConfig').on('child_changed', s => {
-    const ch = s.child('clipsChannel/channelId').val();
+  rtdb.ref('config/clipDestinations').on('child_changed', s => {
+    const ch = s.val()?.channelId;
     if (ch) { globalCache.clipDestinations.set(s.key, ch); console.log(`[broadcast] updated channel for guild ${s.key}`); }
   });
-  rtdb.ref('guildConfig').on('child_removed', s => {
+  rtdb.ref('config/clipDestinations').on('child_removed', s => {
     globalCache.clipDestinations.delete(s.key);
     console.log(`[broadcast] removed channel for guild ${s.key}`);
   });
