@@ -705,11 +705,14 @@ function clipsDetailRows(interactionOrMessage, postPath) {
   const rows = [];
   const row1 = new ActionRowBuilder();
   const client = interactionOrMessage.client;
+  // Determine the message used for caching. If interactionOrMessage is a button interaction,
+  // its .message property contains the underlying Message. Otherwise it is already a Message.
+  const targetMessage = interactionOrMessage.message ?? interactionOrMessage;
 
   for (const emo of POST_EMOJIS) {
     const sid = _cacheForMessage(
       client.reactCache,
-      interactionOrMessage,
+      targetMessage,
       { postPath, emoji: emo }
     );
     row1.addComponents(
@@ -723,11 +726,11 @@ function clipsDetailRows(interactionOrMessage, postPath) {
 
   const sidView = _cacheForMessage(
     client.reactorsCache,
-    interactionOrMessage,
+    targetMessage,
     { postPath }
   );
   
-  const sidComments = _cacheForMessage(client.commentsCache, interactionOrMessage, { postPath, page: 0 });
+  const sidComments = _cacheForMessage(client.commentsCache, targetMessage, { postPath, page: 0 });
 
   const commentSid = cacheModalTarget({ postPath });
   const row2 = new ActionRowBuilder().addComponents(
@@ -1166,18 +1169,22 @@ async function handleSetClipsChannel(interaction) {
     await interaction.deferReply({ ephemeral: true });
 
     const picked = interaction.options.getChannel('channel', true);
-
-    // Must be this guild and not a thread
-    if (picked.guildId !== interaction.guildId) {
+    // Re-fetch via the global ChannelManager to avoid partials/null guild references.
+    const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
+    if (!chan) {
+      return interaction.editReply('Could not resolve that channel.');
+    }
+    // Channel must be in this guild
+    if (chan.guildId !== interaction.guildId) {
       return interaction.editReply('That channel isn’t in this server.');
     }
-    if (picked.isThread && picked.isThread()) {
+    // Disallow threads: .isThread may be a method or boolean
+    const pickedIsThread = typeof chan.isThread === 'function' ? chan.isThread() : chan.isThread;
+    if (pickedIsThread) {
       return interaction.editReply('Pick a text channel, not a thread.');
     }
-
-    // Re-fetch via the global ChannelManager to avoid partials/null guild references
-    const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
-    if (!chan || !chan.isTextBased?.()) {
+    // Ensure we can post there (must be text/announcement)
+    if (!chan.isTextBased?.()) {
       return interaction.editReply('Pick a text or announcement channel I can post in.');
     }
 
@@ -1861,8 +1868,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // All other buttons can be responded to directly. We no longer call deferUpdate(),
-      // because subsequent calls to update() or reply() will handle the response.
+      // We no longer defer updates here. Subsequent update() or reply() calls will handle the response.
       
       if (id.startsWith('lb:')) {
         const [, , catStr, pageStr] = id.split(':');
@@ -1878,7 +1884,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (id.startsWith('c:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          // If the user is not the invoker, reply with an error. Use reply() since we removed deferUpdate().
+          // Only the person who invoked the command may use these controls. Reply with an error.
           return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
         }
 
@@ -1917,7 +1923,7 @@ client.on('interactionCreate', async (interaction) => {
         const shortId = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
         if (!payload) {
-          // No payload means the reaction has expired. Reply immediately.
+          // If the cache entry is missing, inform the user via a reply (do not followUp).
           return interaction.reply({ content: 'Reaction expired. Reopen the clip and try again.', flags: 64 });
         }
 
@@ -1925,7 +1931,7 @@ client.on('interactionCreate', async (interaction) => {
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          // User must link their KC account first. Reply instead of followUp.
+          // Ask the user to link their KC account via a reply.
           return interaction.reply({ content: 'Link your KC account with /link to react.', flags: 64 });
         }
 
@@ -1941,7 +1947,7 @@ client.on('interactionCreate', async (interaction) => {
         const sid = id.split(':')[2];
         const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
         if (!payload) {
-          // The reactors list has expired. Reply with a message.
+          // Cache expired; notify via reply.
           return interaction.reply({ content: 'That list expired. Reopen the clip to refresh.', flags: 64 });
         }
         const { postPath } = payload;
@@ -1965,7 +1971,7 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /clips' });
 
-        // Send the embed as a reply rather than followUp since we didn't defer.
+        // Send the embed as a reply rather than followUp.
         await interaction.reply({ embeds:[embed], flags: 64 });
       }
       else if (id.startsWith('clips:comments:prev:') || id.startsWith('clips:comments:next:')) {
@@ -1974,7 +1980,7 @@ client.on('interactionCreate', async (interaction) => {
           const page = parseInt(parts[4], 10) || 0;
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              // Comments list expired. Send reply.
+              // Notify user when cached comments list has expired.
               return interaction.reply({ content: 'That comments list expired. Reopen the clip and try again.', flags: 64 });
           }
           const { postPath } = payload;
@@ -1999,7 +2005,7 @@ client.on('interactionCreate', async (interaction) => {
           const sid = id.split(':')[2];
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              // Comments list expired. Reply accordingly.
+              // If no cached payload, inform the user to reopen the clip.
               return interaction.reply({ content: 'That comments list expired. Reopen the clip and try again.', flags: 64 });
           }
           const { postPath } = payload;
@@ -2042,7 +2048,7 @@ client.on('interactionCreate', async (interaction) => {
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          // Only the command invoker may use these controls. Reply with an error.
+          // Reply when someone else tries to use these controls.
           return interaction.reply({ content: 'Only the person who ran this command can use these controls.', flags: 64 });
         }
         const key = interaction.message.interaction?.id || '';
@@ -2147,8 +2153,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     } catch (err) {
       console.error(`[button:${id}]`, err);
-      // For buttons, send an error reply. Using reply() ensures we don't run into
-      // InteractionAlreadyReplied errors now that deferUpdate() has been removed.
+      // For buttons, send an error via reply. This avoids InteractionAlreadyReplied errors.
       const msg = 'Sorry, something went wrong.';
       await interaction.reply({ content: msg, flags: 64 }).catch(() => {});
     }
