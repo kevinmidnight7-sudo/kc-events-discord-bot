@@ -81,7 +81,7 @@ const globalCache = {
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel']).has(name);
+  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -1298,6 +1298,20 @@ const clipsCmd = new SlashCommandBuilder()
      .setRequired(false)
   );
 
+const latestFiveCmd = new SlashCommandBuilder()
+  .setName('latestfive')
+  .setDescription('Post the 5 most recently uploaded clips here')
+  .addStringOption(o =>
+    o.setName('platform')
+     .setDescription('Filter by platform')
+     .addChoices(
+       { name: 'All', value: 'all' },
+       { name: 'YouTube', value: 'youtube' },
+       { name: 'TikTok', value: 'tiktok' },
+     )
+     .setRequired(false)
+  );
+
 const messagesCmd = new SlashCommandBuilder()
   .setName('messages')
   .setDescription('Show the latest 10 messageboard posts');
@@ -1378,7 +1392,8 @@ const setClipsChannelCmd = new SlashCommandBuilder()
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
-  avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd
+  avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
+  latestFiveCmd
 ].map(c => c.toJSON());
 
 
@@ -1516,6 +1531,41 @@ client.on('interactionCreate', async (interaction) => {
             interaction.client.clipsCache.set(interaction.id, state);
             const embed = buildClipsListEmbed(list, 0, nameMap);
             await safeReply(interaction, { content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
+        }
+        else if (commandName === 'latestfive') {
+            const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
+            const all = await fetchAllPosts({ platform });
+            if (!all.length) {
+              return await safeReply(interaction, { content: 'No clips found.' });
+            }
+        
+            all.sort((a, b) => (b.data?.createdAt || 0) - (a.data?.createdAt || 0));
+            const list = all.slice(0, 5);
+        
+            const nameMap = await getAllUserNames();
+        
+            const channel = interaction.channel;
+            const me = interaction.guild?.members.me ?? await interaction.guild?.members.fetchMe().catch(() => null);
+            if (!me || !channel?.permissionsFor(me)?.has([
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.EmbedLinks,
+            ])) {
+              return await safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** here.' });
+            }
+        
+            for (const item of list) {
+              const embed = buildClipDetailEmbed(item, nameMap);
+              const msg = await channel.send({ embeds: [embed] });
+        
+              const postPath = clipDbPath(item);
+              const rows = clipsDetailRows(msg, postPath);
+              await msg.edit({ components: rows });
+        
+              await new Promise(r => setTimeout(r, 300));
+            }
+        
+            await safeReply(interaction, { content: `Posted ${list.length} latest clip${list.length > 1 ? 's' : ''} here.` });
         }
         else if (commandName === 'messages') {
             const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
@@ -2266,3 +2316,4 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     process.exit(1);
   });
 })();
+
