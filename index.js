@@ -37,7 +37,9 @@ const {
   ChannelType, PermissionFlagsBits, GuildMember,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
-  EmbedBuilder
+  EmbedBuilder,
+  // add this:
+  StringSelectMenuBuilder
 } = require('discord.js');
 
 const admin = require('firebase-admin');
@@ -329,6 +331,31 @@ async function postsDisabledGlobally() {
 }
 
 // ----- Shared helpers for new commands -----
+
+// ----- START: Clan Helper Functions -----
+function getUserScores(uid, usersData, badgesData) {
+  const user = usersData[uid] || {};
+  const stats = user.stats || {};
+  const b = badgesData[uid] || {};
+  const offence = Number(stats.offence ?? b.offence ?? 0) || 0;
+  const defence = Number(stats.defence ?? b.defence ?? 0) || 0;
+  const overall = Number(stats.overall ?? b.overall ?? 0) || 0;
+  return { offence, defence, overall, total: offence + defence + overall };
+}
+
+function computeClanScore(clan, usersData, badgesData) {
+  if (!clan || !clan.members) return 0;
+  let sum = 0;
+  for (const uid of Object.keys(clan.members)) {
+    sum += getUserScores(uid, usersData, badgesData).total;
+  }
+  return sum;
+}
+// ----- END: Clan Helper Functions -----
+
+// Helper to clamp string lengths
+const clamp = (s, n=100) => (s || '').toString().slice(0, n);
+
 function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
 
 function countReactions(reactionsObj = {}) {
@@ -1389,11 +1416,17 @@ const setClipsChannelCmd = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+// Clan listing command
+const clansCmd = new SlashCommandBuilder()
+  .setName('clans')
+  .setDescription('Browse KC clans and view details');
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
   avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
-  latestFiveCmd
+  latestFiveCmd,
+  clansCmd // <-- add the clans command here
 ].map(c => c.toJSON());
 
 
@@ -1472,6 +1505,7 @@ client.on('interactionCreate', async (interaction) => {
     
     // --- All other commands are deferred ---
     try {
+        // Defer once for all commands that reach here
         await safeDefer(interaction, { ephemeral });
 
         if (commandName === 'whoami') {
@@ -1744,6 +1778,64 @@ client.on('interactionCreate', async (interaction) => {
         }
         else if (commandName === 'setclipschannel') {
             return handleSetClipsChannel(interaction);
+        }
+        else if (commandName === 'clans') {
+          // fetch clans, users and badges from RTDB
+          const [clansSnap, usersSnap, badgesSnap] = await Promise.all([
+            withTimeout(rtdb.ref('clans').get(), 6000, 'RTDB clans'),
+            withTimeout(rtdb.ref('users').get(), 6000, 'RTDB users'),
+            withTimeout(rtdb.ref('badges').get(), 6000, 'RTDB badges'),
+          ]);
+          const clansData = clansSnap.val() || {};
+          const usersData = usersSnap.val() || {};
+          const badgesData = badgesSnap.val() || {};
+        
+          // build an array of clans with memberCount and score
+          const entries = Object.entries(clansData).map(([id, clan]) => {
+            const memberCount = clan.members ? Object.keys(clan.members).length : 0;
+            const score = computeClanScore(clan, usersData, badgesData);
+            return { id, ...clan, memberCount, score };
+          });
+        
+          if (entries.length === 0) {
+            return safeReply(interaction, { content: 'There are no clans yet.', embeds: [] });
+          }
+        
+          // sort by score (desc) and pick the top 20
+          entries.sort((a, b) => b.score - a.score);
+          const top = entries.slice(0, 20);
+        
+          // build select menu options, clamping lengths
+          const options = top.map(c => ({
+            label: clamp(c.name, 100),
+            description: clamp(`${c.memberCount} members • ${c.score} points`, 100),
+            value: c.id,
+          }));
+        
+          const select = new StringSelectMenuBuilder()
+            .setCustomId(`clans_select:${interaction.id}`)
+            .setPlaceholder('Select a clan to view details')
+            .addOptions(options);
+        
+          // store data in a cache keyed by the interaction ID
+          interaction.client.clanCache ??= new Map();
+          interaction.client.clanCache.set(interaction.id, {
+            entries,
+            usersData,
+            badgesData,
+          });
+        
+          // send an embed with the menu
+          const embed = new EmbedBuilder()
+            .setTitle('KC Clans')
+            .setDescription('Select a clan below to view its members, owner, description and score.')
+            .setColor(DEFAULT_EMBED_COLOR);
+        
+          await safeReply(interaction, {
+            content: '',
+            embeds: [embed],
+            components: [ new ActionRowBuilder().addComponents(select) ],
+          });
         }
 
     } catch (err) {
@@ -2078,6 +2170,70 @@ client.on('interactionCreate', async (interaction) => {
       await safeReply(interaction, { content: msg, ephemeral: true }).catch(() => {});
     }
   }
+  // --- Select Menu Handlers ---
+  else if (interaction.isStringSelectMenu()) {
+    const [prefix, parentInteractionId] = interaction.customId.split(':');
+  
+    // only handle clan selection menus
+    if (prefix !== 'clans_select') return;
+  
+    const clanId = interaction.values[0];
+    const cache = interaction.client.clanCache?.get(parentInteractionId);
+    if (!cache) {
+      // Consider re-running the load logic here instead of just replying
+      return interaction.reply({ content: 'Clan data has expired.  Run `/clans` again.',
+                                ephemeral: true });
+    }
+  
+    const { entries, usersData, badgesData } = cache;
+    const clan = entries.find(c => c.id === clanId);
+    if (!clan) {
+      return interaction.update({ content: 'Clan not found.', embeds: [], components: [] });
+    }
+  
+    // build member display names
+    let memberNames = '';
+    if (clan.members) {
+      memberNames = Object.keys(clan.members)
+        .map(uid => usersData[uid]?.displayName || uid)
+        .join(', ');
+      if (memberNames.length > 1024) {
+        memberNames = memberNames.slice(0, 1020) + '…';
+      }
+    }
+  
+    const owner = usersData[clan.owner] || {};
+  
+    // recompute score in case it is needed
+    const score = computeClanScore(clan, usersData, badgesData);
+  
+    const detailEmbed = new EmbedBuilder()
+      .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
+      .setDescription(clan.description || 'No description provided.')
+      // Add guard for icon URL
+      // .setThumbnail(clan.icon) // Original line
+      .addFields(
+        { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
+        { name: 'Points', value: `${score}`, inline: true },
+        { name: 'Members', value: memberNames || 'No members', inline: false },
+      )
+      .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
+      .setColor(DEFAULT_EMBED_COLOR);
+
+    // Guard missing/invalid icon URL on the embed
+    if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
+      detailEmbed.setThumbnail(clan.icon);
+    }
+  
+    await interaction.update({
+      content: '',
+      embeds: [detailEmbed],
+      components: [], // remove the select menu once a clan is chosen
+    });
+
+    // Delete the cache after selection
+    interaction.client.clanCache?.delete(parentInteractionId);
+  }
   // --- Modal Submissions ---
   else if (interaction.isModalSubmit()) {
     const { customId } = interaction;
@@ -2316,4 +2472,3 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     process.exit(1);
   });
 })();
-
