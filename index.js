@@ -21,6 +21,15 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
 
+// --- PATCH (Step 5): Add global error hooks ---
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandledRejection]", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+// --- END PATCH ---
+
 console.log('ENV sanity', {
   hasToken: !!process.env.DISCORD_BOT_TOKEN,
   hasClient: !!process.env.DISCORD_CLIENT_ID,
@@ -181,22 +190,123 @@ async function withTimeout(promise, ms, label='op'){
 }
 
 // --- Interaction Ack Helpers ---
-function alreadyAcked(i) { return i.deferred || i.replied; }
-async function safeDefer(i, opts) { if (!alreadyAcked(i)) { try { await i.deferReply(opts); } catch {} } }
-async function safeReply(i, payload) {
-  try {
-    if (alreadyAcked(i)) return await i.editReply(payload);
-    return await i.reply(payload);
-  } catch (err) {
-      // Handle 50027: Invalid Webhook Token as a last resort
-      if (err.code === 50027) {
-          console.warn(`[safeReply] Caught 50027, falling back to channel.send for command: ${i.commandName}`);
-          try {
-              await i.channel?.send(payload);
-          } catch {}
-      }
-  }
+// --- PATCH (Step 1): Replace reply helpers ---
+/**
+ * Acknowledge the interaction if not already acknowledged.
+ * - For slash commands: use deferReply({ ephemeral? })
+ * - For components: use deferUpdate() if you intend to update the same message,
+ *   or skip deferring and call .reply(...) once with content.
+ */
+async function safeDefer(interaction, opts = {}) {
+  try {
+    // Already acknowledged
+    if (interaction.deferred || interaction.replied) return;
+
+    // Chat input command
+    // --- FIX (Item 6): Use interaction.isChatInputCommand() ---
+    if (interaction.isChatInputCommand()) {
+      return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
+    }
+
+    // Components (Buttons/Selects)
+    // --- FIX (Item 6): Use interaction.isMessageComponent() ---
+    if (interaction.isMessageComponent()) {
+      // ONLY use deferUpdate if you *will* update() the existing message.
+      if (opts.intent === "update") {
+        return await interaction.deferUpdate();
+      }
+      // else: do not defer here. You will use interaction.reply(...) once.
+      return;
+    }
+    
+    // Modals
+    // --- FIX (Item 6): Use interaction.isModalSubmit() ---
+    if (interaction.isModalSubmit()) {
+      return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
+    }
+  } catch (err) {
+    console.error("safeDefer error:", err);
+    // Don't throw, as we want the handler to attempt a safeReply
+  }
 }
+
+/**
+ * Send the correct response method based on current interaction state.
+ * Rules (Discord API):
+ * - If we deferred with deferReply(), we must finish with editReply() or followUp().
+ * - If we already replied once, additional output must be followUp().
+ * - If we never acknowledged, we can reply() once.
+ * - For components when we used deferUpdate(), finish with update() on the same message;
+ *   otherwise use reply()/followUp() (but never both).
+ */
+async function safeReply(interaction, options) {
+  try {
+    // Component interactions (buttons/selects)
+    // --- FIX (Item 6): Use interaction.isMessageComponent() ---
+    if (interaction.isMessageComponent()) {
+      // If we deferred update earlier (deferUpdate), we must call update() here
+      // to modify the same original message content/components.
+      // Note: interaction.deferred is true after deferUpdate()
+      if (interaction.deferred && !interaction.replied) {
+        // UPDATE THE SAME MESSAGE
+        return await interaction.update(options);
+      }
+
+      // If we already replied (e.g. ephemeral prompt), any subsequent output
+      // must be followUp()
+      if (interaction.replied) {
+        return await interaction.followUp(options);
+      }
+
+      // Fresh component without a defer: we can reply now
+      // This is used for ephemeral errors or new messages from components
+      return await interaction.reply(options);
+    }
+
+    // Slash commands & Modal Submissions
+    // (interaction.deferred is true after deferReply)
+    if (interaction.deferred) {
+      // We already deferred the *initial* reply -> must editReply or followUp
+      if (interaction.replied) {
+        return await interaction.followUp(options);
+      }
+      return await interaction.editReply(options);
+    }
+
+    if (interaction.replied) {
+      return await interaction.followUp(options);
+    }
+
+    // Initial reply (no defer, no reply yet)
+    return await interaction.reply(options);
+  } catch (err) {
+    console.error("safeReply error", {
+      deferred: interaction.deferred,
+      replied: interaction.replied,
+      // --- FIX (Item 6): Use interaction.isX() ---
+      isChatInput: interaction.isChatInputCommand(),
+      isComponent: interaction.isMessageComponent(),
+      isModal: interaction.isModalSubmit(),
+      preview: typeof options === "object" ? {
+        hasContent: !!options?.content,
+        embeds: Array.isArray(options?.embeds) ? options.embeds.length : 0,
+        components: Array.isArray(options?.components) ? options.components.length : 0,
+        ephemeral: !!options?.ephemeral
+      } : options
+    }, err);
+    // As a last resort, try a followup if editReply/reply failed
+    if (err.code !== 10062) { // 10062 = Unknown interaction (too old)
+        try {
+            if (!interaction.replied) {
+                await interaction.followUp(options);
+            }
+        } catch (e) {
+            console.error("safeReply followup failed", e);
+        }
+    }
+  }
+}
+// --- END PATCH (Step 1) ---
 
 
 async function hasEmerald(uid) {
@@ -740,11 +850,14 @@ function clipsDetailRows(interactionOrMessage, postPath) {
   const rows = [];
   const row1 = new ActionRowBuilder();
   const client = interactionOrMessage.client;
+  
+  // Use interaction.message if available (from button), otherwise interaction (from slash command reply)
+  const message = interactionOrMessage.message || interactionOrMessage;
 
   for (const emo of POST_EMOJIS) {
     const sid = _cacheForMessage(
       client.reactCache,
-      interactionOrMessage,
+      message, // Use the message object
       { postPath, emoji: emo }
     );
     row1.addComponents(
@@ -758,11 +871,15 @@ function clipsDetailRows(interactionOrMessage, postPath) {
 
   const sidView = _cacheForMessage(
     client.reactorsCache,
-    interactionOrMessage,
+    message, // Use the message object
     { postPath }
   );
   
-  const sidComments = _cacheForMessage(client.commentsCache, interactionOrMessage, { postPath, page: 0 });
+  const sidComments = _cacheForMessage(
+    client.commentsCache, 
+    message, // Use the message object
+    { postPath, page: 0 }
+  );
 
   const commentSid = cacheModalTarget({ postPath });
   const row2 = new ActionRowBuilder().addComponents(
@@ -779,7 +896,7 @@ function clipsDetailRows(interactionOrMessage, postPath) {
       .setLabel('💬 Comment')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('clips:back')
+      .setCustomId('clips:back') // Changed from 'c:b' to be specific
       .setLabel('Back to list')
       .setStyle(ButtonStyle.Secondary),
   );
@@ -819,9 +936,11 @@ function buildClipCommentsEmbed(item, comments, page, nameMap) {
             return `${start + i + 1}) **${displayName}** — ${truncatedText}  *(${time})*`;
         }).join('\n')
         : "No comments yet.";
+    
+    const caption = item.data?.caption || 'Clip';
 
     return new EmbedBuilder()
-        .setTitle(`Comments — "${item.data.caption}"`)
+        .setTitle(`Comments — "${caption.slice(0, 200)}"`)
         .setDescription(description)
         .setColor(DEFAULT_EMBED_COLOR)
         .setFooter({ text: 'KC Bot • /clips' });
@@ -848,7 +967,7 @@ function commentsRows(sid, page, maxPage) {
     }
     row.addComponents(
         new ButtonBuilder()
-            .setCustomId('clips:back')
+            .setCustomId('clips:backDetail') // Go back to clip detail, not list
             .setLabel('Back to clip')
             .setStyle(ButtonStyle.Secondary)
     );
@@ -1047,6 +1166,7 @@ async function getKCProfile(uid) {
   let postLines = [];
   if (postingAllowed && posts) {
     const list = Object.entries(posts)
+      .filter(([,p]) => p && !p.draft && (!p.publishAt || p.publishAt < Date.now())) // Filter out drafts/scheduled
       .sort((a, b) => (b[1]?.createdAt || 0) - (a[1]?.createdAt || 0))
       .slice(0, 3);
 
@@ -1191,28 +1311,28 @@ async function loadCustomBadges(uid) {
   return out.slice(0, 10); // clamp to fit embed field
 }
 
+// --- PATCH (Step 2/4): This function is now wrapped by the try/catch in the main handler
 async function handleSetClipsChannel(interaction) {
-  await safeDefer(interaction, { ephemeral: true });
-
-  try {
     if (!interaction.inGuild()) {
-      return safeReply(interaction, { content: 'Run this in a server.' });
+      return safeReply(interaction, { content: 'Run this in a server.', ephemeral: true });
     }
 
     const picked = interaction.options.getChannel('channel', true);
 
     // Must be this guild and not a thread
     if (picked.guildId !== interaction.guildId) {
-      return safeReply(interaction, { content: 'That channel isn’t in this server.' });
+      return safeReply(interaction, { content: 'That channel isn’t in this server.', ephemeral: true });
     }
-    if (picked.isThread && picked.isThread()) {
-      return safeReply(interaction, { content: 'Pick a text channel, not a thread.' });
+    // --- FIX (Item 3): Robust thread check ---
+    if (typeof picked.isThread === 'function' && picked.isThread()) {
+      return safeReply(interaction, { content: 'Pick a text channel, not a thread.', ephemeral: true });
     }
+    // --- END FIX ---
 
     // Re-fetch via the global ChannelManager to avoid partials/null guild references
     const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
     if (!chan || !chan.isTextBased?.()) {
-      return safeReply(interaction, { content: 'Pick a text or announcement channel I can post in.' });
+      return safeReply(interaction, { content: 'Pick a text or announcement channel I can post in.', ephemeral: true });
     }
 
     // Invoker must have Manage Server
@@ -1220,13 +1340,13 @@ async function handleSetClipsChannel(interaction) {
       interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
       interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
     if (!invokerOk) {
-      return safeReply(interaction, { content: 'You need the **Manage Server** permission to set this.' });
+      return safeReply(interaction, { content: 'You need the **Manage Server** permission to set this.', ephemeral: true });
     }
 
     // Bot perms in that channel
     const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
     if (!me) {
-      return safeReply(interaction, { content: 'I couldn’t resolve my member record. Reinvite me or check my permissions.' });
+      return safeReply(interaction, { content: 'I couldn’t resolve my member record. Reinvite me or check my permissions.', ephemeral: true });
     }
     const botOk = chan.permissionsFor(me).has([
       PermissionFlagsBits.ViewChannel,
@@ -1234,7 +1354,7 @@ async function handleSetClipsChannel(interaction) {
       PermissionFlagsBits.EmbedLinks,
     ]);
     if (!botOk) {
-      return safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.' });
+      return safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.', ephemeral: true });
     }
 
     // PATCH: Write to the correct RTDB path with the correct structure
@@ -1245,11 +1365,7 @@ async function handleSetClipsChannel(interaction) {
     });
     globalCache.clipDestinations.set(interaction.guildId, chan.id);
 
-    return safeReply(interaction, { content: `✅ Clips will be posted in <#${chan.id}>.` });
-  } catch (e) {
-    console.error('/setclipschannel failed', e);
-    await safeReply(interaction, { content: 'Something went wrong while saving.' });
-  }
+    return safeReply(interaction, { content: `✅ Clips will be posted in <#${chan.id}>.`, ephemeral: true });
 }
 
 // ---------- Discord Client ----------
@@ -1286,7 +1402,10 @@ function _cacheForMessage(map, message, payload, ttlMs = 10 * 60 * 1000) {
   return short;
 }
 function _readFromCache(map, message, shortId) {
-  return map.get(`${message.id}|${shortId}`) || null;
+  // PATCH: Ensure message is valid before accessing .id
+  const msgId = message?.id;
+  if (!msgId) return null;
+  return map.get(`${msgId}|${shortId}`) || null;
 }
 
 // ---------- Slash Commands (definitions) ----------
@@ -1457,7 +1576,8 @@ const MAX_AGE_MS = 15000; // be generous; we’ll still try to ack
 client.on('interactionCreate', async (interaction) => {
   if (!clientReady) {
     try {
-      await interaction.reply({ content: 'Starting up, try again in a second.', ephemeral: true });
+      // Use safeReply for consistency, though reply is fine here
+      await safeReply(interaction, { content: 'Starting up, try again in a second.', ephemeral: true });
     } catch {}
     return;
   }
@@ -1484,39 +1604,39 @@ client.on('interactionCreate', async (interaction) => {
     // Commands that don't defer (they reply or show a modal immediately)
     if (commandName === 'link') {
       try {
-        await interaction.reply({ content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true });
+        await safeReply(interaction, { content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true });
       } catch (err) {
         console.error(`[${commandName}]`, err);
+        // Final fallback
+        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
       }
       return;
     }
     
     if (commandName === 'vote') {
       try {
+        // This command replies with a modal
         await showVoteModal(interaction);
       } catch (err) {
         console.error(`[${commandName}]`, err);
-        if (!alreadyAcked(interaction)) {
-          await interaction.reply({ content: 'Sorry, something went wrong.', ephemeral: true }).catch(() => {});
-        }
+        // If showModal fails, we must send a reply
+        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
       }
       return;
     }
     
-    // --- All other commands are deferred ---
+    // --- PATCH (Step 2/4): All other commands are deferred and wrapped ---
+    await safeDefer(interaction, { ephemeral });
     try {
-        // Defer once for all commands that reach here
-        await safeDefer(interaction, { ephemeral });
-
         if (commandName === 'whoami') {
             const kcUid = await getKCUidForDiscord(interaction.user.id) || 'not linked';
-            await safeReply(interaction, { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\`` });
+            await safeReply(interaction, { content: `Discord ID: \`${interaction.user.id}\`\nKC UID: \`${kcUid}\``, ephemeral: true });
         }
         else if (commandName === 'dumpme') {
             const discordId = interaction.user.id;
             const uid = await getKCUidForDiscord(discordId);
             if (!uid) {
-                return await safeReply(interaction, { content: 'Not linked. Run `/link` first.' });
+                return await safeReply(interaction, { content: 'Not linked. Run `/link` first.', ephemeral: true });
             }
             const [userRT, badgesRT, postsRT] = await Promise.all([
                 withTimeout(rtdb.ref(`users/${uid}`).get(), 6000, `RTDB users/${uid}`),
@@ -1541,7 +1661,10 @@ client.on('interactionCreate', async (interaction) => {
                 rtdb: { user: brief(userRT), badges: brief(badgesRT), postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0 },
                 firestore: { userExists: userFS.exists, userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [], postsCount: postsFS.size }
             };
-            await safeReply(interaction, { content: '```json\n' + JSON.stringify(payload, null, 2).slice(0, 1900) + '\n```' });
+            // --- FIX (Item 1): Fix unterminated string ---
+            const json = "```json\n" + JSON.stringify(payload, null, 2) + "\n```";
+            await safeReply(interaction, { content: json, ephemeral: true });
+            // --- END FIX ---
         }
         else if (commandName === 'leaderboard') {
             const rows = await loadLeaderboardData();
@@ -1561,7 +1684,7 @@ client.on('interactionCreate', async (interaction) => {
             const list = all.slice(0, CLIPS.MAX_LIST);
             const nameMap = await getAllUserNames();
             interaction.client.clipsCache ??= new Map();
-            const state = { list, nameMap, page: 0 };
+            const state = { list, nameMap, page: 0, currentPostPath: null }; // Add currentPostPath
             interaction.client.clipsCache.set(interaction.id, state);
             const embed = buildClipsListEmbed(list, 0, nameMap);
             await safeReply(interaction, { content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
@@ -1570,7 +1693,7 @@ client.on('interactionCreate', async (interaction) => {
             const platform = (interaction.options.getString('platform') || 'all').toLowerCase();
             const all = await fetchAllPosts({ platform });
             if (!all.length) {
-              return await safeReply(interaction, { content: 'No clips found.' });
+              return await safeReply(interaction, { content: 'No clips found.', ephemeral: true });
             }
         
             all.sort((a, b) => (b.data?.createdAt || 0) - (a.data?.createdAt || 0));
@@ -1585,21 +1708,26 @@ client.on('interactionCreate', async (interaction) => {
               PermissionFlagsBits.SendMessages,
               PermissionFlagsBits.EmbedLinks,
             ])) {
-              return await safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** here.' });
+              return await safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** here.', ephemeral: true });
             }
         
+            // Send initial reply *before* looping
+            await safeReply(interaction, { content: `Posting ${list.length} latest clip${list.length > 1 ? 's' : ''}...`, ephemeral: true });
+
             for (const item of list) {
               const embed = buildClipDetailEmbed(item, nameMap);
+              // Use followUp (via safeReply) or channel.send for subsequent messages
               const msg = await channel.send({ embeds: [embed] });
         
               const postPath = clipDbPath(item);
-              const rows = clipsDetailRows(msg, postPath);
+              const rows = clipsDetailRows(msg, postPath); // Pass the message object
               await msg.edit({ components: rows });
         
               await new Promise(r => setTimeout(r, 300));
             }
         
-            await safeReply(interaction, { content: `Posted ${list.length} latest clip${list.length > 1 ? 's' : ''} here.` });
+            // Final update to the original reply
+            await safeReply(interaction, { content: `✅ Posted ${list.length} latest clip${list.length > 1 ? 's' : ''} here.`, ephemeral: true });
         }
         else if (commandName === 'messages') {
             const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
@@ -1658,36 +1786,36 @@ client.on('interactionCreate', async (interaction) => {
             const discordId = interaction.user.id;
             const uid = await getKCUidForDiscord(discordId);
             if (!uid) {
-                return await safeReply(interaction, { content: 'You are not linked. Use `/link` first.' });
+                return await safeReply(interaction, { content: 'You are not linked. Use `/link` first.', ephemeral: true });
             }
             const allowed = await hasEmerald(uid);
             if (!allowed) {
-                return await safeReply(interaction, { content: 'This feature requires Emerald/profile customisation.' });
+                return await safeReply(interaction, { content: 'This feature requires Emerald/profile customisation.', ephemeral: true });
             }
             const action = interaction.options.getString('action');
             if (action === 'set') {
                 const url = interaction.user.displayAvatarURL({ extension: 'png', size: 256 });
                 await setKCAvatar(uid, url);
-                await safeReply(interaction, { content: '✅ Your KC profile picture has been updated to your Discord avatar.' });
+                await safeReply(interaction, { content: '✅ Your KC profile picture has been updated to your Discord avatar.', ephemeral: true });
             } else if (action === 'revert') {
                 await clearKCAvatar(uid);
-                await safeReply(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.' });
+                await safeReply(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.', ephemeral: true });
             } else {
-                await safeReply(interaction, { content: 'Unknown action.' });
+                await safeReply(interaction, { content: 'Unknown action.', ephemeral: true });
             }
         }
         else if (commandName === 'post') {
             const discordId = interaction.user.id;
             const uid = await getKCUidForDiscord(discordId);
             if (!uid) {
-                return await safeReply(interaction, { content: 'You are not linked. Use `/link` first.' });
+                return await safeReply(interaction, { content: 'You are not linked. Use `/link` first.', ephemeral: true });
             }
             if (await postsDisabledGlobally()) {
-                return await safeReply(interaction, { content: '🚫 Posting is currently disabled by admins.' });
+                return await safeReply(interaction, { content: '🚫 Posting is currently disabled by admins.', ephemeral: true });
             }
             const allowed = await postingUnlocked(uid);
             if (!allowed) {
-                return await safeReply(interaction, { content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)' });
+                return await safeReply(interaction, { content: '❌ You don’t have posting unlocked. (Emerald/Diamond or Content access required.)', ephemeral: true });
             }
             const link = interaction.options.getString('link') || '';
             const caption = (interaction.options.getString('caption') || '').slice(0, 140);
@@ -1695,9 +1823,12 @@ client.on('interactionCreate', async (interaction) => {
             const scheduleAtIso = interaction.options.getString('schedule_at') || '';
             const parsed = parseVideoLink(link);
             if (!parsed) {
-                return await safeReply(interaction, { content: 'Invalid link. Please provide a YouTube or TikTok link.' });
+                return await safeReply(interaction, { content: 'Invalid link. Please provide a YouTube or TikTok link.', ephemeral: true });
             }
             const publishAt = scheduleAtIso ? Date.parse(scheduleAtIso) : null;
+            if (scheduleAtIso && !publishAt) {
+                return await safeReply(interaction, { content: 'Invalid schedule format. Use ISO 8601 (e.g., 2025-08-21T10:00:00Z)', ephemeral: true });
+            }
             const postData = { ...parsed, caption, createdAt: admin.database.ServerValue.TIMESTAMP, createdBy: uid, draft: !!draft, publishAt: Number.isFinite(publishAt) ? publishAt : null };
             const ref = rtdb.ref(`users/${uid}/posts`).push();
             await withTimeout(ref.set(postData), 6000, `write post ${ref.key}`);
@@ -1709,13 +1840,14 @@ client.on('interactionCreate', async (interaction) => {
                   `• **Caption:** ${caption || '(none)'}`,
                   publishAt ? `• **Scheduled:** ${new Date(publishAt).toLocaleString()}` : (draft ? '• **Saved as draft**' : '• **Published immediately**')
                 ].join('\n'),
+                ephemeral: true
               });
         }
         else if (commandName === 'postmessage') {
             const discordId = interaction.user.id;
             const uid = await getKCUidForDiscord(discordId);
             if (!uid) {
-                return await safeReply(interaction, { content: 'You must link your KC account first with /link.' });
+                return await safeReply(interaction, { content: 'You must link your KC account first with /link.', ephemeral: true });
             }
             const nameMap = await getAllUserNames();
             const userName = nameMap.get(uid) || interaction.user.username;
@@ -1723,7 +1855,7 @@ client.on('interactionCreate', async (interaction) => {
             const now = Date.now();
             const message = { text, uid, user: userName, time: now, createdAt: now };
             await rtdb.ref('messages').push(message);
-            await safeReply(interaction, { content: '✅ Message posted!' });
+            await safeReply(interaction, { content: '✅ Message posted!', ephemeral: true });
         }
         else if (commandName === 'help') {
             const embed = new EmbedBuilder()
@@ -1738,7 +1870,7 @@ client.on('interactionCreate', async (interaction) => {
                         'Full Voting      : https://kcevents.uk/#voting',
                     ].join('\n')
                 });
-            await safeReply(interaction, { content: '', embeds: [embed] });
+            await safeReply(interaction, { content: '', embeds: [embed], ephemeral: true });
         }
         else if (commandName === 'compare') {
             const youDiscordId = interaction.user.id;
@@ -1777,7 +1909,8 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '', embeds:[embed] });
         }
         else if (commandName === 'setclipschannel') {
-            return handleSetClipsChannel(interaction);
+            // This function now runs inside the try/catch
+            await handleSetClipsChannel(interaction);
         }
         else if (commandName === 'clans') {
           // fetch clans, users and badges from RTDB
@@ -1813,7 +1946,7 @@ client.on('interactionCreate', async (interaction) => {
           }));
         
           const select = new StringSelectMenuBuilder()
-            .setCustomId(`clans_select:${interaction.id}`)
+            .setCustomId(`clans_select:${interaction.id}`) // Keyed to interaction ID
             .setPlaceholder('Select a clan to view details')
             .addOptions(options);
         
@@ -1824,6 +1957,8 @@ client.on('interactionCreate', async (interaction) => {
             usersData,
             badgesData,
           });
+          // Set a timeout to clear this cache
+          setTimeout(() => interaction.client.clanCache?.delete(interaction.id), 15 * 60 * 1000).unref();
         
           // send an embed with the menu
           const embed = new EmbedBuilder()
@@ -1840,8 +1975,12 @@ client.on('interactionCreate', async (interaction) => {
 
     } catch (err) {
         console.error(`[${commandName}]`, err);
-        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
+        await safeReply(interaction, { 
+            content: '❌ Sorry — something went wrong while processing your request.', 
+            ephemeral: true 
+        });
     }
+    // --- END PATCH (Step 2/4) ---
   } 
   // --- Button Handlers ---
   else if (interaction.isButton()) {
@@ -1865,7 +2004,7 @@ client.on('interactionCreate', async (interaction) => {
         const sid = id.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) {
-          return interaction.reply({ content: 'That action expired. Please reopen the clip.', ephemeral: true });
+          return safeReply(interaction, { content: 'That action expired. Please reopen the clip.', ephemeral: true });
         }
         const modal = new ModalBuilder()
           .setCustomId(`clips:commentModal:${sid}`)
@@ -1880,88 +2019,108 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // All other buttons can be responded to directly. We no longer call deferUpdate(),
-      // because subsequent calls to update() or reply() will handle the response.
-      
+      // --- FIX (Item 2): Remove unconditional defer ---
+      // We now defer *inside* branches that update the message.
+
       if (id.startsWith('lb:')) {
+        // --- FIX (Item 2): Defer for message update ---
+        await safeDefer(interaction, { intent: "update" });
         const [, , catStr, pageStr] = id.split(':');
         const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
         const page   = Math.max(0, parseInt(pageStr,10) || 0);
         let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
         if (!Array.isArray(rows)) {
           rows = await loadLeaderboardData();
+          // Cache it again if it expired
+          interaction.client.lbCache?.set(interaction.message.interaction?.id, rows);
         }
         const embed = buildLbEmbed(rows, catIdx, page);
-        await interaction.update({ embeds: [embed], components: [lbRow(catIdx, page)] });
+        // Use safeReply, which will call .update()
+        await safeReply(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
       }
-      else if (id.startsWith('c:')) {
+      else if (id.startsWith('c:')) { // clips list navigation
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          // If the user is not the invoker, reply with an error. Use reply() since we removed deferUpdate().
-          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+          // --- FIX (Item 2): No defer for ephemeral reply ---
+          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
         }
 
         const [c, action, a, b] = id.split(':'); // c:<action>:...
         
         if (action === 'o') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           // open detail view for idx = a
           const { state, item, idx } = getClipByIdx(interaction, parseInt(a,10));
           const postPath = clipDbPath(item);
+          state.currentPostPath = postPath; // Store for 'back' button
           const embed = buildClipDetailEmbed(item, state.nameMap);
           const rows = clipsDetailRows(interaction, postPath);
-          return interaction.update({ embeds:[embed], components: rows });
+          return safeReply(interaction, { embeds:[embed], components: rows });
         }
-        else if (action === 'b') {
+        else if (action === 'b') { // 'c:b' - back to list (deprecated by 'clips:back')
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           // back to list
           const state = getClipsState(interaction);
+          state.currentPostPath = null;
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
         else if (action === 'p') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           // page change
           const state = getClipsState(interaction);
           state.page = Math.max(0, parseInt(a,10) || 0);
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
         else if (action === 'rf') {
-          // refresh list (recompute top)
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
+          // refresh list (re-fetch and re-sort)
           const state = getClipsState(interaction);
-          state.list.sort((x,y)=>y.score-x.score);
+          const platform = state.platform || 'all';
+          const all = await fetchAllPosts({ platform });
+          all.sort((a,b)=>b.score-a.score);
+          state.list = all.slice(0, CLIPS.MAX_LIST);
+          state.nameMap = await getAllUserNames(); // Refresh names too
+          state.page = 0; // Reset to page 0
+          
           const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
         }
       }
       else if (id.startsWith('clips:react:')) {
+        // --- FIX (Item 2): No defer for ephemeral reply ---
         const shortId = id.split(':')[2];
-        const payload = _readFromCache(interaction.client.reactCache, interaction.message ?? interaction, shortId);
+        const payload = _readFromCache(interaction.client.reactCache, interaction.message, shortId);
         if (!payload) {
-          // No payload means the reaction has expired. Reply immediately.
-          return interaction.reply({ content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
+          return safeReply(interaction, { content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
         }
 
         const { postPath, emoji } = payload;
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
         if (!uid) {
-          // User must link their KC account first. Reply instead of followUp.
-          return interaction.reply({ content: 'Link your KC account with /link to react.', ephemeral: true });
+          return safeReply(interaction, { content: 'Link your KC account with /link to react.', ephemeral: true });
         }
 
         const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
         const tx = await myRef.transaction(cur => (cur ? null : true));
-        const wasReacted = !tx.snapshot.exists();
+        const wasReacted = !tx.snapshot.exists(); // true if we just removed it
 
         await rtdb.ref(`${postPath}/reactionCounts/${emoji}`).transaction(cur => (cur || 0) + (wasReacted ? -1 : 1));
 
-        try { await interaction.reply({ content: '✅ Reaction updated.', ephemeral: true }); } catch {}
+        await safeReply(interaction, { content: '✅ Reaction updated.', ephemeral: true });
       }
       else if (id.startsWith('clips:reactors:')) {
+        // --- FIX (Item 2): No defer for ephemeral reply ---
         const sid = id.split(':')[2];
-        const payload = _readFromCache(interaction.client.reactorsCache, interaction.message ?? interaction, sid);
+        const payload = _readFromCache(interaction.client.reactorsCache, interaction.message, sid);
         if (!payload) {
-          // The reactors list has expired. Reply with a message.
-          return interaction.reply({ content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
+          return safeReply(interaction, { content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
         }
         const { postPath } = payload;
 
@@ -1984,26 +2143,25 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(DEFAULT_EMBED_COLOR)
           .setFooter({ text: 'KC Bot • /clips' });
 
-        // Send the embed as a reply rather than followUp since we didn't defer.
-        await interaction.reply({ embeds:[embed], ephemeral: true });
+        await safeReply(interaction, { embeds:[embed], ephemeral: true });
       }
       else if (id.startsWith('clips:comments:prev:') || id.startsWith('clips:comments:next:')) {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const parts = id.split(':'); // ['clips','comments','prev|next', sid, page]
           const sid = parts[3];
           const page = parseInt(parts[4], 10) || 0;
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              // Comments list expired. Send reply.
-              return interaction.reply({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
+              return safeReply(interaction, { content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
           }
           const { postPath } = payload;
-          // find the clip item from state (fallback to direct read if needed)
           const state = getClipsState(interaction);
           let item = state?.list?.find(x => clipDbPath(x) === postPath);
           if (!item) {
               const snap = await rtdb.ref(postPath).get();
               item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
-              if (!item) return; // nothing to show
+              if (!item) return safeReply(interaction, { content: 'Could not load clip data.' });
           }
           const nameMap = state?.nameMap || await getAllUserNames();
           const comments = await loadClipComments(postPath);
@@ -2011,15 +2169,15 @@ client.on('interactionCreate', async (interaction) => {
           const p = Math.max(0, Math.min(page, maxPage));
           const embed = buildClipCommentsEmbed(item, comments, p, nameMap);
           const rows = [commentsRows(sid, p, maxPage)];
-          await interaction.update({ content: '', embeds: [embed], components: rows });
-          return;
+          await safeReply(interaction, { content: '', embeds: [embed], components: rows });
       }
       else if (id.startsWith('clips:comments:')) {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const sid = id.split(':')[2];
           const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
           if (!payload) {
-              // Comments list expired. Reply accordingly.
-              return interaction.reply({ content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
+              return safeReply(interaction, { content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
           }
           const { postPath } = payload;
           const state = getClipsState(interaction);
@@ -2027,7 +2185,7 @@ client.on('interactionCreate', async (interaction) => {
           if (!item) {
               const snap = await rtdb.ref(postPath).get();
               item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
-              if (!item) return;
+              if (!item) return safeReply(interaction, { content: 'Could not load clip data.' });
           }
           const nameMap = state?.nameMap || await getAllUserNames();
           const comments = await loadClipComments(postPath);
@@ -2035,34 +2193,41 @@ client.on('interactionCreate', async (interaction) => {
           const page = 0;
           const embed = buildClipCommentsEmbed(item, comments, page, nameMap);
           const rows = [commentsRows(sid, page, maxPage)];
-          await interaction.update({ content: '', embeds: [embed], components: rows });
-          return;
+          await safeReply(interaction, { content: '', embeds: [embed], components: rows });
       }
-      else if (interaction.customId.startsWith('clips:back')) {
+      else if (id === 'clips:backDetail') {
+        // --- FIX (Item 2): Defer for message update ---
+        await safeDefer(interaction, { intent: "update" });
+        // Back from comments to clip detail
         const state = getClipsState(interaction);
-        // This button can be clicked from either the comments page or the detail page.
-        // We need to determine where to go back to.
-        // A simple way is to check the current embed title.
-        const currentEmbed = interaction.message.embeds[0];
-        if (currentEmbed && currentEmbed.title.startsWith('Comments —')) {
-            // We are on the comments page, go back to the clip detail view.
-            const item = state.list.find(x => clipDbPath(x) === state.currentPostPath);
-            if(item) {
-                const embed = buildClipDetailEmbed(item, state.nameMap);
-                const rows = clipsDetailRows(interaction, clipDbPath(item));
-                return interaction.update({ embeds: [embed], components: rows });
-            }
+        if (!state || !state.currentPostPath) {
+            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
         }
-        
-        // Default back to list
+        const item = state.list.find(x => clipDbPath(x) === state.currentPostPath);
+        if (!item) {
+            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
+        }
+        const embed = buildClipDetailEmbed(item, state.nameMap);
+        const rows = clipsDetailRows(interaction, state.currentPostPath);
+        return safeReply(interaction, { embeds: [embed], components: rows });
+      }
+      else if (id === 'clips:back') {
+        // --- FIX (Item 2): Defer for message update ---
+        await safeDefer(interaction, { intent: "update" });
+        // Back from clip detail to list
+        const state = getClipsState(interaction);
+        if (!state) {
+            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
+        }
+        state.currentPostPath = null;
         const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-        return interaction.update({ embeds:[embed], components: clipsListRows(state.list.length, state.page) });
+        return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
       }
       else if (interaction.customId.startsWith('msg:')) {
         const invokerId = interaction.message.interaction?.user?.id;
         if (invokerId && invokerId !== interaction.user.id) {
-          // Only the command invoker may use these controls. Reply with an error.
-          return interaction.reply({ content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+          // --- FIX (Item 2): No defer for ephemeral reply ---
+          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
         }
         const key = interaction.message.interaction?.id || '';
         interaction.client.msgCache ??= new Map();
@@ -2074,50 +2239,69 @@ client.on('interactionCreate', async (interaction) => {
         }
         const [ns, action, a, b] = interaction.customId.split(':');
         if (action === 'view' || action === 'openIdx') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
+          // --- FIX (Item 1): Fix object spread ---
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await interaction.update({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          // --- END FIX ---
+          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         else if (action === 'back' || action === 'list') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const embed = buildMessagesEmbed(state.list, state.nameMap);
-          await interaction.update({ embeds: [embed], components: messageIndexRows(state.list.length || 0) });
+          await safeReply(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
         }
         else if (action === 'refresh') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
           state.list = list;
           state.nameMap = nameMap;
           const embed = buildMessagesEmbed(list, nameMap);
-          await interaction.update({ embeds: [embed], components: messageIndexRows(list.length || 0) });
+          await safeReply(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
         }
         else if (action === 'refreshOne') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
           const msg = state.list[idx];
           const fresh = await loadNode(msg.path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
+          // --- FIX (Item 1): Fix object spread (redundant, already fixed above) ---
           const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await interaction.update({ embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
+          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
         }
         else if (action === 'openPath') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const path = decPath(a);
           const idx = state.list.findIndex(m=>m.path===path);
           const base = idx>=0 ? state.list[idx] : await loadNode(path);
           const fresh = await loadNode(path);
           const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
+          // --- FIX (Item 1): Fix object spread ---
           const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
-          await interaction.update({ embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
+          // --- END FIX ---
+          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
         }
         else if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const path = decPath(a);
           const page = parseInt(b||'0',10) || 0;
           const parent = await loadNode(path);
           const children = await loadReplies(path);
           const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
-          await interaction.update({ embeds: [embed], components: threadRows(path, children, page, 10) });
+          await safeReply(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
         }
         else if (action === 'openChild') {
+          // --- FIX (Item 2): Defer for message update ---
+          await safeDefer(interaction, { intent: "update" });
           const path = decPath(a);
           const node = await loadNode(path);
           const hasReplies = !!(node?.replies && Object.keys(node.replies).length);
@@ -2133,41 +2317,66 @@ client.on('interactionCreate', async (interaction) => {
               new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
             ),
           ];
-          await interaction.update({ embeds: [embed], components: rows });
+          await safeReply(interaction, { embeds: [embed], components: rows });
         }
         else if (action === 'like') {
+          // --- FIX (Item 2): No defer for ephemeral reply ---
           const discordId = interaction.user.id;
           const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await interaction.reply({ content: 'Link your KC account first with /link.', ephemeral: true });
+          if (!uid) return await safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
           const path = decPath(a);
           const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 6000, `RTDB ${path}/likedBy`);
           const wasLiked = likedSnap.exists();
           await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
           await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
-          const node = await loadNode(path);
-          const embed = buildMessageDetailEmbed(node, state?.nameMap || new Map());
-          const i = state.list.findIndex(m=>m.path===path);
-          if (i>=0) state.list[i] = { ...state.list[i], ...node };
-          await interaction.update({ embeds: [embed] });
+          
+          // We must acknowledge, but we don't want to update the embed
+          // as it's disruptive. Send an ephemeral ack.
+          await safeReply(interaction, { content: '✅ Like updated.', ephemeral: true });
+
+          // --- Optional: update the message embed *after* acknowledging ---
+          // This is "fire and forget" - we don't await it, and if it fails,
+          // the user has already been notified of success.
+          (async () => {
+            try {
+              const node = await loadNode(path);
+              const embed = buildMessageDetailEmbed(node, state?.nameMap || new Map());
+              const i = state.list.findIndex(m=>m.path===path);
+              if (i>=0) {
+                 // --- FIX (Item 1): Fix object spread ---
+                 state.list[i] = { ...state.list[i], ...node };
+                 // --- END FIX ---
+              }
+              // We already replied, so this must be .editReply on the *original* message
+              await interaction.message.edit({ embeds: [embed] });
+            } catch (e) {
+              console.warn(`[msg:like] failed to update embed post-ack:`, e.message);
+            }
+          })();
         }
       }
       else if (interaction.customId === 'votes:refresh') {
+        // --- FIX (Item 2): Defer for message update ---
+        await safeDefer(interaction, { intent: "update" });
         const scores = await loadVoteScores();
         const embed = buildVoteEmbed(scores);
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
         );
-        await interaction.update({ embeds: [embed], components: [row] });
+        await safeReply(interaction, { embeds: [embed], components: [row] });
       }
       else if (interaction.customId.startsWith('vote:delete:')) {
+        // --- FIX (Item 2): Defer for message update ---
+        await safeDefer(interaction, { intent: "update" });
         const uid = interaction.customId.split(':')[2];
         await withTimeout(rtdb.ref(`votes/${uid}`).remove(), 6000, `delete vote ${uid}`);
-        await interaction.update({ content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
+        await safeReply(interaction, { content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
       }
     } catch (err) {
       console.error(`[button:${id}]`, err);
-      const msg = 'Sorry, something went wrong.';
-      await safeReply(interaction, { content: msg, ephemeral: true }).catch(() => {});
+      const msg = '❌ Sorry, something went wrong.';
+      // We must use safeReply to handle the state (deferred/not)
+      await safeReply(interaction, { content: msg, ephemeral: true, embeds: [], components: [] });
     }
   }
   // --- Select Menu Handlers ---
@@ -2177,80 +2386,94 @@ client.on('interactionCreate', async (interaction) => {
     // only handle clan selection menus
     if (prefix !== 'clans_select') return;
   
-    const clanId = interaction.values[0];
-    const cache = interaction.client.clanCache?.get(parentInteractionId);
-    if (!cache) {
-      // Consider re-running the load logic here instead of just replying
-      return interaction.reply({ content: 'Clan data has expired.  Run `/clans` again.',
-                                ephemeral: true });
-    }
-  
-    const { entries, usersData, badgesData } = cache;
-    const clan = entries.find(c => c.id === clanId);
-    if (!clan) {
-      return interaction.update({ content: 'Clan not found.', embeds: [], components: [] });
-    }
-  
-    // build member display names
-    let memberNames = '';
-    if (clan.members) {
-      memberNames = Object.keys(clan.members)
-        .map(uid => usersData[uid]?.displayName || uid)
-        .join(', ');
-      if (memberNames.length > 1024) {
-        memberNames = memberNames.slice(0, 1020) + '…';
+    // --- FIX (Item 3): Defer *after* validation ---
+    try {
+      const clanId = interaction.values[0];
+      const cache = interaction.client.clanCache?.get(parentInteractionId);
+      if (!cache) {
+        // No defer yet; reply ephemeral
+        return safeReply(interaction, { 
+            content: 'Clan data has expired. Run `/clans` again.',
+            ephemeral: true
+        });
       }
-    }
-  
-    const owner = usersData[clan.owner] || {};
-  
-    // recompute score in case it is needed
-    const score = computeClanScore(clan, usersData, badgesData);
-  
-    const detailEmbed = new EmbedBuilder()
-      .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
-      .setDescription(clan.description || 'No description provided.')
-      // Add guard for icon URL
-      // .setThumbnail(clan.icon) // Original line
-      .addFields(
-        { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
-        { name: 'Points', value: `${score}`, inline: true },
-        { name: 'Members', value: memberNames || 'No members', inline: false },
-      )
-      .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
-      .setColor(DEFAULT_EMBED_COLOR);
 
-    // Guard missing/invalid icon URL on the embed
-    if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
-      detailEmbed.setThumbnail(clan.icon);
-    }
-  
-    await interaction.update({
-      content: '',
-      embeds: [detailEmbed],
-      components: [], // remove the select menu once a clan is chosen
-    });
+      // We know we’ll update the existing menu message
+      await safeDefer(interaction, { intent: 'update' });
+      // --- END FIX ---
+    
+      const { entries, usersData, badgesData } = cache;
+      const clan = entries.find(c => c.id === clanId);
+      if (!clan) {
+        return safeReply(interaction, { content: 'Clan not found.', embeds: [], components: [] });
+      }
+    
+      // build member display names
+      let memberNames = '';
+      if (clan.members) {
+        memberNames = Object.keys(clan.members)
+          .map(uid => usersData[uid]?.displayName || uid)
+          .join(', ');
+        if (memberNames.length > 1024) {
+          memberNames = memberNames.slice(0, 1020) + '…';
+        }
+      }
+    
+      const owner = usersData[clan.owner] || {};
+    
+      // recompute score in case it is needed
+      const score = computeClanScore(clan, usersData, badgesData);
+    
+      const detailEmbed = new EmbedBuilder()
+        .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
+        .setDescription(clan.description || 'No description provided.')
+        .addFields(
+          { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
+          { name: 'Points', value: `${score}`, inline: true },
+          { name: 'Members', value: memberNames || 'No members', inline: false },
+        )
+        .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
+        .setColor(DEFAULT_EMBED_COLOR);
 
-    // Delete the cache after selection
-    interaction.client.clanCache?.delete(parentInteractionId);
+      // Guard missing/invalid icon URL on the embed
+      if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
+        detailEmbed.setThumbnail(clan.icon);
+      }
+    
+      await safeReply(interaction, {
+        content: '',
+        embeds: [detailEmbed],
+        components: [], // remove the select menu once a clan is chosen
+      });
+
+      // Delete the cache after selection
+      interaction.client.clanCache?.delete(parentInteractionId);
+
+    } catch (err) {
+        console.error(`[select:${prefix}]`, err);
+        await safeReply(interaction, { 
+            content: '❌ Sorry, something went wrong.', 
+            ephemeral: true, embeds: [], components: [] 
+        });
+    }
   }
   // --- Modal Submissions ---
   else if (interaction.isModalSubmit()) {
     const { customId } = interaction;
+    // Modals are deferred with ephemeral
+    await safeDefer(interaction, { ephemeral: true });
     try {
-      await safeDefer(interaction, { ephemeral: true });
-
       if (customId.startsWith('clips:commentModal:')) {
         const sid = customId.split(':')[2];
         const payload = readModalTarget(sid);
-        if (!payload) return safeReply(interaction, { content: 'This action expired. Reopen the clip.' });
+        if (!payload) return safeReply(interaction, { content: 'This action expired. Reopen the clip.', ephemeral: true });
 
         const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
-        if (!text) return safeReply(interaction, { content: 'Comment cannot be empty.' });
+        if (!text) return safeReply(interaction, { content: 'Comment cannot be empty.', ephemeral: true });
 
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'Link your KC account with /link first.' });
+        if (!uid) return safeReply(interaction, { content: 'Link your KC account with /link first.', ephemeral: true });
 
         const names = await getAllUserNames();
         const userName = names.get(uid) || interaction.user.username;
@@ -2263,43 +2486,43 @@ client.on('interactionCreate', async (interaction) => {
         };
 
         await rtdb.ref(`${payload.postPath}/comments`).push(comment);
-        await safeReply(interaction, { content: '✅ Comment posted!' });
+        await safeReply(interaction, { content: '✅ Comment posted!', ephemeral: true });
       }
       else if (customId.startsWith('msg:replyModal:')) {
         const path = decPath(customId.split(':')[2]);
         const text = interaction.fields.getTextInputValue('replyText').trim();
-        if (!text) return safeReply(interaction, { content: 'Reply can’t be empty.' });
+        if (!text) return safeReply(interaction, { content: 'Reply can’t be empty.', ephemeral: true });
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'You must link your KC account first with /link.' });
+        if (!uid) return safeReply(interaction, { content: 'You must link your KC account first with /link.', ephemeral: true });
         let nameMap = await getAllUserNames();
         const userName = nameMap.get(uid) || interaction.user.username;
         const reply = { user: userName, uid, text, time: admin.database.ServerValue.TIMESTAMP };
         await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 6000, `RTDB ${path}/replies.push`);
-        await safeReply(interaction, { content: '✅ Reply posted!' });
+        await safeReply(interaction, { content: '✅ Reply posted!', ephemeral: true });
       } 
       else if (customId === 'vote:modal') {
         const discordId = interaction.user.id;
         const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'Link your KC account first with /link.' });
-        if (!(await userIsVerified(uid))) return safeReply(interaction, { content: 'You must verify your email on KC before voting.' });
+        if (!uid) return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+        if (!(await userIsVerified(uid))) return safeReply(interaction, { content: 'You must verify your email on KC before voting.', ephemeral: true });
         
         const existingSnap = await rtdb.ref(`votes/${uid}`).get();
         if (existingSnap.exists()) {
-            return safeReply(interaction, { content: 'You have already voted. To change your vote, run `/vote` again and use the buttons.' });
+            return safeReply(interaction, { content: 'You have already voted. To change your vote, run `/vote` again and use the buttons.', ephemeral: true });
         }
 
         const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
         const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
         const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
-        if (!off || !def || !Number.isFinite(rating)) {
-          return safeReply(interaction, { content: 'Please fill all fields. Rating must be 1–5.' });
+        if (!off || !def || !Number.isFinite(rating) || rating < 1 || rating > 5) {
+          return safeReply(interaction, { content: 'Please fill all fields. Rating must be 1–5.', ephemeral: true });
         }
         const verifiedMap = await getVerifiedNameMap();
         const offNorm = norm(off), defNorm = norm(def);
         const offFinal = verifiedMap[offNorm], defFinal = verifiedMap[defNorm];
         if (!offFinal || !defFinal) {
-          return safeReply(interaction, { content: 'Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.' });
+          return safeReply(interaction, { content: 'Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.', ephemeral: true });
         }
         const nameMap = await getAllUserNames();
         const username = nameMap.get(uid) || interaction.user.username;
@@ -2312,14 +2535,14 @@ client.on('interactionCreate', async (interaction) => {
         });
 
         if (!tx.committed) {
-            await safeReply(interaction, { content: '❗ You have already voted for this event.' });
+            await safeReply(interaction, { content: '❗ You have already voted for this event.', ephemeral: true });
         } else {
-            await safeReply(interaction, { content: '✅ Thanks for voting!' });
+            await safeReply(interaction, { content: '✅ Thanks for voting!', ephemeral: true });
         }
       }
     } catch (err) {
       console.error(`[modal:${customId}]`, err);
-      await safeReply(interaction, { content: 'Sorry, something went wrong.' });
+      await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
     }
   }
 });
@@ -2329,8 +2552,13 @@ async function maybeBroadcast(uid, postId, data) {
     if (data.publishAt && Date.now() < data.publishAt) return;
     if (!['youtube', 'tiktok'].includes(data.type)) return;
 
-    const maxAge = parseInt(process.env.CLIP_BROADCAST_MAX_AGE_MS || '15601000', 10);
-    if (data.createdAt && (Date.now() - data.createdAt > maxAge)) return;
+    // Check creation time. Don't broadcast old posts.
+    const maxAge = parseInt(process.env.CLIP_BROADCAST_MAX_AGE_MS || '1800000', 10); // 30 mins
+    const postAge = Date.now() - (data.createdAt || 0);
+    if (!data.createdAt || postAge > maxAge) {
+      // console.log(`[broadcast] skipping old post ${postId}, age=${postAge}ms`);
+      return;
+    }
 
     for (const guildId of globalCache.clipDestinations.keys()) {
         const channelId = globalCache.clipDestinations.get(guildId);
@@ -2364,7 +2592,7 @@ async function maybeBroadcast(uid, postId, data) {
 
             const msg = await channel.send({ embeds: [embed] });
             const postPath = `users/${uid}/posts/${postId}`;
-            const rows = clipsDetailRows(msg, postPath);
+            const rows = clipsDetailRows(msg, postPath); // Pass the new message
             await msg.edit({ components: rows });
 
             await flagRef.set({
@@ -2388,19 +2616,30 @@ function attachPostsListener(uid) {
     if (!uid || listenedUids.has(uid)) return;
     listenedUids.add(uid);
     const ref = rtdb.ref(`users/${uid}/posts`);
-    ref.on('child_added', s => {
-        maybeBroadcast(uid, s.key, s.val()).catch(e => console.error(`[broadcast] unhandled error in maybeBroadcast for ${uid}/${s.key}`, e));
+    
+    // Listen for *new* posts
+    ref.orderByChild('createdAt').startAt(Date.now() - 5000).on('child_added', s => {
+        // Check age again, 'child_added' can fire for old items on startup
+        const data = s.val();
+        const postAge = Date.now() - (data?.createdAt || 0);
+        if (postAge < (parseInt(process.env.CLIP_BROADCAST_MAX_AGE_MS || '1800000', 10) + 10000)) { // 30m + 10s buffer
+            maybeBroadcast(uid, s.key, data).catch(e => console.error(`[broadcast] unhandled error in maybeBroadcast for ${uid}/${s.key}`, e));
+        }
+    }, err => console.error(`[broadcast] listener error for ${uid}:`, err));
+    
+    // Listen for *updates* (e.g., draft -> published)
+    ref.on('child_changed', s => {
+        maybeBroadcast(uid, s.key, s.val()).catch(e => console.error(`[broadcast] unhandled error in maybeBroadcast (update) for ${uid}/${s.key}`, e));
     });
+
     console.log(`[broadcast] attached listener for user ${uid}`);
 }
 
 // ---------- Startup ----------
-// PATCH: Use the correct 'ready' event, and only fire it once.
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
-  // PATCH: Read from and listen to the correct RTDB path for clip destinations.
   try {
     const snap = await rtdb.ref('config/clipDestinations').get();
     globalCache.clipDestinations.clear();
@@ -2430,15 +2669,20 @@ client.once('ready', async () => {
   }
 
   // Attach listeners for all existing and new users to broadcast clips
-  const usersSnap = await rtdb.ref('users').get();
-  if (usersSnap.exists()) {
-      Object.keys(usersSnap.val()).forEach(attachPostsListener);
+  try {
+    const usersSnap = await rtdb.ref('users').get();
+    if (usersSnap.exists()) {
+        Object.keys(usersSnap.val()).forEach(attachPostsListener);
+    }
+    rtdb.ref('users').on('child_added', s => attachPostsListener(s.key));
+  } catch (e) {
+      console.error('[broadcast] failed to attach initial user listeners', e);
   }
-  rtdb.ref('users').on('child_added', s => attachPostsListener(s.key));
 });
 
-process.on('unhandledRejection', e => console.error('unhandledRejection', e));
-process.on('uncaughtException', e => console.error('uncaughtException', e));
+// Redundant listeners (already added at top)
+// process.on('unhandledRejection', e => console.error('unhandledRejection', e));
+// process.on('uncaughtException', e => console.error('uncaughtException', e));
 
 (async () => {
   try {
@@ -2472,3 +2716,4 @@ process.on('uncaughtException', e => console.error('uncaughtException', e));
     process.exit(1);
   });
 })();
+
