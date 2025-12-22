@@ -55,6 +55,9 @@ const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 
+// Node HTTPS module used to fetch images for role icons
+const https = require('https');
+
 const EMOJI = {
   offence:  '<:red:1407696672229818579>',
   defence:  '<:blue:1407696743474139260>',
@@ -87,7 +90,9 @@ const DEFAULT_EMBED_COLOR = 0xF1C40F;
 const globalCache = {
   userNames: new Map(), // uid -> displayName
   userNamesFetchedAt: 0,
-  clipDestinations: new Map() // guildId -> channelId
+  clipDestinations: new Map(), // guildId -> channelId
+  // Destination channels for clan battle announcements (guildId -> channelId)
+  battleDestinations: new Map(),
 };
 
 // only these will be private
@@ -1493,6 +1498,426 @@ async function handleSetClipsChannel(interaction) {
     return safeReply(interaction, { content: `✅ Clips will be posted in <#${chan.id}>.`, ephemeral: true });
 }
 
+// -----------------------------------------------------------------------------
+// Clan Battle & Roles Helpers
+//
+// These helpers implement the commands for clan challenges, role assignments and
+// event announcements. They mirror the behaviour on the KC website where clan
+// owners can challenge other clans to battles, view incoming challenges, and
+// assign custom roles to members. In addition, accepted clan battles will be
+// broadcast automatically to configured channels in each guild.
+
+/**
+ * Return the owner UID for a given clan object. The KC database stores the
+ * owner as `clan.owner`. If the field is missing or not a string, null is returned.
+ *
+ * @param {Object|null|undefined} clan The clan object from RTDB
+ * @returns {string|null}
+ */
+function getOwnerUid(clan) {
+  if (!clan || typeof clan !== 'object') return null;
+  const owner = clan.owner;
+  return typeof owner === 'string' ? owner : null;
+}
+
+/**
+ * Handle the /seteventschannel command. Writes the selected channel to
+ * `config/battleDestinations/<guildId>` in RTDB so that accepted clan battles
+ * can be announced there. Mirrors the behaviour of /setclipschannel.
+ *
+ * Requires Manage Server permissions on the invoking member and ensures the bot
+ * has View Channel, Send Messages and Embed Links in the chosen channel.
+ */
+async function handleSetEventsChannel(interaction) {
+  if (!interaction.inGuild()) {
+    return safeReply(interaction, { content: 'Run this in a server.', ephemeral: true });
+  }
+
+  const picked = interaction.options.getChannel('channel', true);
+  if (picked.guildId !== interaction.guildId) {
+    return safeReply(interaction, { content: 'That channel isn’t in this server.', ephemeral: true });
+  }
+  if (typeof picked.isThread === 'function' && picked.isThread()) {
+    return safeReply(interaction, { content: 'Pick a text channel, not a thread.', ephemeral: true });
+  }
+  // Re-fetch channel to ensure full object
+  const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
+  if (!chan || !chan.isTextBased?.()) {
+    return safeReply(interaction, { content: 'Pick a text or announcement channel I can post in.', ephemeral: true });
+  }
+  // Permissions check for invoker
+  const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+  if (!invokerOk) {
+    return safeReply(interaction, { content: 'You need the **Manage Server** permission to set this.', ephemeral: true });
+  }
+  // Bot perms check in that channel
+  const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
+  if (!me) {
+    return safeReply(interaction, { content: 'I couldn’t resolve my member record. Reinvite me or check my permissions.', ephemeral: true });
+  }
+  const botOk = chan.permissionsFor(me).has([
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.EmbedLinks,
+  ]);
+  if (!botOk) {
+    return safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** in that channel.', ephemeral: true });
+  }
+  // Write to RTDB
+  await rtdb.ref(`config/battleDestinations/${interaction.guildId}`).set({
+    channelId: chan.id,
+    updatedBy: interaction.user.id,
+    updatedAt: admin.database.ServerValue.TIMESTAMP,
+  });
+  globalCache.battleDestinations.set(interaction.guildId, chan.id);
+  return safeReply(interaction, { content: `✅ Clan battles will be announced in <#${chan.id}>.`, ephemeral: true });
+}
+
+/**
+ * Handle the /getclanroles command. Determines the invoking user's clan and
+ * creates or assigns a Discord role corresponding to that clan. Owners receive
+ * a role suffixed with "Owner". Roles are created with the clan’s name and
+ * icon fetched from the KC database. If the role already exists, it is simply
+ * assigned to the user.
+ */
+async function handleGetClanRoles(interaction) {
+  if (!interaction.inGuild()) {
+    return safeReply(interaction, { content: 'Run this in a server.', ephemeral: true });
+  }
+  // Resolve the KC UID and find the user's clan
+  const discordId = interaction.user.id;
+  const uid = await getKCUidForDiscord(discordId);
+  if (!uid) {
+    return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+  }
+  // Fetch all clans to locate membership
+  const clansSnap = await rtdb.ref('clans').get();
+  const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+  let userClanId = null;
+  let userClan = null;
+  for (const [cid, clan] of Object.entries(clansData)) {
+    if (clan.members && clan.members[uid]) {
+      userClanId = cid;
+      userClan = clan;
+      break;
+    }
+  }
+  if (!userClanId) {
+    return safeReply(interaction, { content: 'You are not in a clan.', ephemeral: true });
+  }
+  const isOwner = getOwnerUid(userClan) === uid;
+  const baseName = userClan.name || userClanId;
+  const roleName = isOwner ? `${baseName} Owner` : baseName;
+  // Check if role exists already
+  const guild = interaction.guild;
+  const existing = guild.roles.cache.find(r => r.name === roleName);
+  let role;
+  if (existing) {
+    role = existing;
+  } else {
+    // Fetch icon image from clan data (if present and looks like a URL)
+    let iconBuf = null;
+    const iconUrl = userClan.icon;
+    if (iconUrl && /^https?:\/\//i.test(iconUrl)) {
+      try {
+        iconBuf = await new Promise((resolve, reject) => {
+          https.get(iconUrl, res => {
+            const data = [];
+            res.on('data', chunk => data.push(chunk));
+            res.on('end', () => resolve(Buffer.concat(data)));
+          }).on('error', reject);
+        });
+      } catch (e) {
+        console.warn(`[getClanRoles] failed to fetch icon for ${userClanId}:`, e.message);
+      }
+    }
+    // Create new role. The bot must have Manage Roles; colour left unset (null) so default is used
+    const createData = { name: roleName };
+    if (iconBuf) {
+      createData.icon = iconBuf;
+    }
+    try {
+      role = await guild.roles.create(createData);
+    } catch (e) {
+      console.error('[getClanRoles] failed to create role:', e);
+      return safeReply(interaction, { content: 'Failed to create the role. Check my permissions and try again later.', ephemeral: true });
+    }
+  }
+  // Assign the role to the member (requires Manage Roles)
+  try {
+    await interaction.member.roles.add(role);
+  } catch (e) {
+    console.error('[getClanRoles] failed to assign role:', e);
+    return safeReply(interaction, { content: 'Failed to assign the role to you. Check my permissions and role hierarchy.', ephemeral: true });
+  }
+  return safeReply(interaction, { content: `✅ You have been given the **${roleName}** role.`, ephemeral: true });
+}
+
+/**
+ * Handle the /incomingchallenges command. Shows a list of pending clan battle
+ * challenges where the invoking user’s clan is either the challenger or target.
+ * Only clan owners can use this command. The user will see an embed listing
+ * each pending challenge with Accept and Decline buttons.
+ */
+async function handleIncomingChallenges(interaction) {
+  if (!interaction.inGuild()) {
+    return safeReply(interaction, { content: 'Run this in a server.', ephemeral: true });
+  }
+  const discordId = interaction.user.id;
+  const uid = await getKCUidForDiscord(discordId);
+  if (!uid) {
+    return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+  }
+  // Fetch clans and determine the user’s clan
+  const clansSnap = await rtdb.ref('clans').get();
+  const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+  let clanId = null;
+  let clan = null;
+  for (const [cid, c] of Object.entries(clansData)) {
+    if (c.members && c.members[uid]) {
+      clanId = cid;
+      clan = c;
+      break;
+    }
+  }
+  if (!clanId) {
+    return safeReply(interaction, { content: 'You are not in a clan.', ephemeral: true });
+  }
+  if (getOwnerUid(clan) !== uid) {
+    return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
+  }
+  // Fetch all battles and filter pending involving this clan
+  const battlesSnap = await rtdb.ref('battles').get();
+  const allBattles = battlesSnap.exists() ? battlesSnap.val() || {} : {};
+  const pendingList = [];
+  for (const [bid, b] of Object.entries(allBattles)) {
+    if (b.status === 'pending' && (b.challengerId === clanId || b.targetId === clanId)) {
+      pendingList.push([bid, b]);
+    }
+  }
+  if (pendingList.length === 0) {
+    return safeReply(interaction, { content: 'There are no pending challenges for your clan.', ephemeral: true });
+  }
+  // Build embed
+  const embed = new EmbedBuilder()
+    .setTitle('Incoming Clan Challenges')
+    .setDescription('Below are the pending clan battle challenges. Use the buttons to accept or decline.')
+    .setColor(DEFAULT_EMBED_COLOR)
+    .setFooter({ text: 'KC Bot • /incomingchallenges' });
+  // Add a field for each challenge (limit to first 10 to avoid hitting embed limits)
+  const nameMap = await getAllUserNames();
+  pendingList.slice(0, 10).forEach(([bid, b], idx) => {
+    const c1 = clansData[b.challengerId] || {};
+    const c2 = clansData[b.targetId] || {};
+    const d = b.scheduledTime ? new Date(b.scheduledTime) : null;
+    const dateStr = d ? d.toLocaleDateString('en-GB', { timeZone: 'Europe/London' }) : 'N/A';
+    const timeStr = d ? d.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }) : '';
+    const title = `${c1.name || b.challengerId} vs ${c2.name || b.targetId}`;
+    const valLines = [];
+    if (b.server) valLines.push(`Server: ${b.server}`);
+    if (b.scheduledTime) valLines.push(`Date: ${dateStr} ${timeStr}`);
+    if (b.rules) valLines.push(`Rules: ${b.rules}`);
+    embed.addFields({ name: `${idx + 1}. ${title}`, value: valLines.join('\n') || '\u200b' });
+  });
+  // Build rows of Accept/Decline buttons. Each challenge gets its own row to avoid hitting the limit of 5 buttons per row.
+  const rows = [];
+  const parentId = interaction.id;
+  pendingList.slice(0, 10).forEach(([bid], idx) => {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`cc:accept:${parentId}:${bid}`)
+        .setLabel('Accept')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`cc:decline:${parentId}:${bid}`)
+        .setLabel('Decline')
+        .setStyle(ButtonStyle.Danger),
+    );
+    rows.push(row);
+  });
+  // Cache this state so we can handle button interactions. We also store the user’s clanId.
+  interaction.client.challengeCache ??= new Map();
+  interaction.client.challengeCache.set(parentId, { clanId, pendingList });
+  // Reply with embed and buttons
+  return safeReply(interaction, { embeds: [embed], components: rows, });
+}
+
+/**
+ * Handle the /sendclanchallenge command. Only owners can send challenges. The
+ * command takes a string identifying the target clan. If valid, a modal is
+ * presented to capture server, date/time and rules. The modal custom ID
+ * encodes the interaction ID and target clan ID so that submission can be
+ * processed later. If the user is not an owner or if the target clan is
+ * invalid, an appropriate error message is shown.
+ */
+async function handleSendClanChallenge(interaction) {
+  // Confirm KC account and clan membership
+  const discordId = interaction.user.id;
+  const uid = await getKCUidForDiscord(discordId);
+  if (!uid) {
+    return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+  }
+  // Load clans
+  const clansSnap = await rtdb.ref('clans').get();
+  const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+  let myClanId = null;
+  let myClan = null;
+  for (const [cid, c] of Object.entries(clansData)) {
+    if (c.members && c.members[uid]) {
+      myClanId = cid;
+      myClan = c;
+      break;
+    }
+  }
+  if (!myClanId) {
+    return safeReply(interaction, { content: 'You are not in a clan.', ephemeral: true });
+  }
+  // Only owners can send challenges
+  if (getOwnerUid(myClan) !== uid) {
+    return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
+  }
+  const targetQuery = (interaction.options.getString('clan') || '').trim().toLowerCase();
+  if (!targetQuery) {
+    return safeReply(interaction, { content: 'Please specify a target clan.', ephemeral: true });
+  }
+  // Find target clan by id or name (case-insensitive)
+  let targetId = null;
+  let targetClan = null;
+  for (const [cid, c] of Object.entries(clansData)) {
+    if (cid.toLowerCase() === targetQuery || (c.name && c.name.toLowerCase() === targetQuery)) {
+      targetId = cid;
+      targetClan = c;
+      break;
+    }
+  }
+  if (!targetId) {
+    return safeReply(interaction, { content: 'Could not find that clan. Provide a valid clan name or ID.', ephemeral: true });
+  }
+  if (targetId === myClanId) {
+    return safeReply(interaction, { content: 'You cannot challenge your own clan.', ephemeral: true });
+  }
+  // Check there isn’t already a pending challenge between the clans
+  const battlesSnap = await rtdb.ref('battles').get();
+  const battles = battlesSnap.exists() ? battlesSnap.val() || {} : {};
+  for (const b of Object.values(battles)) {
+    if (b.status === 'pending' && ((b.challengerId === myClanId && b.targetId === targetId) || (b.challengerId === targetId && b.targetId === myClanId))) {
+      return safeReply(interaction, { content: 'A pending challenge already exists between these clans.', ephemeral: true });
+    }
+  }
+  // Build modal
+  const modal = new ModalBuilder()
+    .setCustomId(`scc:${interaction.id}:${targetId}`)
+    .setTitle('Send Clan Challenge');
+  const serverInput = new TextInputBuilder()
+    .setCustomId('scc_server')
+    .setLabel('Server')
+    .setRequired(true)
+    .setPlaceholder('e.g. Europe West')
+    .setStyle(TextInputStyle.Short);
+  const dateInput = new TextInputBuilder()
+    .setCustomId('scc_datetime')
+    .setLabel('Date & Time (ISO)')
+    .setRequired(true)
+    .setPlaceholder('2025-08-21T10:00')
+    .setStyle(TextInputStyle.Short);
+  const rulesInput = new TextInputBuilder()
+    .setCustomId('scc_rules')
+    .setLabel('Rules')
+    .setRequired(true)
+    .setPlaceholder('List any battle rules here')
+    .setStyle(TextInputStyle.Paragraph);
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(serverInput),
+    new ActionRowBuilder().addComponents(dateInput),
+    new ActionRowBuilder().addComponents(rulesInput),
+  );
+  // Show the modal to the user. We do not need to defer in the slash handler when showing a modal.
+  return interaction.showModal(modal);
+}
+
+/**
+ * Broadcast an accepted clan battle to all configured guild channels. This
+ * function is called when a battle is added or updated. Only battles with
+ * `status === 'accepted'` will be announced. Each guild’s announcement is
+ * tracked under `battles/<battleId>/postedToDiscord/<guildId>` so that we
+ * don’t post duplicates. If a battle was accepted more than a configurable
+ * number of milliseconds ago, it won’t be broadcast. Use the
+ * BATTLE_BROADCAST_MAX_AGE_MS env var or default to 30 minutes.
+ */
+async function maybeBroadcastBattle(battleId, battle) {
+  try {
+    if (!battle || battle.status !== 'accepted') return;
+    // Skip if the battle is too old. Use createdAt as proxy; if missing, broadcast anyway.
+    const maxAge = parseInt(process.env.BATTLE_BROADCAST_MAX_AGE_MS || '1800000', 10);
+    const created = battle.createdAt || Date.now();
+    if (Date.now() - created > maxAge) return;
+    // Load clan and user data once
+    const [clansSnap, usersSnap] = await Promise.all([
+      rtdb.ref('clans').get(),
+      rtdb.ref('users').get(),
+    ]);
+    const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+    const usersData = usersSnap.exists() ? usersSnap.val() || {} : {};
+    // Iterate over configured guilds
+    for (const [guildId, channelId] of globalCache.battleDestinations.entries()) {
+      const flagRef = rtdb.ref(`battles/${battleId}/postedToDiscord/${guildId}`);
+      try {
+        const tx = await flagRef.transaction(cur => {
+          if (cur) return; // already posted
+          return { pending: true, by: client.user.id, at: Date.now() };
+        });
+        if (!tx.committed) continue;
+        // Fetch channel and check permission
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (!channel || !channel.isTextBased?.()) {
+          await flagRef.remove();
+          continue;
+        }
+        const me = channel.guild?.members.me || await channel.guild?.members.fetchMe().catch(() => null);
+        if (!me) {
+          await flagRef.remove();
+          continue;
+        }
+        const ok = channel.permissionsFor(me).has([
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+        ]);
+        if (!ok) {
+          await flagRef.remove();
+          continue;
+        }
+        // Build embed (without extended description by default)
+        const embed = buildBattleDetailEmbed(battleId, battle, clansData, usersData, false);
+        // Buttons: join + info
+        const joinBtn = new ButtonBuilder()
+          .setCustomId(`battle:join:${battleId}`)
+          .setLabel('Join')
+          .setStyle(ButtonStyle.Success);
+        const infoBtn = new ButtonBuilder()
+          .setCustomId(`battle:info:${battleId}:show`)
+          .setLabel('Info')
+          .setStyle(ButtonStyle.Secondary);
+        const row = new ActionRowBuilder().addComponents(joinBtn, infoBtn);
+        const msg = await channel.send({ embeds: [embed], components: [row] });
+        await flagRef.set({
+          messageId: msg.id,
+          channelId: channel.id,
+          by: client.user.id,
+          at: admin.database.ServerValue.TIMESTAMP,
+        });
+        console.log(`[battle broadcast] posted battle ${battleId} to guild ${guildId}`);
+      } catch (e) {
+        console.error(`[battle broadcast] failed posting to ${guildId}:`, e);
+        await flagRef.remove();
+      }
+    }
+  } catch (e) {
+    console.error('[battle broadcast] error in maybeBroadcastBattle:', e);
+  }
+}
+
 // ---------- Discord Client ----------
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -1676,6 +2101,42 @@ const clanBattlesCmd = new SlashCommandBuilder()
   .setName('clanbattles')
   .setDescription('View clan battles and sign up if your clan is participating');
 
+// Command: Send Clan Challenge
+// Allows clan owners to challenge another clan to a battle. Owners will provide the target clan name or ID and then fill out
+// server, date/time and rules via a modal. Only owners can use this command.
+const sendClanChallengeCmd = new SlashCommandBuilder()
+  .setName('sendclanchallenge')
+  .setDescription('Challenge another clan to a battle (owner only)')
+  .addStringOption(opt =>
+    opt.setName('clan')
+      .setDescription('Name or ID of the target clan')
+      .setRequired(true)
+  );
+
+// Command: Incoming Challenges
+// Allows clan owners to view pending challenges for their clan and accept or decline them.
+const incomingChallengesCmd = new SlashCommandBuilder()
+  .setName('incomingchallenges')
+  .setDescription('View and respond to pending clan battle challenges (owner only)');
+
+// Command: Get Clan Roles
+// Assigns the clan role to the invoking user. If the role doesn’t exist, it will be created with the clan’s name and icon.
+const getClanRolesCmd = new SlashCommandBuilder()
+  .setName('getclanroles')
+  .setDescription('Assign yourself your clan role (creates it if missing)');
+
+// Command: Set Events Channel
+// Configures which channel new accepted clan battles will be announced in this server. Requires Manage Guild.
+const setEventsChannelCmd = new SlashCommandBuilder()
+  .setName('seteventschannel')
+  .setDescription('Choose the channel where new clan battles will be announced.')
+  .addChannelOption(opt =>
+    opt.setName('channel')
+      .setDescription('Text or Announcement channel in this server')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(true)
+  );
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
@@ -1683,6 +2144,10 @@ const commandsJson = [
   latestFiveCmd,
   clansCmd // <-- add the clans command here
   , clanBattlesCmd // <-- register the clan battles command
+  , sendClanChallengeCmd // register send clan challenge command
+  , incomingChallengesCmd // register incoming challenges command
+  , getClanRolesCmd // register get clan roles command
+  , setEventsChannelCmd // register set events channel command
 ].map(c => c.toJSON());
 
 
@@ -1754,6 +2219,18 @@ client.on('interactionCreate', async (interaction) => {
       try {
         // This command replies with a modal
         await showVoteModal(interaction);
+      } catch (err) {
+        console.error(`[${commandName}]`, err);
+        // If showModal fails, we must send a reply
+        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
+      }
+      return;
+    }
+
+    // New: sendclanchallenge opens a modal and must not be deferred
+    if (commandName === 'sendclanchallenge') {
+      try {
+        await handleSendClanChallenge(interaction);
       } catch (err) {
         console.error(`[${commandName}]`, err);
         // If showModal fails, we must send a reply
@@ -2192,6 +2669,18 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '❌ Failed to load clan battles.', embeds: [], components: [] });
           }
         }
+        // Handle /incomingchallenges command (view and respond to pending challenges)
+        else if (commandName === 'incomingchallenges') {
+          await handleIncomingChallenges(interaction);
+        }
+        // Handle /getclanroles command (create or assign clan role)
+        else if (commandName === 'getclanroles') {
+          await handleGetClanRoles(interaction);
+        }
+        // Handle /seteventschannel command (configure battle announcements)
+        else if (commandName === 'seteventschannel') {
+          await handleSetEventsChannel(interaction);
+        }
 
     } catch (err) {
         console.error(`[${commandName}]`, err);
@@ -2484,6 +2973,186 @@ client.on('interactionCreate', async (interaction) => {
           return safeReply(interaction, { embeds: [embed], components: [row] });
         }
         // Unknown cb action falls through
+      }
+      // Handle clan challenge accept/decline buttons (cc: prefix)
+      else if (id.startsWith('cc:')) {
+        const parts = id.split(':');
+        // cc:<action>:<parentId>:<battleId>
+        const action = parts[1];
+        const parentId = parts[2];
+        const battleId = parts[3];
+        // Restrict to the user who invoked the command
+        const invokerId = interaction.message?.interaction?.user?.id;
+        if (invokerId && invokerId !== interaction.user.id) {
+          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
+        }
+        // Retrieve the cached list
+        const cache = interaction.client.challengeCache?.get(parentId);
+        if (!cache) {
+          return safeReply(interaction, { content: 'This challenge list has expired. Run `/incomingchallenges` again.', ephemeral: true });
+        }
+        // Ensure this battle is still pending
+        const idx = cache.pendingList.findIndex(([bid]) => bid === battleId);
+        if (idx < 0) {
+          return safeReply(interaction, { content: 'Challenge not found. It may have been updated.', ephemeral: true });
+        }
+        const [bid, battle] = cache.pendingList[idx];
+        // Confirm the user is still the owner of their clan
+        let uid;
+        try {
+          uid = await getKCUidForDiscord(interaction.user.id);
+        } catch (_) { uid = null; }
+        if (!uid) {
+          return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+        }
+        // Reload clan to check owner
+        const clanSnap = await rtdb.ref(`clans/${cache.clanId}`).get();
+        const clan = clanSnap.exists() ? clanSnap.val() || {} : {};
+        if (getOwnerUid(clan) !== uid) {
+          return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
+        }
+        // Update battle status
+        try {
+          if (action === 'accept') {
+            await rtdb.ref(`battles/${battleId}`).update({ status: 'accepted', acceptedBy: uid, acceptedAt: admin.database.ServerValue.TIMESTAMP });
+          } else if (action === 'decline') {
+            await rtdb.ref(`battles/${battleId}`).update({ status: 'declined', declinedBy: uid, declinedAt: admin.database.ServerValue.TIMESTAMP });
+          } else {
+            return safeReply(interaction, { content: 'Unknown action.', ephemeral: true });
+          }
+        } catch (e) {
+          console.error('[cc action] failed to update battle:', e);
+          return safeReply(interaction, { content: 'Failed to update the challenge. Try again later.', ephemeral: true });
+        }
+        // Remove from cache list
+        cache.pendingList.splice(idx, 1);
+        // If no more pending, clear message
+        if (cache.pendingList.length === 0) {
+          interaction.client.challengeCache.delete(parentId);
+          await safeDefer(interaction, { intent: 'update' });
+          return safeReply(interaction, { content: 'All challenges processed.', embeds: [], components: [] });
+        }
+        // Otherwise, rebuild embed and rows
+        const clansSnap = await rtdb.ref('clans').get();
+        const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+        const embed = new EmbedBuilder()
+          .setTitle('Incoming Clan Challenges')
+          .setDescription('Below are the pending clan battle challenges. Use the buttons to accept or decline.')
+          .setColor(DEFAULT_EMBED_COLOR)
+          .setFooter({ text: 'KC Bot • /incomingchallenges' });
+        cache.pendingList.slice(0, 10).forEach(([bid2, b2], idx2) => {
+          const c1 = clansData[b2.challengerId] || {};
+          const c2 = clansData[b2.targetId] || {};
+          const d = b2.scheduledTime ? new Date(b2.scheduledTime) : null;
+          const dateStr = d ? d.toLocaleDateString('en-GB', { timeZone: 'Europe/London' }) : 'N/A';
+          const timeStr = d ? d.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }) : '';
+          const title = `${c1.name || b2.challengerId} vs ${c2.name || b2.targetId}`;
+          const lines = [];
+          if (b2.server) lines.push(`Server: ${b2.server}`);
+          if (b2.scheduledTime) lines.push(`Date: ${dateStr} ${timeStr}`);
+          if (b2.rules) lines.push(`Rules: ${b2.rules}`);
+          embed.addFields({ name: `${idx2 + 1}. ${title}`, value: lines.join('\n') || '\u200b' });
+        });
+        const rows = [];
+        cache.pendingList.slice(0, 10).forEach(([bid2], idx2) => {
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`cc:accept:${parentId}:${bid2}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`cc:decline:${parentId}:${bid2}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+          );
+          rows.push(row);
+        });
+        // Update the message
+        await safeDefer(interaction, { intent: 'update' });
+        return safeReply(interaction, { embeds: [embed], components: rows });
+      }
+
+      // Handle battle announcement buttons (battle: prefix)
+      else if (id.startsWith('battle:')) {
+        const parts = id.split(':');
+        // battle:<action>:<battleId>[:<mode>]
+        const action = parts[1];
+        const battleId = parts[2];
+        const mode = parts[3] || 'show';
+        // Load battle data
+        const bSnap = await rtdb.ref(`battles/${battleId}`).get();
+        if (!bSnap.exists()) {
+          return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
+        }
+        const battle = bSnap.val() || {};
+        // Load clans and users
+        const [clansSnap2, usersSnap2] = await Promise.all([
+          rtdb.ref('clans').get(),
+          rtdb.ref('users').get(),
+        ]);
+        const clansData2 = clansSnap2.exists() ? clansSnap2.val() || {} : {};
+        const usersData2 = usersSnap2.exists() ? usersSnap2.val() || {} : {};
+        let uid2 = null;
+        try { uid2 = await getKCUidForDiscord(interaction.user.id); } catch (_) {}
+        // Process join action
+        if (action === 'join') {
+          if (!uid2) {
+            return safeReply(interaction, { content: 'Link your KC account with /link first to join battles.', ephemeral: true });
+          }
+          // Determine the user's clan
+          let userClanId = null;
+          for (const [cid, c] of Object.entries(clansData2)) {
+            if (c.members && c.members[uid2]) {
+              userClanId = cid;
+              break;
+            }
+          }
+          if (!userClanId) {
+            return safeReply(interaction, { content: 'You must be in a clan to join this battle.', ephemeral: true });
+          }
+          if (!(battle.challengerId === userClanId || battle.targetId === userClanId)) {
+            return safeReply(interaction, { content: 'You are not a member of either participating clan.', ephemeral: true });
+          }
+          if (battle.status === 'finished') {
+            return safeReply(interaction, { content: 'This battle has already finished.', ephemeral: true });
+          }
+          if (battle.participants && battle.participants[uid2]) {
+            return safeReply(interaction, { content: 'You have already joined this battle.', ephemeral: true });
+          }
+          // Write to DB
+          try {
+            await rtdb.ref(`battles/${battleId}/participants/${uid2}`).set(userClanId);
+            battle.participants = battle.participants || {};
+            battle.participants[uid2] = userClanId;
+          } catch (e) {
+            console.error('[battle join] failed:', e);
+            return safeReply(interaction, { content: 'Failed to join the battle. Try again later.', ephemeral: true });
+          }
+        }
+        // Determine if description should be included (for info action)
+        const includeDesc = (action === 'info' && mode === 'show');
+        const embed = buildBattleDetailEmbed(battleId, battle, clansData2, usersData2, includeDesc);
+        // Determine join button state for the current user (if logged in and in clan)
+        let joinBtn;
+        const canJoin2 = (
+          battle.status !== 'finished' &&
+          uid2 && (() => {
+            let userClanId = null;
+            for (const [cid, c] of Object.entries(clansData2)) {
+              if (c.members && c.members[uid2]) { userClanId = cid; break; }
+            }
+            return userClanId && (battle.challengerId === userClanId || battle.targetId === userClanId) && !(battle.participants && battle.participants[uid2]);
+          })()
+        );
+        if (canJoin2) {
+          joinBtn = new ButtonBuilder().setCustomId(`battle:join:${battleId}`).setLabel('Join').setStyle(ButtonStyle.Success);
+        } else {
+          // If user is logged in and already joined, disable button with Joined label; else disabled Join
+          let label = 'Join';
+          if (uid2 && battle.participants && battle.participants[uid2]) label = 'Joined';
+          joinBtn = new ButtonBuilder().setCustomId('battle:join:disabled').setLabel(label).setStyle(ButtonStyle.Secondary).setDisabled(true);
+        }
+        // Info button toggles show/hide description
+        const nextMode2 = includeDesc ? 'hide' : 'show';
+        const infoLabel2 = includeDesc ? 'Hide Info' : 'Info';
+        const infoBtn2 = new ButtonBuilder().setCustomId(`battle:info:${battleId}:${nextMode2}`).setLabel(infoLabel2).setStyle(ButtonStyle.Secondary);
+        const row2 = new ActionRowBuilder().addComponents(joinBtn, infoBtn2);
+        await safeDefer(interaction, { intent: 'update' });
+        return safeReply(interaction, { embeds: [embed], components: [row2] });
       }
       // For buttons opening modals, we must reply/showModal, not defer.
       if (id.startsWith('msg:reply')) {
@@ -2962,7 +3631,71 @@ client.on('interactionCreate', async (interaction) => {
     // Modals are deferred with ephemeral
     await safeDefer(interaction, { ephemeral: true });
     try {
-      if (customId.startsWith('clips:commentModal:')) {
+      if (customId.startsWith('scc:')) {
+        // Handle Send Clan Challenge modal submission
+        // customId format: scc:<parentInteractionId>:<targetClanId>
+        const parts = customId.split(':');
+        const parentId = parts[1];
+        const targetClanId = parts[2];
+        // Validate the invoking user is still linked and is a clan owner
+        const discordId = interaction.user.id;
+        const uid = await getKCUidForDiscord(discordId);
+        if (!uid) {
+          return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
+        }
+        // Fetch clans to determine the user’s clan and ownership
+        const clansSnap = await rtdb.ref('clans').get();
+        const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
+        let myClanId = null;
+        let myClan = null;
+        for (const [cid, c] of Object.entries(clansData)) {
+          if (c.members && c.members[uid]) {
+            myClanId = cid;
+            myClan = c;
+            break;
+          }
+        }
+        if (!myClanId) {
+          return safeReply(interaction, { content: 'You are not in a clan.', ephemeral: true });
+        }
+        if (getOwnerUid(myClan) !== uid) {
+          return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
+        }
+        // Parse modal inputs
+        const server = (interaction.fields.getTextInputValue('scc_server') || '').trim();
+        const dtStr = (interaction.fields.getTextInputValue('scc_datetime') || '').trim();
+        const rules = (interaction.fields.getTextInputValue('scc_rules') || '').trim();
+        if (!server || !dtStr || !rules) {
+          return safeReply(interaction, { content: 'All fields are required.', ephemeral: true });
+        }
+        const date = new Date(dtStr);
+        if (!isFinite(date.getTime())) {
+          return safeReply(interaction, { content: 'Invalid date/time. Use ISO 8601 format (e.g. 2025-08-21T10:00).', ephemeral: true });
+        }
+        // Build battle record
+        const scheduledMs = date.getTime();
+        // Optional legacy time string for display (HH:MM in London timezone)
+        const timeStr = date.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
+        const battleData = {
+          challengerId: myClanId,
+          targetId: targetClanId,
+          server,
+          scheduledTime: scheduledMs,
+          time: timeStr,
+          rules,
+          status: 'pending',
+          createdAt: admin.database.ServerValue.TIMESTAMP,
+        };
+        try {
+          await rtdb.ref('battles').push(battleData);
+        } catch (e) {
+          console.error('[scc modal] failed to create battle:', e);
+          return safeReply(interaction, { content: 'Failed to create the challenge. Try again later.', ephemeral: true });
+        }
+        // Acknowledge success
+        return safeReply(interaction, { content: '✅ Challenge sent! Your clan battle request is pending.', embeds: [], components: [], ephemeral: true });
+      }
+      else if (customId.startsWith('clips:commentModal:')) {
         const sid = customId.split(':')[2];
         const payload = readModalTarget(sid);
         if (!payload) return safeReply(interaction, { content: 'This action expired. Reopen the clip.', ephemeral: true });
@@ -3176,6 +3909,50 @@ client.once('ready', async () => {
     rtdb.ref('users').on('child_added', s => attachPostsListener(s.key));
   } catch (e) {
       console.error('[broadcast] failed to attach initial user listeners', e);
+  }
+
+  // Load clan battle/event destination channels and attach live updates
+  try {
+    const snap2 = await rtdb.ref('config/battleDestinations').get();
+    globalCache.battleDestinations.clear();
+    if (snap2.exists()) {
+      const all = snap2.val() || {};
+      for (const [guildId, cfg] of Object.entries(all)) {
+        if (cfg?.channelId) globalCache.battleDestinations.set(guildId, cfg.channelId);
+      }
+    }
+    console.log(`[battle broadcast] loaded initial battle destinations: ${globalCache.battleDestinations.size}`);
+    // Listen for updates to battle destinations
+    rtdb.ref('config/battleDestinations').on('child_added', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.battleDestinations.set(s.key, v.channelId);
+    });
+    rtdb.ref('config/battleDestinations').on('child_changed', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.battleDestinations.set(s.key, v.channelId);
+      else globalCache.battleDestinations.delete(s.key);
+    });
+    rtdb.ref('config/battleDestinations').on('child_removed', s => {
+      globalCache.battleDestinations.delete(s.key);
+    });
+  } catch (e) {
+    console.error('[battle broadcast] failed to load battle destinations', e);
+  }
+  // Attach listener for clan battles to broadcast accepted battles
+  try {
+    const ref = rtdb.ref('battles');
+    // Listen for new battles
+    ref.orderByChild('createdAt').startAt(Date.now() - 5000).on('child_added', s => {
+      const battle = s.val();
+      maybeBroadcastBattle(s.key, battle).catch(e => console.error('[battle broadcast] add error', e));
+    }, err => console.error('[battle broadcast] listener error (add)', err));
+    // Listen for updates (e.g., pending -> accepted)
+    ref.on('child_changed', s => {
+      const battle = s.val();
+      maybeBroadcastBattle(s.key, battle).catch(e => console.error('[battle broadcast] change error', e));
+    }, err => console.error('[battle broadcast] listener error (change)', err));
+  } catch (e) {
+    console.error('[battle broadcast] failed to attach battle listeners', e);
   }
 });
 
