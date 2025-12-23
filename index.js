@@ -902,24 +902,27 @@ function buildBattleDetailEmbed(battleId, battle = {}, clansData = {}, usersData
 }
 
 /**
- * Build the help embed for the given image URL. All help pages share the same
- * title and link list but differ in the image shown. This helper is used by
- * the multi‑page /help command implementation.
- * @param {string} imageUrl
+ * Build an embed for a help page. Each page includes a title, optional image, and
+ * a standard list of resource links. The color is consistent with other embeds.
+ *
+ * @param {object} page - An object with an `image` property (URL string).
+ * @returns {EmbedBuilder}
  */
-function buildHelpEmbed(imageUrl) {
+function buildHelpEmbed(page = {}) {
   const embed = new EmbedBuilder()
     .setTitle('KC Events — Help')
-    .setImage(imageUrl)
-    .setColor(DEFAULT_EMBED_COLOR)
-    .addFields({
-      name: 'Links',
-      value: [
-        'Full Messageboard : https://kcevents.uk/#chatscroll',
-        'Full Clips       : https://kcevents.uk/#socialfeed',
-        'Full Voting      : https://kcevents.uk/#voting',
-      ].join('\n'),
-    });
+    .setColor(DEFAULT_EMBED_COLOR);
+  if (page.image) {
+    embed.setImage(page.image);
+  }
+  embed.addFields({
+    name: 'Links',
+    value: [
+      'Full Messageboard : https://kcevents.uk/#chatscroll',
+      'Full Clips       : https://kcevents.uk/#socialfeed',
+      'Full Voting      : https://kcevents.uk/#voting',
+    ].join('\n'),
+  });
   return embed;
 }
 
@@ -1912,7 +1915,7 @@ async function maybeBroadcastBattle(battleId, battle) {
         }
         // Build embed (without extended description by default)
         const embed = buildBattleDetailEmbed(battleId, battle, clansData, usersData, false);
-        // Buttons: join + info (initial state, user not joined)
+        // Buttons: join + info. For broadcast messages we default to Join; the button will change on interaction.
         const joinBtn = new ButtonBuilder()
           .setCustomId(`battle:join:${battleId}`)
           .setLabel('Join')
@@ -1925,19 +1928,16 @@ async function maybeBroadcastBattle(battleId, battle) {
         // Mention clan roles if they exist in this guild
         let content = '';
         try {
-          const guild = channel.guild;
-          // Ensure roles cache is populated
-          await guild.roles.fetch().catch(() => {});
-          const challengerClan = clansData[battle.challengerId];
-          const targetClan = clansData[battle.targetId];
+          const c1 = clansData[battle.challengerId] || {};
+          const c2 = clansData[battle.targetId] || {};
           const mentions = [];
-          if (challengerClan) {
-            const roleCh = guild.roles.cache.find(r => r.name === challengerClan.name);
-            if (roleCh) mentions.push(`<@&${roleCh.id}>`);
+          if (c1.name) {
+            const r1 = channel.guild.roles.cache.find(r => r.name === c1.name);
+            if (r1) mentions.push(`<@&${r1.id}>`);
           }
-          if (targetClan) {
-            const roleT = guild.roles.cache.find(r => r.name === targetClan.name);
-            if (roleT) mentions.push(`<@&${roleT.id}>`);
+          if (c2.name) {
+            const r2 = channel.guild.roles.cache.find(r => r.name === c2.name);
+            if (r2) mentions.push(`<@&${r2.id}>`);
           }
           content = mentions.join(' ');
         } catch (_) {
@@ -1966,6 +1966,10 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
   partials: [Partials.Channel],
 });
+
+// Cache for /help pages navigation. Map key = parentId (unique per invocation).
+// Each entry: { pages: Array<page>, index: number, userId: string }
+client.helpCache = new Map();
 
 // --- Short-id caches for /clips actions ---// Map key = "<messageId>|<shortId>"
 client.reactCache = new Map();
@@ -2515,38 +2519,37 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '✅ Message posted!', ephemeral: true });
         }
         else if (commandName === 'help') {
-            // Present a multi‑page help embed. The first two pages use the new
-            // images provided by the user; the final page retains the original
-            // help image. Navigation buttons allow the user to switch pages.
+            // Build multi-page help with navigation buttons. The first two pages use new images
+            // supplied by the user; the last page uses the original help image. Store the
+            // pages in the helpCache keyed by the interaction ID so that button interactions
+            // can page through them later.
             const pages = [
-              'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link%203.png',
-              'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link4.png',
-              'https://kevinmidnight7-sudo.github.io/messageboardkc/link.png',
+              { image: 'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link%203.png' },
+              { image: 'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link4.png' },
+              { image: 'https://kevinmidnight7-sudo.github.io/messageboardkc/link.png' },
             ];
-            // Cache the pages and current index keyed by this interaction ID.
-            interaction.client.helpCache ??= new Map();
-            interaction.client.helpCache.set(interaction.id, {
+            const parentId = interaction.id;
+            // Initialise helpCache if needed and store the pages for this session
+            interaction.client.helpCache.set(parentId, {
               pages,
               index: 0,
               userId: interaction.user.id,
             });
-            // Auto‑expire the help state after 15 minutes to free memory
-            setTimeout(() => interaction.client.helpCache?.delete(interaction.id), 15 * 60 * 1000).unref();
-            // Build the first embed and navigation row. Disable the previous button on
-            // the first page and the next button when there is only one page.
+            // Automatically expire this cache entry after 15 minutes
+            setTimeout(() => interaction.client.helpCache.delete(parentId), 15 * 60 * 1000);
             const embed = buildHelpEmbed(pages[0]);
             const prevBtn = new ButtonBuilder()
-              .setCustomId(`help:prev:${interaction.id}`)
+              .setCustomId(`help:prev:${parentId}`)
               .setLabel('◀')
               .setStyle(ButtonStyle.Secondary)
               .setDisabled(true);
             const nextBtn = new ButtonBuilder()
-              .setCustomId(`help:next:${interaction.id}`)
+              .setCustomId(`help:next:${parentId}`)
               .setLabel('▶')
               .setStyle(ButtonStyle.Secondary)
               .setDisabled(pages.length <= 1);
             const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
-            await safeReply(interaction, { content: '', embeds: [embed], components: [row], ephemeral: true });
+            await safeReply(interaction, { embeds: [embed], components: [row] });
         }
         else if (commandName === 'compare') {
             const youDiscordId = interaction.user.id;
@@ -2755,9 +2758,10 @@ client.on('interactionCreate', async (interaction) => {
   } 
   // --- Button Handlers ---
   else if (interaction.isButton()) {
+    const id = interaction.customId;
     // Handle multi‑page /help navigation buttons. Custom IDs are of the form
     // help:<prev|next>:<parentId>. Only the original invoker may use these controls.
-    if (id.startsWith('help:')) {
+    if (id && id.startsWith('help:')) {
       const parts = id.split(':');
       const dir = parts[1];
       const parentId = parts[2];
@@ -2774,24 +2778,25 @@ client.on('interactionCreate', async (interaction) => {
       else if (dir === 'prev') newIndex -= 1;
       newIndex = Math.max(0, Math.min(cache.pages.length - 1, newIndex));
       cache.index = newIndex;
-      const embed = buildHelpEmbed(cache.pages[newIndex]);
+      const embedHelp = buildHelpEmbed(cache.pages[newIndex]);
       const prevDisabled = newIndex === 0;
       const nextDisabled = newIndex === cache.pages.length - 1;
-      const prevBtn = new ButtonBuilder()
+      const prevBtn2 = new ButtonBuilder()
         .setCustomId(`help:prev:${parentId}`)
         .setLabel('◀')
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(prevDisabled);
-      const nextBtn = new ButtonBuilder()
+      const nextBtn2 = new ButtonBuilder()
         .setCustomId(`help:next:${parentId}`)
         .setLabel('▶')
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(nextDisabled);
-      const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
+      const rowHelp = new ActionRowBuilder().addComponents(prevBtn2, nextBtn2);
       await safeDefer(interaction, { intent: 'update' });
-      return safeReply(interaction, { embeds: [embed], components: [row], ephemeral: true });
+      // When updating an existing message, omit the `ephemeral` flag; the interaction
+      // is already replied to.
+      return safeReply(interaction, { embeds: [embedHelp], components: [rowHelp] });
     }
-    const id = interaction.customId;
     try {
       // For clan battle controls (cb: prefix)
       if (id.startsWith('cb:')) {
@@ -2860,14 +2865,13 @@ client.on('interactionCreate', async (interaction) => {
           // Build detail embed
           // Build detail embed (default view does not show extended description)
           const embed = buildBattleDetailEmbed(battleId, battle, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Determine join eligibility and whether the user has already joined
-          const joined = battle.participants && battle.participants[cache.uid];
+          // Determine join eligibility
           let joinBtn;
           const canJoin = (
             battle.status !== 'finished' &&
             cache.uid && cache.userClanId &&
             (battle.challengerId === cache.userClanId || battle.targetId === cache.userClanId) &&
-            !joined
+            !(battle.participants && battle.participants[cache.uid])
           );
           if (canJoin) {
             joinBtn = new ButtonBuilder()
@@ -2875,21 +2879,20 @@ client.on('interactionCreate', async (interaction) => {
               .setLabel('Join')
               .setStyle(ButtonStyle.Success);
           } else {
-            // Disabled join (either not eligible or already joined)
-            const label = joined ? 'Joined' : 'Join';
-            joinBtn = new ButtonBuilder()
-              .setCustomId('cb:join:disabled')
-              .setLabel(label)
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true);
-          }
-          // If the user has joined, provide a leave button
-          let leaveBtn = null;
-          if (joined) {
-            leaveBtn = new ButtonBuilder()
-              .setCustomId(`cb:leave:${parentId}:${battleId}`)
-              .setLabel('Leave')
-              .setStyle(ButtonStyle.Danger);
+            // If already joined, show Leave button; otherwise disabled Join
+            const joined = battle.participants && battle.participants[cache.uid];
+            if (joined) {
+              joinBtn = new ButtonBuilder()
+                .setCustomId(`cb:leave:${parentId}:${battleId}`)
+                .setLabel('Leave')
+                .setStyle(ButtonStyle.Danger);
+            } else {
+              joinBtn = new ButtonBuilder()
+                .setCustomId('cb:join:disabled')
+                .setLabel('Join')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true);
+            }
           }
           // Info button to toggle extended description
           const infoBtn = new ButtonBuilder()
@@ -2900,11 +2903,7 @@ client.on('interactionCreate', async (interaction) => {
             .setCustomId(`cb:list:${parentId}`)
             .setLabel('Back')
             .setStyle(ButtonStyle.Secondary);
-          const rowBuilder = new ActionRowBuilder();
-          rowBuilder.addComponents(joinBtn);
-          if (leaveBtn) rowBuilder.addComponents(leaveBtn);
-          rowBuilder.addComponents(infoBtn, backBtn);
-          const row = rowBuilder;
+          const row = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn);
           await safeDefer(interaction, { intent: 'update' });
           return safeReply(interaction, { embeds: [embed], components: [row] });
         }
@@ -3000,13 +2999,7 @@ client.on('interactionCreate', async (interaction) => {
           }
           // Build updated detail view (default view without description)
           const embed = buildBattleDetailEmbed(battleId, battleRef, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Create disabled join button to indicate joined
-          const joinedBtn = new ButtonBuilder()
-            .setCustomId('cb:join:disabled')
-            .setLabel('Joined')
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true);
-          // Provide a leave button so a joined user can unjoin the battle
+          // Show a Leave button now that the user has joined
           const leaveBtn = new ButtonBuilder()
             .setCustomId(`cb:leave:${parentId}:${battleId}`)
             .setLabel('Leave')
@@ -3020,18 +3013,20 @@ client.on('interactionCreate', async (interaction) => {
             .setCustomId(`cb:list:${parentId}`)
             .setLabel('Back')
             .setStyle(ButtonStyle.Secondary);
-          const row = new ActionRowBuilder().addComponents(joinedBtn, leaveBtn, infoBtn2, backBtn2);
+          const row = new ActionRowBuilder().addComponents(leaveBtn, infoBtn2, backBtn2);
           await safeDefer(interaction, { intent: 'update' });
           return safeReply(interaction, { embeds: [embed], components: [row] });
         }
         else if (action === 'leave') {
-          // User wants to leave a battle. Param is the battle ID.
           const battleId = param;
-          // Ensure user has a clan
+          // Ensure user is linked and in a clan
+          if (!cache.uid) {
+            return safeReply(interaction, { content: 'Link your KC account with /link first to leave battles.', ephemeral: true });
+          }
           if (!cache.userClanId) {
             return safeReply(interaction, { content: 'You must be in a clan to leave this battle.', ephemeral: true });
           }
-          // Find battle reference in cache lists
+          // Find battle reference in cache
           let battleRef = null;
           for (const k of Object.keys(cache.lists)) {
             const arr = cache.lists[k];
@@ -3046,12 +3041,11 @@ client.on('interactionCreate', async (interaction) => {
           if (!battleRef) {
             return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
           }
-          // Check if the user is actually a participant
-          const alreadyJoined = battleRef.participants && battleRef.participants[cache.uid];
-          if (!alreadyJoined) {
-            return safeReply(interaction, { content: 'You have not joined this battle.', ephemeral: true });
+          const joined = battleRef.participants && battleRef.participants[cache.uid];
+          if (!joined) {
+            return safeReply(interaction, { content: 'You are not currently joined in this battle.', ephemeral: true });
           }
-          // Perform leave in database
+          // Remove from DB
           try {
             await withTimeout(
               rtdb.ref(`battles/${battleId}/participants/${cache.uid}`).remove(),
@@ -3073,39 +3067,39 @@ client.on('interactionCreate', async (interaction) => {
               }
             }
           }
-          // Build updated detail view without description
+          // Build updated detail view
           const embed = buildBattleDetailEmbed(battleId, battleRef, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Determine join eligibility after removal
-          const canJoin = (
+          // Determine new join/leave button
+          let btn;
+          const canJoinAgain = (
             battleRef.status !== 'finished' &&
             cache.uid && cache.userClanId &&
             (battleRef.challengerId === cache.userClanId || battleRef.targetId === cache.userClanId) &&
             !(battleRef.participants && battleRef.participants[cache.uid])
           );
-          let joinBtn;
-          if (canJoin) {
-            joinBtn = new ButtonBuilder()
+          if (canJoinAgain) {
+            btn = new ButtonBuilder()
               .setCustomId(`cb:join:${parentId}:${battleId}`)
               .setLabel('Join')
               .setStyle(ButtonStyle.Success);
           } else {
-            joinBtn = new ButtonBuilder()
+            btn = new ButtonBuilder()
               .setCustomId('cb:join:disabled')
               .setLabel('Join')
               .setStyle(ButtonStyle.Secondary)
               .setDisabled(true);
           }
-          const infoBtnLeave = new ButtonBuilder()
+          const infoBtn2 = new ButtonBuilder()
             .setCustomId(`cb:info:${parentId}:${battleId}:show`)
             .setLabel('Info')
             .setStyle(ButtonStyle.Secondary);
-          const backBtnLeave = new ButtonBuilder()
+          const backBtn2 = new ButtonBuilder()
             .setCustomId(`cb:list:${parentId}`)
             .setLabel('Back')
             .setStyle(ButtonStyle.Secondary);
-          const rowLeave = new ActionRowBuilder().addComponents(joinBtn, infoBtnLeave, backBtnLeave);
+          const row2 = new ActionRowBuilder().addComponents(btn, infoBtn2, backBtn2);
           await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: [rowLeave] });
+          return safeReply(interaction, { embeds: [embed], components: [row2] });
         }
         else if (action === 'info') {
           // Toggle additional description view for a battle
@@ -3166,23 +3160,7 @@ client.on('interactionCreate', async (interaction) => {
             .setCustomId(`cb:list:${parentId}`)
             .setLabel('Back')
             .setStyle(ButtonStyle.Secondary);
-          // If the user has already joined, provide a leave button
-          const joinedFlag = battleRef.participants && battleRef.participants[cache.uid];
-          let row;
-          if (joinedFlag) {
-            const joinedBtn = new ButtonBuilder()
-              .setCustomId('cb:join:disabled')
-              .setLabel('Joined')
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true);
-            const leaveBtn = new ButtonBuilder()
-              .setCustomId(`cb:leave:${parentId}:${battleId}`)
-              .setLabel('Leave')
-              .setStyle(ButtonStyle.Danger);
-            row = new ActionRowBuilder().addComponents(joinedBtn, leaveBtn, infoBtn, backBtn3);
-          } else {
-            row = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn3);
-          }
+          const row = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn3);
           await safeDefer(interaction, { intent: 'update' });
           return safeReply(interaction, { embeds: [embed], components: [row] });
         }
@@ -3302,21 +3280,18 @@ client.on('interactionCreate', async (interaction) => {
         const usersData2 = usersSnap2.exists() ? usersSnap2.val() || {} : {};
         let uid2 = null;
         try { uid2 = await getKCUidForDiscord(interaction.user.id); } catch (_) {}
-        // Determine whether the user is currently a participant
-        let userClanId = null;
-        if (uid2) {
+        // Process join and leave actions
+        if (action === 'join') {
+          if (!uid2) {
+            return safeReply(interaction, { content: 'Link your KC account with /link first to join battles.', ephemeral: true });
+          }
+          // Determine the user's clan
+          let userClanId = null;
           for (const [cid, c] of Object.entries(clansData2)) {
             if (c.members && c.members[uid2]) {
               userClanId = cid;
               break;
             }
-          }
-        }
-        let joinedFlag = uid2 && battle.participants && battle.participants[uid2];
-        // Process join or leave actions
-        if (action === 'join') {
-          if (!uid2) {
-            return safeReply(interaction, { content: 'Link your KC account with /link first to join battles.', ephemeral: true });
           }
           if (!userClanId) {
             return safeReply(interaction, { content: 'You must be in a clan to join this battle.', ephemeral: true });
@@ -3327,31 +3302,44 @@ client.on('interactionCreate', async (interaction) => {
           if (battle.status === 'finished') {
             return safeReply(interaction, { content: 'This battle has already finished.', ephemeral: true });
           }
-          if (joinedFlag) {
+          if (battle.participants && battle.participants[uid2]) {
             return safeReply(interaction, { content: 'You have already joined this battle.', ephemeral: true });
           }
-          // Add to participants
+          // Write to DB
           try {
             await rtdb.ref(`battles/${battleId}/participants/${uid2}`).set(userClanId);
             battle.participants = battle.participants || {};
             battle.participants[uid2] = userClanId;
-            joinedFlag = true;
           } catch (e) {
             console.error('[battle join] failed:', e);
             return safeReply(interaction, { content: 'Failed to join the battle. Try again later.', ephemeral: true });
           }
-        } else if (action === 'leave') {
-          // Remove participant
+        }
+        else if (action === 'leave') {
+          // Remove the current user from participants if eligible
           if (!uid2) {
             return safeReply(interaction, { content: 'Link your KC account with /link first to leave battles.', ephemeral: true });
           }
-          if (!joinedFlag) {
-            return safeReply(interaction, { content: 'You are not a participant of this battle.', ephemeral: true });
+          // Determine the user's clan
+          let userClanId2 = null;
+          for (const [cid, c] of Object.entries(clansData2)) {
+            if (c.members && c.members[uid2]) { userClanId2 = cid; break; }
           }
+          if (!userClanId2) {
+            return safeReply(interaction, { content: 'You must be in a clan to leave this battle.', ephemeral: true });
+          }
+          if (!(battle.challengerId === userClanId2 || battle.targetId === userClanId2)) {
+            return safeReply(interaction, { content: 'You are not a member of either participating clan.', ephemeral: true });
+          }
+          if (!battle.participants || !battle.participants[uid2]) {
+            return safeReply(interaction, { content: 'You have not joined this battle.', ephemeral: true });
+          }
+          // Remove from DB and update local state
           try {
             await rtdb.ref(`battles/${battleId}/participants/${uid2}`).remove();
-            if (battle.participants) delete battle.participants[uid2];
-            joinedFlag = false;
+            if (battle.participants) {
+              delete battle.participants[uid2];
+            }
           } catch (e) {
             console.error('[battle leave] failed:', e);
             return safeReply(interaction, { content: 'Failed to leave the battle. Try again later.', ephemeral: true });
@@ -3360,33 +3348,33 @@ client.on('interactionCreate', async (interaction) => {
         // Determine if description should be included (for info action)
         const includeDesc = (action === 'info' && mode === 'show');
         const embed = buildBattleDetailEmbed(battleId, battle, clansData2, usersData2, includeDesc);
-        // Build row: show join/leave buttons based on participation
+        // Determine join button state for the current user (if logged in and in clan)
+        let joinBtn;
+        const canJoin2 = (
+          battle.status !== 'finished' &&
+          uid2 && (() => {
+            let userClanId = null;
+            for (const [cid, c] of Object.entries(clansData2)) {
+              if (c.members && c.members[uid2]) { userClanId = cid; break; }
+            }
+            return userClanId && (battle.challengerId === userClanId || battle.targetId === userClanId) && !(battle.participants && battle.participants[uid2]);
+          })()
+        );
+        if (canJoin2) {
+          joinBtn = new ButtonBuilder().setCustomId(`battle:join:${battleId}`).setLabel('Join').setStyle(ButtonStyle.Success);
+        } else {
+          // If user is logged in and already joined, offer Leave button; else disable Join
+          if (uid2 && battle.participants && battle.participants[uid2]) {
+            joinBtn = new ButtonBuilder().setCustomId(`battle:leave:${battleId}`).setLabel('Leave').setStyle(ButtonStyle.Danger);
+          } else {
+            joinBtn = new ButtonBuilder().setCustomId('battle:join:disabled').setLabel('Join').setStyle(ButtonStyle.Secondary).setDisabled(true);
+          }
+        }
+        // Info button toggles show/hide description
         const nextMode2 = includeDesc ? 'hide' : 'show';
         const infoLabel2 = includeDesc ? 'Hide Info' : 'Info';
         const infoBtn2 = new ButtonBuilder().setCustomId(`battle:info:${battleId}:${nextMode2}`).setLabel(infoLabel2).setStyle(ButtonStyle.Secondary);
-        let row2;
-        if (joinedFlag) {
-          // User has joined: show disabled Joined, Leave, Info
-          const joinedBtn = new ButtonBuilder().setCustomId('battle:join:disabled').setLabel('Joined').setStyle(ButtonStyle.Secondary).setDisabled(true);
-          const leaveBtn2 = new ButtonBuilder().setCustomId(`battle:leave:${battleId}`).setLabel('Leave').setStyle(ButtonStyle.Danger);
-          row2 = new ActionRowBuilder().addComponents(joinedBtn, leaveBtn2, infoBtn2);
-        } else {
-          // Determine if user can join
-          const canJoin2 = (
-            battle.status !== 'finished' &&
-            uid2 && userClanId && (battle.challengerId === userClanId || battle.targetId === userClanId) &&
-            !(battle.participants && battle.participants[uid2])
-          );
-          let joinBtn2;
-          if (canJoin2) {
-            joinBtn2 = new ButtonBuilder().setCustomId(`battle:join:${battleId}`).setLabel('Join').setStyle(ButtonStyle.Success);
-          } else {
-            let label = 'Join';
-            if (uid2 && battle.participants && battle.participants[uid2]) label = 'Joined';
-            joinBtn2 = new ButtonBuilder().setCustomId('battle:join:disabled').setLabel(label).setStyle(ButtonStyle.Secondary).setDisabled(true);
-          }
-          row2 = new ActionRowBuilder().addComponents(joinBtn2, infoBtn2);
-        }
+        const row2 = new ActionRowBuilder().addComponents(joinBtn, infoBtn2);
         await safeDefer(interaction, { intent: 'update' });
         return safeReply(interaction, { embeds: [embed], components: [row2] });
       }
@@ -4228,4 +4216,3 @@ client.once('ready', async () => {
     process.exit(1);
   });
 })();
-
