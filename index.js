@@ -314,6 +314,32 @@ async function safeReply(interaction, options) {
 }
 // --- END PATCH (Step 1) ---
 
+// --- Battledome Helpers ---
+const BD = {
+  LIST_URL: 'http://snakey.monster/bdlist.json',
+  TIMEOUT_MS: 3500,
+};
+
+async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
+
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function buildBdInfoUrl(serverStr) {
+  // The spec says: "server name with /bdinfo.json added"
+  // If serverStr already includes protocol, keep it. Otherwise assume http://
+  const base = /^https?:\/\//i.test(serverStr) ? serverStr : `http://${serverStr}`;
+  return base.replace(/\/+$/, '') + '/bdinfo.json';
+}
+// --- End Battledome Helpers ---
 
 async function hasEmerald(uid) {
   // Prefer RTDB; fall back to Firestore if needed
@@ -2184,6 +2210,12 @@ const setEventsChannelCmd = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+// Command: Battledome
+// View Battledome servers and who is currently playing
+const battledomeCmd = new SlashCommandBuilder()
+  .setName('battledome')
+  .setDescription('View Battledome servers and who is currently playing');
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
@@ -2195,6 +2227,7 @@ const commandsJson = [
   , incomingChallengesCmd // register incoming challenges command
   , getClanRolesCmd // register get clan roles command
   , setEventsChannelCmd // register set events channel command
+  , battledomeCmd // register battledome command
 ].map(c => c.toJSON());
 
 
@@ -2745,6 +2778,42 @@ client.on('interactionCreate', async (interaction) => {
         // Handle /seteventschannel command (configure battle announcements)
         else if (commandName === 'seteventschannel') {
           await handleSetEventsChannel(interaction);
+        }
+        // Handle /battledome command
+        else if (commandName === 'battledome') {
+          const list = await fetchJson(BD.LIST_URL);
+          const servers = Array.isArray(list?.bdservers) ? list.bdservers : [];
+          if (!servers.length) {
+            return safeReply(interaction, { content: 'No Battledome servers found right now.', ephemeral: true });
+          }
+        
+          // Build select options (max 25 for Discord select menus)
+          const options = servers.slice(0, 25).map((s, idx) => ({
+            label: clampStr(`${s.name || 'Unknown'} (${s.location || 'Unknown'})`, 100, 'Unknown'),
+            description: clampStr(String(s.address || s.ip || s.server || 'No address'), 100, '—'),
+            value: String(idx),
+          }));
+        
+          const parentId = interaction.id;
+          interaction.client.bdCache ??= new Map();
+          interaction.client.bdCache.set(parentId, { servers });
+          setTimeout(() => interaction.client.bdCache?.delete(parentId), 15 * 60 * 1000).unref?.();
+        
+          const select = new StringSelectMenuBuilder()
+            .setCustomId(`bd_select:${parentId}`)
+            .setPlaceholder('Select a Battledome server…')
+            .addOptions(options);
+        
+          const embed = new EmbedBuilder()
+            .setTitle('Battledome Servers')
+            .setDescription('Pick a server to see who is online + who is in the dome right now.')
+            .setColor(DEFAULT_EMBED_COLOR)
+            .setFooter({ text: 'KC Bot • /battledome' });
+        
+          return safeReply(interaction, {
+            embeds: [embed],
+            components: [new ActionRowBuilder().addComponents(select)],
+          });
         }
 
     } catch (err) {
@@ -3775,78 +3844,129 @@ client.on('interactionCreate', async (interaction) => {
   else if (interaction.isStringSelectMenu()) {
     const [prefix, parentInteractionId] = interaction.customId.split(':');
   
-    // only handle clan selection menus
-    if (prefix !== 'clans_select') return;
-  
-    // --- FIX (Item 3): Defer *after* validation ---
-    try {
-      const clanId = interaction.values[0];
-      const cache = interaction.client.clanCache?.get(parentInteractionId);
-      if (!cache) {
-        // No defer yet; reply ephemeral
-        return safeReply(interaction, { 
-            content: 'Clan data has expired. Run `/clans` again.',
-            ephemeral: true
-        });
-      }
-
-      // We know we’ll update the existing menu message
-      await safeDefer(interaction, { intent: 'update' });
-      // --- END FIX ---
-    
-      const { entries, usersData, badgesData } = cache;
-      const clan = entries.find(c => c.id === clanId);
-      if (!clan) {
-        return safeReply(interaction, { content: 'Clan not found.', embeds: [], components: [] });
-      }
-    
-      // build member display names
-      let memberNames = '';
-      if (clan.members) {
-        memberNames = Object.keys(clan.members)
-          .map(uid => usersData[uid]?.displayName || uid)
-          .join(', ');
-        if (memberNames.length > 1024) {
-          memberNames = memberNames.slice(0, 1020) + '…';
+    if (prefix === 'clans_select') {
+      try {
+        const clanId = interaction.values[0];
+        const cache = interaction.client.clanCache?.get(parentInteractionId);
+        if (!cache) {
+          // No defer yet; reply ephemeral
+          return safeReply(interaction, { 
+              content: 'Clan data has expired. Run `/clans` again.',
+              ephemeral: true
+          });
         }
+  
+        // We know we’ll update the existing menu message
+        await safeDefer(interaction, { intent: 'update' });
+      
+        const { entries, usersData, badgesData } = cache;
+        const clan = entries.find(c => c.id === clanId);
+        if (!clan) {
+          return safeReply(interaction, { content: 'Clan not found.', embeds: [], components: [] });
+        }
+      
+        // build member display names
+        let memberNames = '';
+        if (clan.members) {
+          memberNames = Object.keys(clan.members)
+            .map(uid => usersData[uid]?.displayName || uid)
+            .join(', ');
+          if (memberNames.length > 1024) {
+            memberNames = memberNames.slice(0, 1020) + '…';
+          }
+        }
+      
+        const owner = usersData[clan.owner] || {};
+      
+        // recompute score in case it is needed
+        const score = computeClanScore(clan, usersData, badgesData);
+      
+        const detailEmbed = new EmbedBuilder()
+          .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
+          .setDescription(clan.description || 'No description provided.')
+          .addFields(
+            { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
+            { name: 'Points', value: `${score}`, inline: true },
+            { name: 'Members', value: memberNames || 'No members', inline: false },
+          )
+          .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
+          .setColor(DEFAULT_EMBED_COLOR);
+  
+        // Guard missing/invalid icon URL on the embed
+        if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
+          detailEmbed.setThumbnail(clan.icon);
+        }
+      
+        await safeReply(interaction, {
+          content: '',
+          embeds: [detailEmbed],
+          components: [], // remove the select menu once a clan is chosen
+        });
+  
+        // Delete the cache after selection
+        interaction.client.clanCache?.delete(parentInteractionId);
+  
+      } catch (err) {
+          console.error(`[select:${prefix}]`, err);
+          await safeReply(interaction, { 
+              content: '❌ Sorry, something went wrong.', 
+              ephemeral: true, embeds: [], components: [] 
+          });
       }
-    
-      const owner = usersData[clan.owner] || {};
-    
-      // recompute score in case it is needed
-      const score = computeClanScore(clan, usersData, badgesData);
-    
-      const detailEmbed = new EmbedBuilder()
-        .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
-        .setDescription(clan.description || 'No description provided.')
-        .addFields(
-          { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
-          { name: 'Points', value: `${score}`, inline: true },
-          { name: 'Members', value: memberNames || 'No members', inline: false },
-        )
-        .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
-        .setColor(DEFAULT_EMBED_COLOR);
+    } else if (prefix === 'bd_select') {
+      try {
+          const cache = interaction.client.bdCache?.get(parentInteractionId);
+          if (!cache) {
+            return safeReply(interaction, { content: 'This Battledome menu expired. Run `/battledome` again.', ephemeral: true });
+          }
+      
+          await safeDefer(interaction, { intent: 'update' });
 
-      // Guard missing/invalid icon URL on the embed
-      if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
-        detailEmbed.setThumbnail(clan.icon);
-      }
-    
-      await safeReply(interaction, {
-        content: '',
-        embeds: [detailEmbed],
-        components: [], // remove the select menu once a clan is chosen
-      });
-
-      // Delete the cache after selection
-      interaction.client.clanCache?.delete(parentInteractionId);
-
-    } catch (err) {
+          const idx = parseInt(interaction.values?.[0] || '', 10);
+          const s = cache.servers[idx];
+          if (!s) {
+            return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
+          }
+      
+          const infoUrl = buildBdInfoUrl(s.server || s.address || s.ip);
+          let info;
+          try {
+            info = await fetchJson(infoUrl);
+          } catch (e) {
+            return safeReply(interaction, {
+              content: `Couldn’t load server info for **${s.name || 'Unknown'}**.\nURL: ${infoUrl}\nError: ${e.message}`,
+              ephemeral: true
+            });
+          }
+      
+          const players = Array.isArray(info?.players) ? info.players : [];
+          const lines = players.slice(0, 40).map(p => {
+            const inDome = (p.indomenow === 'Yes') ? ' 🏟️' : '';
+            const rank = p.rank != null ? `#${p.rank}` : '#?';
+            const score = p.score != null ? ` (${p.score})` : '';
+            const name = p.name || '(unknown)';
+            return `${rank} **${name}**${score}${inDome}`;
+          });
+      
+          const embed = new EmbedBuilder()
+            .setTitle(info?.name ? `Battledome — ${info.name}` : `Battledome — ${s.name || 'Server'}`)
+            .addFields(
+              { name: 'Online now', value: String(info?.onlinenow ?? '—'), inline: true },
+              { name: 'In dome now', value: String(info?.indomenow ?? '—'), inline: true },
+              { name: 'Players this hour', value: String(info?.thishour ?? '—'), inline: true },
+              { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' }
+            )
+            .setColor(DEFAULT_EMBED_COLOR)
+            .setFooter({ text: 'KC Bot • /battledome' });
+      
+          return safeReply(interaction, { embeds: [embed], components: interaction.message.components });
+      } catch (err) {
         console.error(`[select:${prefix}]`, err);
         await safeReply(interaction, { 
             content: '❌ Sorry, something went wrong.', 
             ephemeral: true, embeds: [], components: [] 
         });
+      }
     }
   }
   // --- Modal Submissions ---
