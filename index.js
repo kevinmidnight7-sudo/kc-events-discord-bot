@@ -334,9 +334,13 @@ async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
 }
 
 function buildBdInfoUrl(serverStr) {
-  // The spec says: "server name with /bdinfo.json added"
-  // If serverStr already includes protocol, keep it. Otherwise assume http://
-  const base = /^https?:\/\//i.test(serverStr) ? serverStr : `http://${serverStr}`;
+  if (!serverStr) return null;
+
+  let base = /^https?:\/\//i.test(serverStr) ? serverStr : `http://${serverStr}`;
+
+  // If the bdlist server is using :444 (game port), try the bdinfo port (:507)
+  base = base.replace(/:444\b/, ':507');
+
   return base.replace(/\/+$/, '') + '/bdinfo.json';
 }
 // --- End Battledome Helpers ---
@@ -2781,6 +2785,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         // Handle /battledome command
         else if (commandName === 'battledome') {
+          await safeDefer(interaction);
           const list = await fetchJson(BD.LIST_URL);
           const servers = Array.isArray(list?.bdservers) ? list.bdservers : [];
           if (!servers.length) {
