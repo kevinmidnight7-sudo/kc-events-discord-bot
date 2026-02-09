@@ -47,7 +47,6 @@ const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
   EmbedBuilder,
-  // add this:
   StringSelectMenuBuilder
 } = require('discord.js');
 
@@ -93,11 +92,13 @@ const globalCache = {
   clipDestinations: new Map(), // guildId -> channelId
   // Destination channels for clan battle announcements (guildId -> channelId)
   battleDestinations: new Map(),
+  // Destination channels for Battledome updates (guildId -> channelId)
+  bdDestinations: new Map(),
 };
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive']).has(name);
+  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive', 'notifybd', 'setbattledomechannel']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -195,112 +196,56 @@ async function withTimeout(promise, ms, label='op'){
 }
 
 // --- Interaction Ack Helpers ---
-// --- PATCH (Step 1): Replace reply helpers ---
-/**
- * Acknowledge the interaction if not already acknowledged.
- * - For slash commands: use deferReply({ ephemeral? })
- * - For components: use deferUpdate() if you intend to update the same message,
- *   or skip deferring and call .reply(...) once with content.
- */
 async function safeDefer(interaction, opts = {}) {
   try {
-    // Already acknowledged
     if (interaction.deferred || interaction.replied) return;
-
-    // Chat input command
-    // --- FIX (Item 6): Use interaction.isChatInputCommand() ---
     if (interaction.isChatInputCommand()) {
       return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
     }
-
-    // Components (Buttons/Selects)
-    // --- FIX (Item 6): Use interaction.isMessageComponent() ---
     if (interaction.isMessageComponent()) {
-      // ONLY use deferUpdate if you *will* update() the existing message.
       if (opts.intent === "update") {
         return await interaction.deferUpdate();
       }
-      // else: do not defer here. You will use interaction.reply(...) once.
       return;
     }
-    
-    // Modals
-    // --- FIX (Item 6): Use interaction.isModalSubmit() ---
     if (interaction.isModalSubmit()) {
       return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
     }
   } catch (err) {
     console.error("safeDefer error:", err);
-    // Don't throw, as we want the handler to attempt a safeReply
   }
 }
 
-/**
- * Send the correct response method based on current interaction state.
- * Rules (Discord API):
- * - If we deferred with deferReply(), we must finish with editReply() or followUp().
- * - If we already replied once, additional output must be followUp().
- * - If we never acknowledged, we can reply() once.
- * - For components when we used deferUpdate(), finish with update() on the same message;
- *   otherwise use reply()/followUp() (but never both).
- */
 async function safeReply(interaction, options) {
   try {
-    // Component interactions (buttons/selects)
-    // --- FIX (Item 6): Use interaction.isMessageComponent() ---
     if (interaction.isMessageComponent()) {
-      // If we deferred update earlier (deferUpdate), we must call update() here
-      // to modify the same original message content/components.
-      // Note: interaction.deferred is true after deferUpdate()
       if (interaction.deferred && !interaction.replied) {
-        // UPDATE THE SAME MESSAGE
         return await interaction.update(options);
       }
-
-      // If we already replied (e.g. ephemeral prompt), any subsequent output
-      // must be followUp()
       if (interaction.replied) {
         return await interaction.followUp(options);
       }
-
-      // Fresh component without a defer: we can reply now
-      // This is used for ephemeral errors or new messages from components
       return await interaction.reply(options);
     }
-
-    // Slash commands & Modal Submissions
-    // (interaction.deferred is true after deferReply)
     if (interaction.deferred) {
-      // We already deferred the *initial* reply -> must editReply or followUp
       if (interaction.replied) {
         return await interaction.followUp(options);
       }
       return await interaction.editReply(options);
     }
-
     if (interaction.replied) {
       return await interaction.followUp(options);
     }
-
-    // Initial reply (no defer, no reply yet)
     return await interaction.reply(options);
   } catch (err) {
     console.error("safeReply error", {
       deferred: interaction.deferred,
       replied: interaction.replied,
-      // --- FIX (Item 6): Use interaction.isX() ---
       isChatInput: interaction.isChatInputCommand(),
       isComponent: interaction.isMessageComponent(),
       isModal: interaction.isModalSubmit(),
-      preview: typeof options === "object" ? {
-        hasContent: !!options?.content,
-        embeds: Array.isArray(options?.embeds) ? options.embeds.length : 0,
-        components: Array.isArray(options?.components) ? options.components.length : 0,
-        ephemeral: !!options?.ephemeral
-      } : options
     }, err);
-    // As a last resort, try a followup if editReply/reply failed
-    if (err.code !== 10062) { // 10062 = Unknown interaction (too old)
+    if (err.code !== 10062) { 
         try {
             if (!interaction.replied) {
                 await interaction.followUp(options);
@@ -308,21 +253,39 @@ async function safeReply(interaction, options) {
         } catch (e) {
             console.error("safeReply followup failed", e);
         }
-
     }
   }
 }
-// --- END PATCH (Step 1) ---
 
-// --- Battledome Helpers ---
+// --- Battledome Helpers (NEW) ---
 const BD = {
-  LIST_URL: 'http://snakey.monster/bdlist.json',
   TIMEOUT_MS: 10000,
 };
 
-const BD_INFO_OVERRIDES = {
-  "West Coast Battledome": "http://23.230.253.209:507/bdinfo.json",
-  "West Coast test BD": "http://23.230.253.209:507/bdinfo.json",
+// Authoritative Server List (HTTP only)
+const BD_SERVERS = {
+  west: {
+    name: "West Coast Battledome",
+    url: "http://172.99.249.149:444/bdinfo.json",
+    region: "west"
+  },
+  east: {
+    name: "East Coast Battledome",
+    url: "http://206.221.176.241:444/bdinfo.json",
+    region: "east"
+  },
+  eu: {
+    name: "EU Battledome",
+    url: "http://51.91.19.175:444/bdinfo.json",
+    region: "eu"
+  }
+};
+
+// Map region -> state for polling
+const bdState = {
+  west: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
+  east: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
+  eu:   { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
 };
 
 async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
@@ -338,15 +301,37 @@ async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
   }
 }
 
-function buildBdInfoUrl(serverStr) {
-  if (!serverStr) return null;
+// Tolerant parser for BD info
+function parseBdInfo(json) {
+  if (!json || typeof json !== 'object') return null;
+  
+  // Normalise list
+  let players = Array.isArray(json.players) ? json.players : [];
+  
+  // Clean players
+  players = players.map(p => ({
+    name: p.name || '(unknown)',
+    score: parseInt(p.score, 10) || 0,
+    rank: p.rank,
+    indomenow: p.indomenow, // might be undefined
+    inactive: p.inactive // might be undefined (seconds)
+  })).filter(p => p.name !== '(unknown)'); 
 
-  let base = /^https?:\/\//i.test(serverStr) ? serverStr : `http://${serverStr}`;
+  // Sort by score desc
+  players.sort((a,b) => b.score - a.score);
 
-  // If the bdlist server is using :444 (game port), try the bdinfo port (:507)
-  base = base.replace(/:444\b/, ':507');
+  return {
+    name: json.name || 'Unknown Server',
+    onlinenow: parseInt(json.onlinenow, 10) || 0,
+    indomenow: parseInt(json.indomenow, 10) || 0,
+    thishour: parseInt(json.thishour, 10) || 0,
+    players
+  };
+}
 
-  return base.replace(/\/+$/, '') + '/bdinfo.json';
+async function fetchBdInfo(url) {
+  const json = await fetchJson(url);
+  return parseBdInfo(json);
 }
 // --- End Battledome Helpers ---
 
@@ -2225,18 +2210,64 @@ const battledomeCmd = new SlashCommandBuilder()
   .setName('battledome')
   .setDescription('View Battledome servers and who is currently playing');
 
+// Command: Set Battledome Update Channel (NEW)
+const setBattledomeChannelCmd = new SlashCommandBuilder()
+  .setName('setbattledomechannel')
+  .setDescription('Choose the channel for Battledome join/leave updates')
+  .addChannelOption(opt =>
+    opt.setName('channel')
+      .setDescription('Text or Announcement channel')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(true)
+  );
+
+// Command: Notify BD (NEW)
+const notifyBdCmd = new SlashCommandBuilder()
+  .setName('notifybd')
+  .setDescription('Manage Battledome notifications')
+  .addStringOption(o =>
+    o.setName('region')
+     .setDescription('Region to subscribe to')
+     .addChoices(
+       { name: 'West Coast', value: 'west' },
+       { name: 'East Coast (NY)', value: 'east' },
+       { name: 'EU', value: 'eu' }
+     )
+     .setRequired(false)
+  )
+  .addStringOption(o => 
+    o.setName('action')
+     .setDescription('Manage subscription')
+     .addChoices(
+        { name: 'Subscribe (default)', value: 'sub' },
+        { name: 'Unsubscribe', value: 'unsub' },
+        { name: 'Turn Off All', value: 'clear' }
+     )
+     .setRequired(false)
+  );
+
+// Command: Battledome Leaderboard (NEW)
+const battledomeLbCmd = new SlashCommandBuilder()
+  .setName('battledomelb')
+  .setDescription('Show live leaderboard for a Battledome region')
+  .addStringOption(o =>
+    o.setName('region')
+     .setDescription('Select region')
+     .addChoices(
+       { name: 'West Coast', value: 'west' },
+       { name: 'East Coast (NY)', value: 'east' },
+       { name: 'EU', value: 'eu' }
+     )
+     .setRequired(true)
+  );
+
 // Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
   avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
   latestFiveCmd,
-  clansCmd // <-- add the clans command here
-  , clanBattlesCmd // <-- register the clan battles command
-  , sendClanChallengeCmd // register send clan challenge command
-  , incomingChallengesCmd // register incoming challenges command
-  , getClanRolesCmd // register get clan roles command
-  , setEventsChannelCmd // register set events channel command
-  , battledomeCmd // register battledome command
+  clansCmd, clanBattlesCmd, sendClanChallengeCmd, incomingChallengesCmd, getClanRolesCmd, setEventsChannelCmd,
+  battledomeCmd, setBattledomeChannelCmd, notifyBdCmd, battledomeLbCmd
 ].map(c => c.toJSON());
 
 
@@ -2791,22 +2822,18 @@ client.on('interactionCreate', async (interaction) => {
         // Handle /battledome command
         else if (commandName === 'battledome') {
           await safeDefer(interaction);
-          const list = await fetchJson(BD.LIST_URL);
-          const servers = Array.isArray(list?.bdservers) ? list.bdservers : [];
-          if (!servers.length) {
-            return safeReply(interaction, { content: 'No Battledome servers found right now.', ephemeral: true });
-          }
+          // Use hard-coded server list instead of fetching
+          const servers = Object.values(BD_SERVERS);
         
-          // Build select options (max 25 for Discord select menus)
-          const options = servers.slice(0, 25).map((s, idx) => ({
-            label: clampStr(`${s.name || 'Unknown'} (${s.location || 'Unknown'})`, 100, 'Unknown'),
-            description: clampStr(String(s.address || s.ip || s.server || 'No address'), 100, '—'),
+          const options = servers.map((s, idx) => ({
+            label: clampStr(s.name, 100, 'Unknown'),
+            description: clampStr(s.region || 'Unknown Region', 100, '—'),
             value: String(idx),
           }));
         
           const parentId = interaction.id;
           interaction.client.bdCache ??= new Map();
-          interaction.client.bdCache.set(parentId, { servers });
+          interaction.client.bdCache.set(parentId, { servers }); // Store the array we just built
           setTimeout(() => interaction.client.bdCache?.delete(parentId), 15 * 60 * 1000).unref?.();
         
           const select = new StringSelectMenuBuilder()
@@ -2824,6 +2851,92 @@ client.on('interactionCreate', async (interaction) => {
             embeds: [embed],
             components: [new ActionRowBuilder().addComponents(select)],
           });
+        }
+        // Handle /setbattledomechannel
+        else if (commandName === 'setbattledomechannel') {
+          if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
+          const picked = interaction.options.getChannel('channel', true);
+          if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.', ephemeral: true });
+          if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.', ephemeral: true });
+          
+          const chan = await interaction.client.channels.fetch(picked.id).catch(()=>null);
+          if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.', ephemeral: true });
+
+          const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+          if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.', ephemeral: true });
+
+          const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(()=>null);
+          if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+             return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
+          }
+
+          await rtdb.ref(`config/bdDestinations/${interaction.guildId}`).set({
+            channelId: chan.id,
+            updatedBy: interaction.user.id,
+            updatedAt: admin.database.ServerValue.TIMESTAMP
+          });
+          globalCache.bdDestinations.set(interaction.guildId, chan.id);
+          return safeReply(interaction, { content: `✅ Battledome updates will post to <#${chan.id}>.`, ephemeral: true });
+        }
+        // Handle /notifybd
+        else if (commandName === 'notifybd') {
+          const region = interaction.options.getString('region');
+          const action = interaction.options.getString('action') || 'sub';
+          const userId = interaction.user.id;
+          const guildId = interaction.guildId;
+
+          if (!guildId) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
+
+          const ref = rtdb.ref(`bdNotify/${guildId}/${userId}`);
+
+          if (action === 'clear') {
+            await ref.remove();
+            return safeReply(interaction, { content: '🔕 Unsubscribed from all Battledome alerts.', ephemeral: true });
+          }
+
+          if (!region) return safeReply(interaction, { content: 'Please specify a region.', ephemeral: true });
+
+          if (action === 'unsub') {
+             await ref.child(`regions/${region}`).remove();
+             return safeReply(interaction, { content: `🔕 Unsubscribed from **${region}** alerts.`, ephemeral: true });
+          } else {
+             // Subscribe
+             await ref.child(`regions/${region}`).set(true);
+             await ref.child('updatedAt').set(admin.database.ServerValue.TIMESTAMP);
+             return safeReply(interaction, { content: `🔔 Subscribed to **${region}** Battledome join alerts!`, ephemeral: true });
+          }
+        }
+        // Handle /battledomelb
+        else if (commandName === 'battledomelb') {
+          await safeDefer(interaction);
+          const region = interaction.options.getString('region');
+          const serverConfig = BD_SERVERS[region];
+          if (!serverConfig) return safeReply(interaction, { content: 'Unknown region.', ephemeral: true });
+
+          let info;
+          try {
+            info = await fetchBdInfo(serverConfig.url);
+          } catch (e) {
+            return safeReply(interaction, { content: `Failed to fetch leaderboard: ${e.message}`, ephemeral: true });
+          }
+
+          if (!info || !info.players || info.players.length === 0) {
+             return safeReply(interaction, { content: `No players currently on **${serverConfig.name}**.`, ephemeral: true });
+          }
+
+          const top15 = info.players.slice(0, 15);
+          const lines = top15.map((p, i) => {
+             const idle = p.inactive && p.inactive > 60 ? ` *(idle ${p.inactive}s)*` : '';
+             return `**${i+1}. ${p.name}** — ${p.score}${idle}`;
+          }).join('\n');
+
+          const embed = new EmbedBuilder()
+            .setTitle(`Battledome Leaderboard — ${serverConfig.name}`)
+            .setDescription(lines)
+            .setFooter({ text: `Live snapshot • ${new Date().toLocaleTimeString('en-GB')}` })
+            .setColor(DEFAULT_EMBED_COLOR);
+          
+          return safeReply(interaction, { embeds: [embed] });
         }
 
     } catch (err) {
@@ -3938,10 +4051,10 @@ client.on('interactionCreate', async (interaction) => {
             return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
           }
       
-          const infoUrl = BD_INFO_OVERRIDES[s.name] || buildBdInfoUrl(s.server || s.address || s.ip);
+          const infoUrl = s.url;
           let info;
           try {
-            info = await fetchJson(infoUrl);
+            info = await fetchBdInfo(infoUrl);
           } catch (e) {
             return safeReply(interaction, {
               content: `Couldn’t load server info for **${s.name || 'Unknown'}**.\nURL: ${infoUrl}\nError: ${e.message}`,
@@ -3955,7 +4068,8 @@ client.on('interactionCreate', async (interaction) => {
             const rank = p.rank != null ? `#${p.rank}` : '#?';
             const score = p.score != null ? ` (${p.score})` : '';
             const name = p.name || '(unknown)';
-            return `${rank} **${name}**${score}${inDome}`;
+            const idle = p.inactive > 60 ? ' *(idle)*' : '';
+            return `${rank} **${name}**${score}${inDome}${idle}`;
           });
       
           const embed = new EmbedBuilder()
@@ -4221,11 +4335,146 @@ function attachPostsListener(uid) {
     console.log(`[broadcast] attached listener for user ${uid}`);
 }
 
+async function checkRegion(regionKey) {
+  const config = BD_SERVERS[regionKey];
+  if (!config) return;
+  
+  let info;
+  try {
+    info = await fetchBdInfo(config.url);
+  } catch (e) {
+    return;
+  }
+  if (!info) return;
+
+  const state = bdState[regionKey];
+  const currentNames = new Set(info.players.map(p => p.name));
+  const currentOnline = info.onlinenow;
+
+  // First run: just init state
+  if (state.lastCheck === 0) {
+    state.lastNames = currentNames;
+    state.lastOnline = currentOnline;
+    state.lastCheck = Date.now();
+    return;
+  }
+
+  // Diff
+  const joins = [];
+  const leaves = [];
+  
+  for (const name of currentNames) {
+    if (!state.lastNames.has(name)) joins.push(name);
+  }
+  for (const name of state.lastNames) {
+    if (!currentNames.has(name)) leaves.push(name);
+  }
+
+  // Unnamed calc
+  // Effective count of named players
+  const namedCountPrev = state.lastNames.size;
+  const namedCountCurr = currentNames.size;
+  
+  const unnamedPrev = Math.max(0, state.lastOnline - namedCountPrev);
+  const unnamedCurr = Math.max(0, currentOnline - namedCountCurr);
+  
+  let unnamedDiff = unnamedCurr - unnamedPrev; 
+  
+  // Update state immediately
+  state.lastNames = currentNames;
+  state.lastOnline = currentOnline;
+  state.lastCheck = Date.now();
+
+  if (joins.length === 0 && leaves.length === 0 && unnamedDiff === 0) return;
+
+  // Broadcast
+  await broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info });
+}
+
+async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }) {
+  const serverName = BD_SERVERS[regionKey]?.name || regionKey;
+  
+  // Prepare embed content
+  const fields = [];
+  if (joins.length > 0) {
+    fields.push({ name: '✅ Joined', value: joins.join(', ').slice(0, 1024) });
+  }
+  if (leaves.length > 0) {
+    fields.push({ name: '❌ Left', value: leaves.join(', ').slice(0, 1024) });
+  }
+  if (unnamedDiff !== 0) {
+    const verb = unnamedDiff > 0 ? 'Joined' : 'Left';
+    const count = Math.abs(unnamedDiff);
+    const emoji = unnamedDiff > 0 ? '✅' : '❌';
+    fields.push({ name: `${emoji} ${verb} (Unnamed)`, value: `(${count > 0 ? '+' : ''}${unnamedDiff}) unnamed player${count > 1 ? 's' : ''}` });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Battledome Update — ${serverName}`)
+    .setDescription(`**Online:** ${info.onlinenow}  |  **In Dome:** ${info.indomenow ?? '?'}  |  **This Hour:** ${info.thishour ?? '?'}`)
+    .addFields(fields)
+    .setColor(joins.length > 0 || unnamedDiff > 0 ? 0x2ecc71 : 0xe74c3c) // Green for joins, Red for leaves
+    .setFooter({ text: `Live snapshot • ${new Date().toLocaleTimeString('en-GB')}` });
+
+  // Broadcast to all configured guilds
+  for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
+    try {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased?.()) continue;
+
+      // Construct content with mentions for joins only
+      let content = '';
+      if (joins.length > 0) {
+        // Fetch subscribers for this guild/region
+        const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
+        if (snap.exists()) {
+          const subs = [];
+          snap.forEach(child => {
+            const val = child.val();
+            if (val.regions && val.regions[regionKey]) {
+              subs.push(`<@${child.key}>`);
+            }
+          });
+          if (subs.length > 0) {
+            content = subs.join(' ');
+          }
+        }
+      }
+
+      await channel.send({ content, embeds: [embed] });
+    } catch (e) {
+      console.error(`[BD Broadcast] Failed to send to guild ${guildId}:`, e.message);
+    }
+  }
+}
+
+// Polling Loop
+async function pollBattledome() {
+  while (true) {
+    try {
+      // Staggered checks
+      await checkRegion('west');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      await checkRegion('east');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      await checkRegion('eu');
+      await new Promise(r => setTimeout(r, 5000));
+
+    } catch (e) {
+      console.error('[BD Poller] Loop error:', e);
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+}
+
 // ---------- Startup ----------
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
+  // Load clip destinations
   try {
     const snap = await rtdb.ref('config/clipDestinations').get();
     globalCache.clipDestinations.clear();
@@ -4237,7 +4486,6 @@ client.once('ready', async () => {
     }
     console.log(`[broadcast] loaded initial clip destinations: ${globalCache.clipDestinations.size}`);
 
-    // Live updates for when channels are added, changed, or removed.
     rtdb.ref('config/clipDestinations').on('child_added', s => {
       const v = s.val() || {};
       if (v.channelId) globalCache.clipDestinations.set(s.key, v.channelId);
@@ -4252,6 +4500,34 @@ client.once('ready', async () => {
     });
   } catch (e) {
     console.error('[broadcast] failed to load clip destinations', e);
+  }
+
+  // Load Battledome destinations (NEW)
+  try {
+    const snap = await rtdb.ref('config/bdDestinations').get();
+    globalCache.bdDestinations.clear();
+    if (snap.exists()) {
+      const all = snap.val() || {};
+      for (const [guildId, cfg] of Object.entries(all)) {
+        if (cfg?.channelId) globalCache.bdDestinations.set(guildId, cfg.channelId);
+      }
+    }
+    console.log(`[BD] loaded initial destinations: ${globalCache.bdDestinations.size}`);
+
+    rtdb.ref('config/bdDestinations').on('child_added', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.bdDestinations.set(s.key, v.channelId);
+    });
+    rtdb.ref('config/bdDestinations').on('child_changed', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.bdDestinations.set(s.key, v.channelId);
+      else globalCache.bdDestinations.delete(s.key);
+    });
+    rtdb.ref('config/bdDestinations').on('child_removed', s => {
+      globalCache.bdDestinations.delete(s.key);
+    });
+  } catch (e) {
+    console.error('[BD] failed to load destinations', e);
   }
 
   // Attach listeners for all existing and new users to broadcast clips
@@ -4338,6 +4614,10 @@ client.once('ready', async () => {
     }
     console.log('Lock acquired — logging into Discord…');
     await client.login(process.env.DISCORD_BOT_TOKEN);
+    
+    // Start Battledome Poller only after acquiring lock and login
+    pollBattledome().catch(e => console.error('BD Poller failed to start:', e));
+
     setInterval(() => renewBotLock().catch(() => {}), 30_000).unref();
   }
 
