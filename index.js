@@ -2235,6 +2235,13 @@ const notifyBdCmd = new SlashCommandBuilder()
      )
      .setRequired(false)
   )
+  .addIntegerOption(o => 
+    o.setName('threshold')
+     .setDescription('Only ping if player count reaches this number (optional)')
+     .setMinValue(1)
+     .setMaxValue(200)
+     .setRequired(false)
+  )
   .addStringOption(o => 
     o.setName('action')
      .setDescription('Manage subscription')
@@ -2881,6 +2888,7 @@ client.on('interactionCreate', async (interaction) => {
         // Handle /notifybd
         else if (commandName === 'notifybd') {
           const region = interaction.options.getString('region');
+          const threshold = interaction.options.getInteger('threshold');
           const action = interaction.options.getString('action') || 'sub';
           const userId = interaction.user.id;
           const guildId = interaction.guildId;
@@ -2901,9 +2909,25 @@ client.on('interactionCreate', async (interaction) => {
              return safeReply(interaction, { content: `🔕 Unsubscribed from **${region}** alerts.`, ephemeral: true });
           } else {
              // Subscribe
-             await ref.child(`regions/${region}`).set(true);
+             const updateData = {
+                 enabled: true,
+                 state: 'below', // Reset state on manual update to ensure trigger works if currently above
+             };
+             // Only set threshold if provided, otherwise null (explicit removal of threshold if overriding)
+             if (threshold) {
+                 updateData.threshold = threshold;
+             } else {
+                 updateData.threshold = null;
+             }
+
+             await ref.child(`regions/${region}`).update(updateData);
              await ref.child('updatedAt').set(admin.database.ServerValue.TIMESTAMP);
-             return safeReply(interaction, { content: `🔔 Subscribed to **${region}** Battledome join alerts!`, ephemeral: true });
+             
+             const msg = threshold
+                ? `🔔 Subscribed to **${region}**! You will be notified when player count reaches **${threshold}+**.`
+                : `🔔 Subscribed to **${region}** join alerts! (All named joins)`;
+             
+             return safeReply(interaction, { content: msg, ephemeral: true });
           }
         }
         // Handle /battledomelb
@@ -3566,7 +3590,7 @@ client.on('interactionCreate', async (interaction) => {
         const nextMode2 = includeDesc ? 'hide' : 'show';
         const infoLabel2 = includeDesc ? 'Hide Info' : 'Info';
         const infoBtn2 = new ButtonBuilder().setCustomId(`battle:info:${battleId}:${nextMode2}`).setLabel(infoLabel2).setStyle(ButtonStyle.Secondary);
-        const row2 = new ActionRowBuilder().addComponents(joinBtn, infoBtn2);
+        const row2 = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn3);
         await safeDefer(interaction, { intent: 'update' });
         return safeReply(interaction, { embeds: [embed], components: [row2] });
       }
@@ -4393,6 +4417,7 @@ async function checkRegion(regionKey) {
 
 async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }) {
   const serverName = BD_SERVERS[regionKey]?.name || regionKey;
+  const onlineNow = info.onlinenow || 0;
   
   // Prepare embed content
   const fields = [];
@@ -4422,22 +4447,61 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
       const channel = await client.channels.fetch(channelId).catch(() => null);
       if (!channel || !channel.isTextBased?.()) continue;
 
-      // Construct content with mentions for joins only
+      // Construct content with mentions
       let content = '';
-      if (joins.length > 0) {
-        // Fetch subscribers for this guild/region
-        const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
-        if (snap.exists()) {
-          const subs = [];
-          snap.forEach(child => {
-            const val = child.val();
-            if (val.regions && val.regions[regionKey]) {
-              subs.push(`<@${child.key}>`);
-            }
-          });
-          if (subs.length > 0) {
-            content = subs.join(' ');
+      
+      // Fetch subscribers for this guild/region
+      const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
+      if (snap.exists()) {
+        const triggeredUserIds = [];
+        const stateUpdates = {}; // path -> value
+
+        snap.forEach(child => {
+          const userId = child.key;
+          const val = child.val();
+          const sub = val.regions?.[regionKey];
+          
+          if (!sub || !sub.enabled) return;
+
+          const threshold = sub.threshold; // number or null
+          const prevState = sub.state || 'below';
+          
+          // Logic: Check threshold crossing
+          if (typeof threshold === 'number') {
+             if (onlineNow >= threshold) {
+                // Currently Above
+                if (prevState !== 'above') {
+                   // Crossing UP
+                   // Only trigger if we have positive movement (joins or unnamed increase)
+                   const isIncrease = (joins.length > 0) || (unnamedDiff > 0);
+                   if (isIncrease) {
+                      triggeredUserIds.push(userId);
+                      stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
+                   }
+                }
+             } else {
+                // Currently Below
+                if (prevState !== 'below') {
+                   // Crossing DOWN (Re-arm)
+                   stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
+                }
+             }
+          } else {
+             // No threshold: legacy join pings (only named joins)
+             if (joins.length > 0) {
+                triggeredUserIds.push(userId);
+             }
           }
+        });
+
+        // Apply state updates
+        if (Object.keys(stateUpdates).length > 0) {
+           // We do this asynchronously without awaiting to not block the broadcast loop too much
+           rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
+        }
+
+        if (triggeredUserIds.length > 0) {
+          content = triggeredUserIds.map(id => `<@${id}>`).join(' ');
         }
       }
 
