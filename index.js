@@ -317,7 +317,12 @@ async function safeReply(interaction, options) {
 // --- Battledome Helpers ---
 const BD = {
   LIST_URL: 'http://snakey.monster/bdlist.json',
-  TIMEOUT_MS: 3500,
+  TIMEOUT_MS: 10000,
+};
+
+const BD_INFO_OVERRIDES = {
+  "West Coast Battledome": "http://23.230.253.209:507/bdinfo.json",
+  "West Coast test BD": "http://23.230.253.209:507/bdinfo.json",
 };
 
 async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
@@ -3933,7 +3938,7 @@ client.on('interactionCreate', async (interaction) => {
             return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
           }
       
-          const infoUrl = buildBdInfoUrl(s.server || s.address || s.ip);
+          const infoUrl = BD_INFO_OVERRIDES[s.name] || buildBdInfoUrl(s.server || s.address || s.ip);
           let info;
           try {
             info = await fetchJson(infoUrl);
