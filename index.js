@@ -267,6 +267,7 @@ const BD = {
   LB_STALE_MS: 5 * 60 * 1000,
   STATS_FRESH_MS: 5 * 60 * 1000,
   STATS_STALE_MS: 60 * 60 * 1000,
+  WEST_STATS_URL: "http://snakey.monster/bdstats.htm",
 };
 
 // Authoritative Server List (HTTP only)
@@ -312,6 +313,7 @@ const bdTop = {
   East: new Map(),
   EU: new Map(),
 };
+const bdTopMeta = { lastUpdatedAt: 0, seededHardcoded: false };
 let bdTopDirty = false;
 
 async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
@@ -440,33 +442,46 @@ async function fetchBdInfo(url) {
 }
 
 // Top Scores helpers
+function updateBdTopScore(regionKey, name, score, serverName = "") {
+  const clean = String(name || "").trim();
+  if (!clean) return;
+
+  const rec = { score: Number(score) || 0, seenAt: Date.now(), serverName };
+  let changed = false;
+
+  // Update region map
+  if (bdTop[regionKey] instanceof Map) {
+    const cur = bdTop[regionKey].get(clean);
+    const curScore = (cur && typeof cur === "object") ? (cur.score ?? 0) : (Number(cur) || 0);
+    if (rec.score > curScore) {
+      bdTop[regionKey].set(clean, rec);
+      changed = true;
+    }
+  }
+
+  // Update global map
+  {
+    const cur = bdTop.global.get(clean);
+    const curScore = (cur && typeof cur === "object") ? (cur.score ?? 0) : (Number(cur) || 0);
+    if (rec.score > curScore) {
+      bdTop.global.set(clean, rec);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    bdTopMeta.lastUpdatedAt = Date.now();
+    bdTopDirty = true;
+  }
+}
+
+// Refactored to use shared updater logic
 function updateBdTop(regionKey, players) {
   if (!Array.isArray(players)) return;
-  let changed = false;
-  const regionMap = bdTop[regionKey];
-  const globalMap = bdTop.global;
-  
   for (const p of players) {
      if (!p.name || p.score == null) continue;
-     const entry = { score: p.score, seenAt: Date.now(), serverName: regionKey };
-     
-     // Region Update
-     if (regionMap) {
-         const existing = regionMap.get(p.name);
-         if (!existing || p.score > existing.score) {
-             regionMap.set(p.name, entry);
-             changed = true;
-         }
-     }
-     
-     // Global Update
-     const existingG = globalMap.get(p.name);
-     if (!existingG || p.score > existingG.score) {
-         globalMap.set(p.name, entry);
-         changed = true;
-     }
+     updateBdTopScore(regionKey, p.name, p.score, regionKey);
   }
-  if (changed) bdTopDirty = true;
 }
 
 // Cached wrapper for BD info
@@ -496,47 +511,99 @@ async function fetchWestStatsHtml() {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), BD.TIMEOUT_MS).unref?.();
   try {
-    const res = await fetch("http://snakey.monster/bdstats.htm", { signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for bdstats.htm`);
+    const res = await fetch(BD.WEST_STATS_URL, { 
+        signal: controller.signal,
+        headers: { "user-agent": "KC-BD-Bot/1.0" }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${BD.WEST_STATS_URL}`);
     return await res.text();
   } finally { clearTimeout(t); }
 }
 
-function parseAndSeedWestStats(html) {
-    if(!html) return;
-    const lines = html.split('\n');
-    let inSection = false;
-    const entries = [];
-    for(const line of lines) {
-        if(line.includes('Highest Scorer')) { inSection = true; continue; }
-        if(!inSection) continue;
-        // Parsing line: YYYYMMDD HHMM <server> <rank> <score> <players> <name...>
-        const m = line.match(/^\s*(\d{8})\s+(\d{4})\s+([^\s]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
-        if(m) {
-            const score = parseInt(m[5], 10);
-            const name = m[7].trim();
-            if(name && score) {
-                entries.push({name, score});
-            }
-        }
+function parseWestStats(html) {
+  try {
+    const marker = "Highest Scorer";
+    const idx = html.indexOf(marker);
+    if (idx < 0) return [];
+    const tail = html.slice(idx);
+
+    const lines = tail.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+    // Expected row format:
+    // 20260210 0600 172.99.249.149:444 1 33 8 th ' fercho
+    const rowRe = /^(\d{8})\s+(\d{4})\s+([^\s]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/;
+
+    const out = [];
+    for (const l of lines) {
+      const m = l.match(rowRe);
+      if (!m) continue;
+      out.push({
+        date: m[1],
+        time: m[2],
+        server: m[3],
+        rank: Number(m[4]) || 0,
+        score: Number(m[5]) || 0,
+        players: Number(m[6]) || 0,
+        name: (m[7] || "").trim()
+      });
     }
-    if (entries.length) {
-        // Seed West stats
-        updateBdTop('West', entries);
-    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 async function getWestStatsCached() {
-  return await swrFetch("http://snakey.monster/bdstats.htm", {
-    fetcher: async () => {
-        const text = await fetchWestStatsHtml();
-        parseAndSeedWestStats(text);
-        return text;
-    },
+  return await swrFetch(BD.WEST_STATS_URL, {
+    fetcher: fetchWestStatsHtml,
     freshMs: BD.STATS_FRESH_MS,
     staleMs: BD.STATS_STALE_MS,
     minIntervalMs: BD.MIN_FETCH_INTERVAL_MS
   });
+}
+
+async function seedTopFromWestStats() {
+  const r = await getWestStatsCached().catch(() => null);
+  if (!r?.data) return;
+
+  const rows = parseWestStats(r.data);
+  for (const row of rows) {
+    if (!row.name) continue;
+    updateBdTopScore("West", row.name, row.score, "West Coast (bdstats.htm)");
+  }
+}
+
+// Hardcoded scores to seed
+const HARDCODED_TOP_SCORES = [
+  { name: "dont leave", score: 130 },
+  { name: "tAsTy snack", score: 112 },
+  { name: "[3D] F A R I S E O", score: 100 },
+  { name: "~Kaida~", score: 92 },
+  { name: "iyh", score: 89 },
+  { name: ":p", score: 74 },
+  { name: "welp", score: 73 },
+  { name: "mw", score: 64 },
+  { name: "azure ' th", score: 63 },
+  { name: "th' YT: @sn.Mystical", score: 62 },
+  { name: "[WOVD] m i d n i g h t", score: 57 },
+  { name: "[RR] YT@qrypticlus", score: 53 },
+  { name: "[worm] sk", score: 53 },
+  { name: "evan", score: 53 },
+];
+
+function seedHardcodedTopScoresOnce() {
+  if (bdTopMeta?.seededHardcoded) return;
+  for (const e of HARDCODED_TOP_SCORES) {
+    updateBdTopScore("West", e.name, e.score, "Seed (hardcoded)");
+  }
+  bdTopMeta.seededHardcoded = true;
+}
+
+// Helper to prevent ugly wrapping
+function clampName(s, n=45){
+  s = String(s || "");
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > n ? (s.slice(0, n - 1) + "…") : s;
 }
 
 // Persistence for Top Scores
@@ -555,11 +622,13 @@ async function loadBdTop() {
             });
             console.log('[BdTop] Loaded scores from RTDB');
         }
+        // Run seeds after loading persistence (keeps highest)
+        seedHardcodedTopScoresOnce();
     } catch (e) {
         console.error('[BdTop] Failed to load:', e.message);
     }
     // Also warm cache from West stats
-    getWestStatsCached().catch(e => console.warn('[BdTop] Failed West seed:', e.message));
+    seedTopFromWestStats().catch(e => console.warn('[BdTop] Failed West seed:', e.message));
 }
 
 async function saveBdTop() {
@@ -2686,24 +2755,24 @@ client.on('interactionCreate', async (interaction) => {
           
           return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /battledometop (NEW)
+        // Handle /battledometop (NEW - clean output)
         else if (commandName === 'battledometop') {
             await safeDefer(interaction);
             const region = interaction.options.getString('region') || 'All';
             const entries = [];
-
+            
             if (region === 'All') {
                 bdTop.global.forEach((v, k) => {
-                    const obj = (v && typeof v === 'object')
-                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object') 
+                      ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
+                      : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else if (bdTop[region]) {
                 bdTop[region].forEach((v, k) => {
-                    const obj = (v && typeof v === 'object')
-                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object') 
+                      ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
+                      : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else {
@@ -2711,25 +2780,24 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // Sort by score desc
-            entries.sort((a, b) => (b.score || 0) - (a.score || 0));
+            entries.sort((a, b) => (b.score||0) - (a.score||0));
             const top15 = entries.slice(0, 15);
 
             if (top15.length === 0) {
-                return safeReply(
-                    interaction,
-                    { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true }
-                );
+                return safeReply(interaction, { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true });
             }
 
-            const lines = top15
-                .map((p, i) => `**${i + 1}. ${p.name}** — ${p.score}`)
-                .join('\\n');
-
-            // Optional: Timestamp from last save or general "Cached" status
+            // Clean list formatting
+            const lines = top15.map((p, i) => `${i + 1}. ${clampName(p.name)} — ${p.score}`);
+            const listText = lines.join('\n');
+            const listBlock = "```\n" + listText + "\n```";
+            
+            const lastUpdate = bdTopMeta.lastUpdatedAt || Date.now();
+            
             const embed = new EmbedBuilder()
-                .setTitle(`All‑Time Top LB (${region})`)
-                .setDescription(lines)
-                .setFooter({ text: `Updated recently • Cached` })
+                .setTitle(region === "All" ? "All-Time Top LB" : `All-Time Top LB (${region})`)
+                .setDescription(listBlock)
+                .setFooter({ text: `Updated <t:${Math.floor(lastUpdate / 1000)}:R> • Cached` })
                 .setColor(DEFAULT_EMBED_COLOR);
 
             return safeReply(interaction, { embeds: [embed] });
@@ -3924,27 +3992,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-async function pollBattledome() {
-  while (true) {
-    try {
-      // Staggered checks
-      await checkRegion('West');
-      await new Promise(r => setTimeout(r, 5000));
-      
-      await checkRegion('East');
-      await new Promise(r => setTimeout(r, 5000));
-      
-      await checkRegion('EU');
-      await new Promise(r => setTimeout(r, 5000));
-
-    } catch (e) {
-      console.error('[BD Poller] Loop error:', e);
-      await new Promise(r => setTimeout(r, 10000));
-    }
-  }
-}
-
-// check region
 async function checkRegion(regionKey) {
   const config = BD_SERVERS[regionKey];
   if (!config) return;
@@ -4106,6 +4153,27 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
   }
 }
 
+// Polling Loop
+async function pollBattledome() {
+  while (true) {
+    try {
+      // Staggered checks
+      await checkRegion('West');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      await checkRegion('East');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      await checkRegion('EU');
+      await new Promise(r => setTimeout(r, 5000));
+
+    } catch (e) {
+      console.error('[BD Poller] Loop error:', e);
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+}
+
 
 // ---------- Startup ----------
 client.once('ready', async () => {
@@ -4252,7 +4320,7 @@ function attachPostsListener(uid) {
     }
     console.log('Lock acquired — logging into Discord…');
     
-    // Load persisted top scores
+    // Load persisted top scores (will also seed hardcoded scores and fetch west stats)
     await loadBdTop();
     
     // Start Top Score persistence loop
@@ -4262,6 +4330,9 @@ function attachPostsListener(uid) {
             await saveBdTop();
         }
     }, 30000).unref();
+
+    // Start background refresh for West stats
+    setInterval(() => seedTopFromWestStats().catch(()=>{}), 20 * 60 * 1000).unref?.();
 
     await client.login(process.env.DISCORD_BOT_TOKEN);
     
