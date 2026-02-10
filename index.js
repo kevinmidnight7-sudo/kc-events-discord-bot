@@ -3944,35 +3944,168 @@ async function pollBattledome() {
   }
 }
 
-// NOTE: checkRegion function implementation assumed to be in the omitted original code or needs to be added if missing.
-// However, based on the prompt, we are modifying existing code. The original code provided did NOT include checkRegion implementation fully visible in the snippet.
-// Assuming it exists or I should add a dummy one to prevent crash if it was expected. 
-// Given the instructions focused on SWR and commands, I will add a safe implementation of checkRegion that uses the new cached fetcher.
-
+// check region
 async function checkRegion(regionKey) {
-    const config = BD_SERVERS[regionKey];
-    if (!config) return;
+  const config = BD_SERVERS[regionKey];
+  if (!config) return;
+  
+  let info;
+  try {
+    info = await fetchBdInfo(config.url);
+  } catch (e) {
+    return;
+  }
+  if (!info) return;
 
-    try {
-        // Use cached fetcher to respect rate limits even in poller
-        const r = await getBdInfoCached(config.url);
-        const data = r.data;
-        if (!data || !data.players) return;
+  const state = bdState[regionKey];
+  const currentNames = new Set(info.players.map(p => p.name));
+  const currentOnline = info.onlinenow;
 
-        // ... Existing logic for notifications would go here ...
-        // Since original code for notifications wasn't provided in the snippet (it ended abruptly or was missing),
-        // I will leave this placeholder. The primary goal is the SWR integration.
-        
-        // Example simple logic to keep bdState updated if needed for other things
-        const currentNames = new Set(data.players.map(p => p.name));
-        bdState[regionKey].lastNames = currentNames;
-        bdState[regionKey].lastOnline = data.onlinenow;
-        bdState[regionKey].lastCheck = Date.now();
+  // First run: just init state
+  if (state.lastCheck === 0) {
+    state.lastNames = currentNames;
+    state.lastOnline = currentOnline;
+    state.lastCheck = Date.now();
+    return;
+  }
 
-    } catch (e) {
-        // console.warn(`[BD Poll] Failed ${regionKey}: ${e.message}`);
-    }
+  // Diff
+  const joins = [];
+  const leaves = [];
+  
+  for (const name of currentNames) {
+    if (!state.lastNames.has(name)) joins.push(name);
+  }
+  for (const name of state.lastNames) {
+    if (!currentNames.has(name)) leaves.push(name);
+  }
+
+  // Unnamed calc
+  // Effective count of named players
+  const namedCountPrev = state.lastNames.size;
+  const namedCountCurr = currentNames.size;
+  
+  const unnamedPrev = Math.max(0, state.lastOnline - namedCountPrev);
+  const unnamedCurr = Math.max(0, currentOnline - namedCountCurr);
+  
+  let unnamedDiff = unnamedCurr - unnamedPrev; 
+  
+  // Update state immediately
+  state.lastNames = currentNames;
+  state.lastOnline = currentOnline;
+  state.lastCheck = Date.now();
+
+  if (joins.length === 0 && leaves.length === 0 && unnamedDiff === 0) return;
+
+  // Broadcast
+  await broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info });
 }
+
+async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }) {
+  const serverName = BD_SERVERS[regionKey]?.name || regionKey;
+  const onlineNow = info.onlinenow || 0;
+  
+  // Prepare embed content
+  const fields = [];
+  if (joins.length > 0) {
+    fields.push({ name: '✅ Joined', value: joins.join(', ').slice(0, 1024) });
+  }
+  if (leaves.length > 0) {
+    fields.push({ name: '❌ Left', value: leaves.join(', ').slice(0, 1024) });
+  }
+  if (unnamedDiff !== 0) {
+    const verb = unnamedDiff > 0 ? 'Joined' : 'Left';
+    const count = Math.abs(unnamedDiff);
+    const emoji = unnamedDiff > 0 ? '✅' : '❌';
+    fields.push({ name: `${emoji} ${verb} (Unnamed)`, value: `(${count > 0 ? '+' : ''}${unnamedDiff}) unnamed player${count > 1 ? 's' : ''}` });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Battledome Update — ${serverName}`)
+    .setDescription(`**Online:** ${info.onlinenow}  |  **In Dome:** ${info.indomenow ?? '?'}  |  **This Hour:** ${info.thishour ?? '?'}`)
+    .addFields(fields)
+    .setColor(joins.length > 0 || unnamedDiff > 0 ? 0x2ecc71 : 0xe74c3c) // Green for joins, Red for leaves
+    .setFooter({ text: `Live snapshot • ${new Date().toLocaleTimeString('en-GB')}` });
+
+  // Broadcast to all configured guilds
+  for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
+    try {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased?.()) continue;
+
+      // Construct content with mentions
+      let content = '';
+      
+      // Optimization: Only check subscribers if there's a potential trigger
+      // Triggers happen on: 
+      // 1. Named joins (legacy)
+      // 2. Count change (threshold crossing up OR down for re-arm)
+      const shouldCheckSubs = joins.length > 0 || unnamedDiff !== 0;
+
+      if (shouldCheckSubs) {
+        // Fetch subscribers for this guild/region
+        const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
+        if (snap.exists()) {
+            const triggeredUserIds = [];
+            const stateUpdates = {}; // path -> value
+
+            snap.forEach(child => {
+            const userId = child.key;
+            const val = child.val();
+            const sub = val.regions?.[regionKey];
+            
+            if (!sub || !sub.enabled) return;
+
+            const threshold = sub.threshold; // number or null
+            const prevState = sub.state || 'below';
+            
+            // Logic: Check threshold crossing
+            if (typeof threshold === 'number') {
+                if (onlineNow >= threshold) {
+                    // Currently Above
+                    if (prevState !== 'above') {
+                    // Crossing UP
+                    // Only trigger if we have positive movement (joins or unnamed increase)
+                    const isIncrease = (joins.length > 0) || (unnamedDiff > 0);
+                    if (isIncrease) {
+                        triggeredUserIds.push(userId);
+                        stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
+                    }
+                    }
+                } else {
+                    // Currently Below
+                    if (prevState !== 'below') {
+                    // Crossing DOWN (Re-arm)
+                    stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
+                    }
+                }
+            } else {
+                // No threshold: legacy join pings (only named joins)
+                if (joins.length > 0) {
+                    triggeredUserIds.push(userId);
+                }
+            }
+            });
+
+            // Apply state updates
+            if (Object.keys(stateUpdates).length > 0) {
+            // We do this asynchronously without awaiting to not block the broadcast loop too much
+            rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
+            }
+
+            if (triggeredUserIds.length > 0) {
+            content = triggeredUserIds.map(id => `<@${id}>`).join(' ');
+            }
+        }
+      }
+
+      await channel.send({ content, embeds: [embed] });
+    } catch (e) {
+      console.error(`[BD Broadcast] Failed to send to guild ${guildId}:`, e.message);
+    }
+  }
+}
+
 
 // ---------- Startup ----------
 client.once('ready', async () => {
