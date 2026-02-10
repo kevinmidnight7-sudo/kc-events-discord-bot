@@ -315,6 +315,7 @@ const bdTop = {
 };
 const bdTopMeta = { lastUpdatedAt: 0, seededHardcoded: false };
 let bdTopDirty = false;
+const lastCacheAnnounce = {}; // regionKey -> timestamp
 
 async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
   const now = Date.now();
@@ -504,6 +505,27 @@ async function getBdInfoCached(url) {
         staleMs: BD.INFO_STALE_MS,
         minIntervalMs: BD.MIN_FETCH_INTERVAL_MS
     });
+}
+
+async function announceBdCacheUpdated(regionKey, fetchedAt) {
+  const now = Date.now();
+  const last = lastCacheAnnounce[regionKey] || 0;
+  // Announce at most once every 10 minutes
+  if (now - last < 10 * 60 * 1000) return;
+
+  lastCacheAnnounce[regionKey] = now;
+  const serverName = BD_SERVERS[regionKey]?.name || regionKey;
+  const timeStr = `<t:${Math.floor(fetchedAt/1000)}:T>`;
+
+  // Broadcast to all destinations
+  for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
+      try {
+          const channel = await client.channels.fetch(channelId).catch(() => null);
+          if (channel && channel.isTextBased?.()) {
+              await channel.send(`✅ **${serverName}** cache updated • ${timeStr}`);
+          }
+      } catch (e) {}
+  }
 }
 
 // West Stats Page Helpers
@@ -2722,16 +2744,19 @@ client.on('interactionCreate', async (interaction) => {
             fromCache = r.fromCache;
             isStale = r.stale;
             fetchTime = r.fetchedAt;
-            
-            // If cache failed and we have no stale data, r.data might be null if swrFetch errored internally without throw
-            if (!info && r.error) throw new Error(r.error);
-
+            // Removed throw for missing data to allow graceful fallback
           } catch (e) {
-            return safeReply(interaction, { content: `Couldn't load leaderboard. Please try again in a moment. (${e.message})`, ephemeral: true });
+            // Quiet fail
           }
 
-          if (!info || !info.players || info.players.length === 0) {
-             return safeReply(interaction, { content: `No players currently on **${serverConfig.name}**.`, ephemeral: true });
+          if (!info || !info.players) {
+             // Show Warming Up Embed instead of error
+             const warmEmbed = new EmbedBuilder()
+                .setTitle(`Battledome Leaderboard — ${serverConfig.name}`)
+                .setDescription('_Cache warming up. Please try again in ~10 seconds._')
+                .setFooter({ text: 'Cache warming up' })
+                .setColor(DEFAULT_EMBED_COLOR);
+             return safeReply(interaction, { embeds: [warmEmbed] });
           }
 
           const top15 = info.players.slice(0, 15);
@@ -2749,30 +2774,30 @@ client.on('interactionCreate', async (interaction) => {
 
           const embed = new EmbedBuilder()
             .setTitle(`Battledome Leaderboard — ${serverConfig.name}`)
-            .setDescription(lines)
+            .setDescription(lines || '_No players listed._')
             .setFooter({ text: footer })
             .setColor(DEFAULT_EMBED_COLOR);
           
           return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /battledometop (NEW - clean output)
+        // Handle /battledometop (NEW)
         else if (commandName === 'battledometop') {
             await safeDefer(interaction);
             const region = interaction.options.getString('region') || 'All';
             const entries = [];
-            
+
             if (region === 'All') {
                 bdTop.global.forEach((v, k) => {
-                    const obj = (v && typeof v === 'object') 
-                      ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                      : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object')
+                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
+                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else if (bdTop[region]) {
                 bdTop[region].forEach((v, k) => {
-                    const obj = (v && typeof v === 'object') 
-                      ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                      : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object')
+                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
+                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else {
@@ -2780,14 +2805,16 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // Sort by score desc
-            entries.sort((a, b) => (b.score||0) - (a.score||0));
+            entries.sort((a, b) => (b.score || 0) - (a.score || 0));
             const top15 = entries.slice(0, 15);
 
             if (top15.length === 0) {
-                return safeReply(interaction, { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true });
+                return safeReply(
+                    interaction,
+                    { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true }
+                );
             }
 
-            // Clean list formatting
             const lines = top15.map((p, i) => `${i + 1}. ${clampName(p.name)} — ${p.score}`);
             const listText = lines.join('\n');
             const listBlock = "```\n" + listText + "\n```";
@@ -3936,15 +3963,24 @@ client.on('interactionCreate', async (interaction) => {
             fromCache = r.fromCache;
             isStale = r.stale;
             fetchTime = r.fetchedAt;
-
-             // If cache failed and we have no stale data
-            if (!info && r.error) throw new Error(r.error);
-
+            // Removed throw for missing data to allow graceful fallback
           } catch (e) {
-            return safeReply(interaction, {
-              content: `Couldn’t load server info right now. Try again in a few seconds.`,
-              ephemeral: true
-            });
+            // quiet fail
+          }
+
+          if (!info) {
+              // Return warming up embed
+              const warmEmbed = new EmbedBuilder()
+                  .setTitle(`Battledome — ${s.name || 'Server'}`)
+                  .addFields(
+                      { name: 'Online now', value: '—', inline: true },
+                      { name: 'In dome now', value: '—', inline: true },
+                      { name: 'Players this hour', value: '—', inline: true },
+                      { name: 'Players (0)', value: '_Cache warming up. Try again in ~10 seconds._' }
+                  )
+                  .setColor(DEFAULT_EMBED_COLOR)
+                  .setFooter({ text: 'Cache warming up' });
+              return safeReply(interaction, { embeds: [warmEmbed], components: interaction.message.components });
           }
       
           const players = Array.isArray(info?.players) ? info.players : [];
@@ -3995,14 +4031,22 @@ client.on('interactionCreate', async (interaction) => {
 async function checkRegion(regionKey) {
   const config = BD_SERVERS[regionKey];
   if (!config) return;
-  
-  let info;
-  try {
-    info = await fetchBdInfo(config.url);
-  } catch (e) {
-    return;
+
+  // FIX: Use cached fetcher, do not throw
+  const r = await getBdInfoCached(config.url).catch(() => null);
+  const info = r?.data;
+
+  // If no data (start up fail), just return
+  if (!info || !Array.isArray(info.players)) return;
+
+  // Update top scores
+  updateBdTop(regionKey, info.players);
+
+  // Optional: Announce fresh cache
+  if (r && !r.fromCache && !r.stale) {
+      // Don't await to avoid blocking poller
+      announceBdCacheUpdated(regionKey, r.fetchedAt).catch(() => {});
   }
-  if (!info) return;
 
   const state = bdState[regionKey];
   const currentNames = new Set(info.players.map(p => p.name));
