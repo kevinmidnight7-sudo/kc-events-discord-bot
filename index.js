@@ -2911,14 +2911,15 @@ client.on('interactionCreate', async (interaction) => {
              // Subscribe
              const updateData = {
                  enabled: true,
-                 state: 'below', // Reset state on manual update to ensure trigger works if currently above
+                 // State is managed by the poller; do not reset it here to avoid double-pings
              };
-             // Only set threshold if provided, otherwise null (explicit removal of threshold if overriding)
+             
+             // Only set threshold if provided; otherwise preserve existing (or undefined)
              if (threshold) {
                  updateData.threshold = threshold;
-             } else {
-                 updateData.threshold = null;
              }
+             // If user wants to clear threshold, they can unsubscribe/resubscribe or we could add a clear option later.
+             // Per instructions, we do not overwrite with null if missing.
 
              await ref.child(`regions/${region}`).update(updateData);
              await ref.child('updatedAt').set(admin.database.ServerValue.TIMESTAMP);
@@ -3987,288 +3988,6 @@ client.on('interactionCreate', async (interaction) => {
       await safeReply(interaction, { content: msg, ephemeral: true, embeds: [], components: [] });
     }
   }
-  // --- Select Menu Handlers ---
-  else if (interaction.isStringSelectMenu()) {
-    const [prefix, parentInteractionId] = interaction.customId.split(':');
-  
-    if (prefix === 'clans_select') {
-      try {
-        const clanId = interaction.values[0];
-        const cache = interaction.client.clanCache?.get(parentInteractionId);
-        if (!cache) {
-          // No defer yet; reply ephemeral
-          return safeReply(interaction, { 
-              content: 'Clan data has expired. Run `/clans` again.',
-              ephemeral: true
-          });
-        }
-  
-        // We know we’ll update the existing menu message
-        await safeDefer(interaction, { intent: 'update' });
-      
-        const { entries, usersData, badgesData } = cache;
-        const clan = entries.find(c => c.id === clanId);
-        if (!clan) {
-          return safeReply(interaction, { content: 'Clan not found.', embeds: [], components: [] });
-        }
-      
-        // build member display names
-        let memberNames = '';
-        if (clan.members) {
-          memberNames = Object.keys(clan.members)
-            .map(uid => usersData[uid]?.displayName || uid)
-            .join(', ');
-          if (memberNames.length > 1024) {
-            memberNames = memberNames.slice(0, 1020) + '…';
-          }
-        }
-      
-        const owner = usersData[clan.owner] || {};
-      
-        // recompute score in case it is needed
-        const score = computeClanScore(clan, usersData, badgesData);
-      
-        const detailEmbed = new EmbedBuilder()
-          .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
-          .setDescription(clan.description || 'No description provided.')
-          .addFields(
-            { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
-            { name: 'Points', value: `${score}`, inline: true },
-            { name: 'Members', value: memberNames || 'No members', inline: false },
-          )
-          .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
-          .setColor(DEFAULT_EMBED_COLOR);
-  
-        // Guard missing/invalid icon URL on the embed
-        if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
-          detailEmbed.setThumbnail(clan.icon);
-        }
-      
-        await safeReply(interaction, {
-          content: '',
-          embeds: [detailEmbed],
-          components: [], // remove the select menu once a clan is chosen
-        });
-  
-        // Delete the cache after selection
-        interaction.client.clanCache?.delete(parentInteractionId);
-  
-      } catch (err) {
-          console.error(`[select:${prefix}]`, err);
-          await safeReply(interaction, { 
-              content: '❌ Sorry, something went wrong.', 
-              ephemeral: true, embeds: [], components: [] 
-          });
-      }
-    } else if (prefix === 'bd_select') {
-      try {
-          const cache = interaction.client.bdCache?.get(parentInteractionId);
-          if (!cache) {
-            return safeReply(interaction, { content: 'This Battledome menu expired. Run `/battledome` again.', ephemeral: true });
-          }
-      
-          await safeDefer(interaction, { intent: 'update' });
-
-          const idx = parseInt(interaction.values?.[0] || '', 10);
-          const s = cache.servers[idx];
-          if (!s) {
-            return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
-          }
-      
-          const infoUrl = s.url;
-          let info;
-          try {
-            info = await fetchBdInfo(infoUrl);
-          } catch (e) {
-            return safeReply(interaction, {
-              content: `Couldn’t load server info for **${s.name || 'Unknown'}**.\nURL: ${infoUrl}\nError: ${e.message}`,
-              ephemeral: true
-            });
-          }
-      
-          const players = Array.isArray(info?.players) ? info.players : [];
-          const lines = players.slice(0, 40).map(p => {
-            const inDome = (p.indomenow === 'Yes') ? ' 🏟️' : '';
-            const rank = p.rank != null ? `#${p.rank}` : '#?';
-            const score = p.score != null ? ` (${p.score})` : '';
-            const name = p.name || '(unknown)';
-            const idle = p.inactive > 60 ? ' *(idle)*' : '';
-            return `${rank} **${name}**${score}${inDome}${idle}`;
-          });
-      
-          const embed = new EmbedBuilder()
-            .setTitle(info?.name ? `Battledome — ${info.name}` : `Battledome — ${s.name || 'Server'}`)
-            .addFields(
-              { name: 'Online now', value: String(info?.onlinenow ?? '—'), inline: true },
-              { name: 'In dome now', value: String(info?.indomenow ?? '—'), inline: true },
-              { name: 'Players this hour', value: String(info?.thishour ?? '—'), inline: true },
-              { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' }
-            )
-            .setColor(DEFAULT_EMBED_COLOR)
-            .setFooter({ text: 'KC Bot • /battledome' });
-      
-          return safeReply(interaction, { embeds: [embed], components: interaction.message.components });
-      } catch (err) {
-        console.error(`[select:${prefix}]`, err);
-        await safeReply(interaction, { 
-            content: '❌ Sorry, something went wrong.', 
-            ephemeral: true, embeds: [], components: [] 
-        });
-      }
-    }
-  }
-  // --- Modal Submissions ---
-  else if (interaction.isModalSubmit()) {
-    const { customId } = interaction;
-    // Modals are deferred with ephemeral
-    await safeDefer(interaction, { ephemeral: true });
-    try {
-      if (customId.startsWith('scc:')) {
-        // Handle Send Clan Challenge modal submission
-        // customId format: scc:<parentInteractionId>:<targetClanId>
-        const parts = customId.split(':');
-        const parentId = parts[1];
-        const targetClanId = parts[2];
-        // Validate the invoking user is still linked and is a clan owner
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
-        }
-        // Fetch clans to determine the user’s clan and ownership
-        const clansSnap = await rtdb.ref('clans').get();
-        const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
-        let myClanId = null;
-        let myClan = null;
-        for (const [cid, c] of Object.entries(clansData)) {
-          if (c.members && c.members[uid]) {
-            myClanId = cid;
-            myClan = c;
-            break;
-          }
-        }
-        if (!myClanId) {
-          return safeReply(interaction, { content: 'You are not in a clan.', ephemeral: true });
-        }
-        if (getOwnerUid(myClan) !== uid) {
-          return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
-        }
-        // Parse modal inputs
-        const server = (interaction.fields.getTextInputValue('scc_server') || '').trim();
-        const dtStr = (interaction.fields.getTextInputValue('scc_datetime') || '').trim();
-        const rules = (interaction.fields.getTextInputValue('scc_rules') || '').trim();
-        if (!server || !dtStr || !rules) {
-          return safeReply(interaction, { content: 'All fields are required.', ephemeral: true });
-        }
-        const date = new Date(dtStr);
-        if (!isFinite(date.getTime())) {
-          return safeReply(interaction, { content: 'Invalid date/time. Use ISO 8601 format (e.g. 2025-08-21T10:00).', ephemeral: true });
-        }
-        // Build battle record
-        const scheduledMs = date.getTime();
-        // Optional legacy time string for display (HH:MM in London timezone)
-        const timeStr = date.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
-        const battleData = {
-          challengerId: myClanId,
-          targetId: targetClanId,
-          server,
-          scheduledTime: scheduledMs,
-          time: timeStr,
-          rules,
-          status: 'pending',
-          createdAt: admin.database.ServerValue.TIMESTAMP,
-        };
-        try {
-          await rtdb.ref('battles').push(battleData);
-        } catch (e) {
-          console.error('[scc modal] failed to create battle:', e);
-          return safeReply(interaction, { content: 'Failed to create the challenge. Try again later.', ephemeral: true });
-        }
-        // Acknowledge success
-        return safeReply(interaction, { content: '✅ Challenge sent! Your clan battle request is pending.', embeds: [], components: [], ephemeral: true });
-      }
-      else if (customId.startsWith('clips:commentModal:')) {
-        const sid = customId.split(':')[2];
-        const payload = readModalTarget(sid);
-        if (!payload) return safeReply(interaction, { content: 'This action expired. Reopen the clip.', ephemeral: true });
-
-        const text = (interaction.fields.getTextInputValue('commentText') || '').trim();
-        if (!text) return safeReply(interaction, { content: 'Comment cannot be empty.', ephemeral: true });
-
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'Link your KC account with /link first.', ephemeral: true });
-
-        const names = await getAllUserNames();
-        const userName = names.get(uid) || interaction.user.username;
-
-        const comment = {
-          text,
-          uid,
-          user: userName,
-          time: admin.database.ServerValue.TIMESTAMP,
-        };
-
-        await rtdb.ref(`${payload.postPath}/comments`).push(comment);
-        await safeReply(interaction, { content: '✅ Comment posted!', ephemeral: true });
-      }
-      else if (customId.startsWith('msg:replyModal:')) {
-        const path = decPath(customId.split(':')[2]);
-        const text = interaction.fields.getTextInputValue('replyText').trim();
-        if (!text) return safeReply(interaction, { content: 'Reply can’t be empty.', ephemeral: true });
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'You must link your KC account first with /link.', ephemeral: true });
-        let nameMap = await getAllUserNames();
-        const userName = nameMap.get(uid) || interaction.user.username;
-        const reply = { user: userName, uid, text, time: admin.database.ServerValue.TIMESTAMP };
-        await withTimeout(rtdb.ref(`${path}/replies`).push(reply), 6000, `RTDB ${path}/replies.push`);
-        await safeReply(interaction, { content: '✅ Reply posted!', ephemeral: true });
-      } 
-      else if (customId === 'vote:modal') {
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
-        if (!(await userIsVerified(uid))) return safeReply(interaction, { content: 'You must verify your email on KC before voting.', ephemeral: true });
-        
-        const existingSnap = await rtdb.ref(`votes/${uid}`).get();
-        if (existingSnap.exists()) {
-            return safeReply(interaction, { content: 'You have already voted. To change your vote, run `/vote` again and use the buttons.', ephemeral: true });
-        }
-
-        const off = (interaction.fields.getTextInputValue('voteOff') || '').trim();
-        const def = (interaction.fields.getTextInputValue('voteDef') || '').trim();
-        const rating = Math.max(1, Math.min(5, parseInt(interaction.fields.getTextInputValue('voteRate') || '0', 10)));
-        if (!off || !def || !Number.isFinite(rating) || rating < 1 || rating > 5) {
-          return safeReply(interaction, { content: 'Please fill all fields. Rating must be 1–5.', ephemeral: true });
-        }
-        const verifiedMap = await getVerifiedNameMap();
-        const offNorm = norm(off), defNorm = norm(def);
-        const offFinal = verifiedMap[offNorm], defFinal = verifiedMap[defNorm];
-        if (!offFinal || !defFinal) {
-          return safeReply(interaction, { content: 'Couldn’t match one or both names to verified users. Please type the display name exactly as on KC.', ephemeral: true });
-        }
-        const nameMap = await getAllUserNames();
-        const username = nameMap.get(uid) || interaction.user.username;
-        const vote = { uid, username, bestOffence: offFinal, bestDefence: defFinal, rating, time: admin.database.ServerValue.TIMESTAMP };
-        const ref = rtdb.ref(`votes/${uid}`);
-        
-        // Use a transaction to prevent race conditions
-        const tx = await ref.transaction(currentData => {
-            return currentData ? undefined : vote;
-        });
-
-        if (!tx.committed) {
-            await safeReply(interaction, { content: '❗ You have already voted for this event.', ephemeral: true });
-        } else {
-            await safeReply(interaction, { content: '✅ Thanks for voting!', ephemeral: true });
-        }
-      }
-    } catch (err) {
-      console.error(`[modal:${customId}]`, err);
-      await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
-    }
-  }
 });
 
 async function maybeBroadcast(uid, postId, data) {
@@ -4450,58 +4169,66 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
       // Construct content with mentions
       let content = '';
       
-      // Fetch subscribers for this guild/region
-      const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
-      if (snap.exists()) {
-        const triggeredUserIds = [];
-        const stateUpdates = {}; // path -> value
+      // Optimization: Only check subscribers if there's a potential trigger
+      // Triggers happen on: 
+      // 1. Named joins (legacy)
+      // 2. Count change (threshold crossing up OR down for re-arm)
+      const shouldCheckSubs = joins.length > 0 || unnamedDiff !== 0;
 
-        snap.forEach(child => {
-          const userId = child.key;
-          const val = child.val();
-          const sub = val.regions?.[regionKey];
-          
-          if (!sub || !sub.enabled) return;
+      if (shouldCheckSubs) {
+        // Fetch subscribers for this guild/region
+        const snap = await rtdb.ref(`bdNotify/${guildId}`).get();
+        if (snap.exists()) {
+            const triggeredUserIds = [];
+            const stateUpdates = {}; // path -> value
 
-          const threshold = sub.threshold; // number or null
-          const prevState = sub.state || 'below';
-          
-          // Logic: Check threshold crossing
-          if (typeof threshold === 'number') {
-             if (onlineNow >= threshold) {
-                // Currently Above
-                if (prevState !== 'above') {
-                   // Crossing UP
-                   // Only trigger if we have positive movement (joins or unnamed increase)
-                   const isIncrease = (joins.length > 0) || (unnamedDiff > 0);
-                   if (isIncrease) {
-                      triggeredUserIds.push(userId);
-                      stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
-                   }
+            snap.forEach(child => {
+            const userId = child.key;
+            const val = child.val();
+            const sub = val.regions?.[regionKey];
+            
+            if (!sub || !sub.enabled) return;
+
+            const threshold = sub.threshold; // number or null
+            const prevState = sub.state || 'below';
+            
+            // Logic: Check threshold crossing
+            if (typeof threshold === 'number') {
+                if (onlineNow >= threshold) {
+                    // Currently Above
+                    if (prevState !== 'above') {
+                    // Crossing UP
+                    // Only trigger if we have positive movement (joins or unnamed increase)
+                    const isIncrease = (joins.length > 0) || (unnamedDiff > 0);
+                    if (isIncrease) {
+                        triggeredUserIds.push(userId);
+                        stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
+                    }
+                    }
+                } else {
+                    // Currently Below
+                    if (prevState !== 'below') {
+                    // Crossing DOWN (Re-arm)
+                    stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
+                    }
                 }
-             } else {
-                // Currently Below
-                if (prevState !== 'below') {
-                   // Crossing DOWN (Re-arm)
-                   stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
+            } else {
+                // No threshold: legacy join pings (only named joins)
+                if (joins.length > 0) {
+                    triggeredUserIds.push(userId);
                 }
-             }
-          } else {
-             // No threshold: legacy join pings (only named joins)
-             if (joins.length > 0) {
-                triggeredUserIds.push(userId);
-             }
-          }
-        });
+            }
+            });
 
-        // Apply state updates
-        if (Object.keys(stateUpdates).length > 0) {
-           // We do this asynchronously without awaiting to not block the broadcast loop too much
-           rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
-        }
+            // Apply state updates
+            if (Object.keys(stateUpdates).length > 0) {
+            // We do this asynchronously without awaiting to not block the broadcast loop too much
+            rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
+            }
 
-        if (triggeredUserIds.length > 0) {
-          content = triggeredUserIds.map(id => `<@${id}>`).join(' ');
+            if (triggeredUserIds.length > 0) {
+            content = triggeredUserIds.map(id => `<@${id}>`).join(' ');
+            }
         }
       }
 
