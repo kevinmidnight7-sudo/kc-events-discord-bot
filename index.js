@@ -264,37 +264,37 @@ const BD = {
 
 // Authoritative Server List (HTTP only)
 const BD_SERVERS = {
-  west: {
+  West: {
     name: "West Coast Battledome",
     url: "http://172.99.249.149:444/bdinfo.json",
-    region: "west"
+    region: "West"
   },
-  east: {
+  East: {
     name: "East Coast Battledome",
     url: "http://206.221.176.241:444/bdinfo.json",
-    region: "east"
+    region: "East"
   },
-  eu: {
+  EU: {
     name: "EU Battledome",
     url: "http://51.91.19.175:444/bdinfo.json",
-    region: "eu"
+    region: "EU"
   }
 };
 
 // Map of Server Name -> Region Key (Fix for Battledome Selection)
 const BD_NAME_OVERRIDES = {
-  "West Coast Battledome": "west",
-  "West Coast test BD": "west",
-  "East Coast Battledome": "east",
-  "New York Battledome": "east",
-  "EU Battledome": "eu",
+  "West Coast Battledome": "West",
+  "West Coast test BD": "West",
+  "East Coast Battledome": "East",
+  "New York Battledome": "East",
+  "EU Battledome": "EU",
 };
 
 // Map region -> state for polling
 const bdState = {
-  west: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
-  east: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
-  eu:   { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
+  West: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
+  East: { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
+  EU:   { lastNames: new Set(), lastOnline: 0, lastCheck: 0 },
 };
 
 async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
@@ -2238,9 +2238,9 @@ const notifyBdCmd = new SlashCommandBuilder()
     o.setName('region')
      .setDescription('Region to subscribe to')
      .addChoices(
-       { name: 'West Coast', value: 'west' },
-       { name: 'East Coast (NY)', value: 'east' },
-       { name: 'EU', value: 'eu' }
+       { name: 'West Coast', value: 'West' },
+       { name: 'East Coast (NY)', value: 'East' },
+       { name: 'EU', value: 'EU' }
      )
      .setRequired(false)
   )
@@ -2270,9 +2270,9 @@ const battledomeLbCmd = new SlashCommandBuilder()
     o.setName('region')
      .setDescription('Select region')
      .addChoices(
-       { name: 'West Coast', value: 'west' },
-       { name: 'East Coast (NY)', value: 'east' },
-       { name: 'EU', value: 'eu' }
+       { name: 'West Coast', value: 'West' },
+       { name: 'East Coast (NY)', value: 'East' },
+       { name: 'EU', value: 'EU' }
      )
      .setRequired(true)
   );
@@ -4088,7 +4088,7 @@ client.on('interactionCreate', async (interaction) => {
       
           // Resolve region URL from authoritative map
           // Use s.region if available, otherwise map by name, fallback to west
-          const region = s.region || BD_NAME_OVERRIDES[s.name] || "west";
+          const region = s.region || BD_NAME_OVERRIDES[s.name] || "West";
           const url = BD_SERVERS[region]?.url || s.url;
 
           if (!url) {
@@ -4134,11 +4134,10 @@ client.on('interactionCreate', async (interaction) => {
             ephemeral: true, embeds: [], components: [] 
         });
       }
-    }
+     }
   }
-  return map;
-}
-
+});
+  
 async function userIsVerified(uid) {
   const s = await withTimeout(rtdb.ref(`users/${uid}/emailVerified`).get(), 6000, 'RTDB emailVerified');
   return !!s.val();
@@ -4944,9 +4943,9 @@ const notifyBdCmd = new SlashCommandBuilder()
     o.setName('region')
      .setDescription('Region to subscribe to')
      .addChoices(
-       { name: 'West Coast', value: 'west' },
-       { name: 'East Coast (NY)', value: 'east' },
-       { name: 'EU', value: 'eu' }
+       { name: 'West Coast', value: 'West' },
+       { name: 'East Coast (NY)', value: 'East' },
+       { name: 'EU', value: 'EU' }
      )
      .setRequired(false)
   )
@@ -4976,9 +4975,9 @@ const battledomeLbCmd = new SlashCommandBuilder()
     o.setName('region')
      .setDescription('Select region')
      .addChoices(
-       { name: 'West Coast', value: 'west' },
-       { name: 'East Coast (NY)', value: 'east' },
-       { name: 'EU', value: 'eu' }
+       { name: 'West Coast', value: 'West' },
+       { name: 'East Coast (NY)', value: 'East' },
+       { name: 'EU', value: 'EU' }
      )
      .setRequired(true)
   );
@@ -5271,13 +5270,13 @@ async function pollBattledome() {
   while (true) {
     try {
       // Staggered checks
-      await checkRegion('west');
+      await checkRegion('West');
       await new Promise(r => setTimeout(r, 5000));
       
-      await checkRegion('east');
+      await checkRegion('East');
       await new Promise(r => setTimeout(r, 5000));
       
-      await checkRegion('eu');
+      await checkRegion('EU');
       await new Promise(r => setTimeout(r, 5000));
 
     } catch (e) {
