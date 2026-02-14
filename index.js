@@ -101,6 +101,165 @@ const BD_UI = {
   COLORS: { online: 0x2ECC71, idle: 0xF1C40F, offline: 0xE74C3C }
 };
 
+// -----------------------------------------------------------------------------
+// Slither server leaderboard constants and cache
+//
+// NTL (https://ntl-slither.com/ss/rs.php) hosts a realtime status page for
+// Slither.io private servers. We add a new `/server` command which fetches
+// this page, parses all server blocks, caches the result for a short period
+// and returns a leaderboard embed for a specified server id. See
+// slither_server_command_instructions.txt for full details.
+//
+// SLITHER defines the endpoint and caching parameters. slitherCache stores
+// the last fetch timestamp, parsed server map, raw HTML length and error.
+const SLITHER = {
+  URL: 'https://ntl-slither.com/ss/rs.php',
+  TIMEOUT_MS: 8000,
+  CACHE_MS: 15000,
+};
+
+const slitherCache = {
+  fetchedAt: 0,
+  servers: new Map(),
+  rawLen: 0,
+  lastError: null,
+};
+
+// Fetch plain text from a URL with a timeout and custom user-agent. Uses
+// AbortController to cancel the request if it hangs. Throws on non‑2xx
+// responses. Returns the response body as a string.
+async function fetchText(url, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'user-agent': 'KC-Discord-Bot/1.0' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return await res.text();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Parse the NTL real‑time server page into a Map of server objects. Each
+// server block begins with a numeric id followed by ip:port and region.
+// Leaderboard lines are parsed into rank, name and score. Totals and
+// update info are extracted. See the instructions for format details.
+function parseNtlServers(html) {
+  // Replace <br> with newlines and strip other tags. Normalize whitespace.
+  const text = html
+    .replace(/<br\s*\/?\>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r/g, '');
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const servers = new Map();
+  let cur = null;
+  const headerRe = /^(\d{3,6})\s+([0-9.]+:\d+)\s+-\s+(.+)$/;
+  const lbRe = /^(\d{1,2})#\s*(.+)$/;
+  for (const line of lines) {
+    const h = line.match(headerRe);
+    if (h) {
+      const id = Number(h[1]);
+      cur = {
+        id,
+        ipPort: h[2],
+        region: h[3].trim(),
+        serverTime: null,
+        totalScore: null,
+        totalPlayers: null,
+        updated: null,
+        leaderboard: [],
+      };
+      servers.set(id, cur);
+      continue;
+    }
+    if (!cur) continue;
+    // Server time line
+    if (/^server time:/i.test(line)) {
+      cur.serverTime = line.replace(/^server time:\s*/i, '').trim();
+      continue;
+    }
+    // Leaderboard lines: e.g. "1# name 12505"
+    const lbm = line.match(lbRe);
+    if (lbm) {
+      const rank = Number(lbm[1]);
+      const rest = lbm[2].trim();
+      const m2 = rest.match(/^(.*?)(\d+)\s*$/);
+      if (m2) {
+        const name = (m2[1] || '').trim();
+        const score = Number(m2[2]);
+        cur.leaderboard.push({ rank, name: name || '(no name)', score });
+      }
+      continue;
+    }
+    // Total score line
+    if (/^total score:/i.test(line)) {
+      cur.totalScore = Number(line.replace(/[^0-9]/g, '')) || null;
+      continue;
+    }
+    // Total players line
+    if (/^total players:/i.test(line)) {
+      cur.totalPlayers = Number(line.replace(/[^0-9]/g, '')) || null;
+      continue;
+    }
+    // Updated line
+    if (/^updated:/i.test(line)) {
+      cur.updated = line.replace(/^updated:\s*/i, '').trim();
+      continue;
+    }
+  }
+  // Trim leaderboard to top 10 and sort by rank
+  for (const s of servers.values()) {
+    s.leaderboard = s.leaderboard
+      .filter((e) => e.rank >= 1 && e.rank <= 10)
+      .sort((a, b) => a.rank - b.rank);
+  }
+  return servers;
+}
+
+// Cache wrapper for the Slither server map. Returns cached data if the
+// last fetch occurred within SLITHER.CACHE_MS milliseconds. Otherwise
+// fetches fresh HTML and reparses. Returns an object with servers map,
+// fromCache boolean and fetchedAt timestamp.
+async function getSlitherServersCached() {
+  const now = Date.now();
+  const age = now - slitherCache.fetchedAt;
+  if (slitherCache.servers.size && age < SLITHER.CACHE_MS) {
+    return {
+      servers: slitherCache.servers,
+      fromCache: true,
+      fetchedAt: slitherCache.fetchedAt,
+    };
+  }
+  try {
+    const html = await fetchText(SLITHER.URL, SLITHER.TIMEOUT_MS);
+    const servers = parseNtlServers(html);
+    slitherCache.fetchedAt = Date.now();
+    slitherCache.servers = servers;
+    slitherCache.rawLen = html.length;
+    slitherCache.lastError = null;
+    return { servers, fromCache: false, fetchedAt: slitherCache.fetchedAt };
+  } catch (e) {
+    slitherCache.lastError = e.message;
+    if (slitherCache.servers.size) {
+      return {
+        servers: slitherCache.servers,
+        fromCache: true,
+        fetchedAt: slitherCache.fetchedAt,
+        error: e.message,
+      };
+    }
+    throw e;
+  }
+}
+
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
   userNames: new Map(), // uid -> displayName
@@ -495,16 +654,18 @@ function buildBdStatusUnifiedEmbed(options = {}) {
       } else {
         lines.push('_No players_');
       }
-      // Include advanced details if requested (e.g. server URL)
-     if (showAdvanced) {
-  const serverIp =
-    info?.server ||
-    info?.ip ||
-    info?.address ||
-    'Unknown';
-
-  lines.push(`🖥️ Server: ${serverIp}`);
-}
+      // Include advanced details if requested. Derive the in‑game IP:PORT from
+      // the Battledome server URL rather than showing the full API path or
+      // falling back to info.ip (which is often undefined). Use URL().host to
+      // extract only host:port from BD_SERVERS[region].url (e.g. http://172.99.249.149:444/bdinfo.json -> 172.99.249.149:444).
+      if (showAdvanced) {
+        let serverIp = 'Unknown';
+        try {
+          const u = new URL(BD_SERVERS[region]?.url || '');
+          serverIp = u.host || 'Unknown';
+        } catch (_) {}
+        lines.push(`🖥️ Server: ${serverIp}`);
+      }
 
 
       if (fetchedAt) {
@@ -608,6 +769,73 @@ function buildBdScoreCompareEmbed() {
   const lastUpdate = bdTopMeta.lastUpdatedAt || Date.now();
   embed.setFooter({ text: `Updated <t:${Math.floor(lastUpdate/1000)}:R>` });
   return embed;
+}
+
+// -----------------------------------------------------------------------------
+// Battledome helpers for join logs and server host extraction
+//
+// Extract the in‑game host:port from the configured BD_SERVERS URL for a
+// region. Falls back to 'Unknown' if parsing fails. This allows details
+// views and join logs to show the actual connection address instead of the
+// API endpoint.
+function bdServerHost(region) {
+  try {
+    return new URL(BD_SERVERS[region]?.url || '').host || 'Unknown';
+  } catch {
+    return 'Unknown';
+  }
+}
+
+// Post join and leave events to the configured Battledome join logs channel.
+// When a guild has /setjoinlogschannel configured, this function constructs
+// green (joins) and red (leaves) embeds summarising the names and counts
+// of players who joined or left the specified region during a poll. Up to
+// 10 names are shown inline; additional players are summarised. A timestamp
+// is included in the footer. If no names are provided, no embed is sent.
+async function postJoinLogsBlock(guildId, region, { joins = [], leaves = [] }) {
+  const joinLogsId = globalCache.bdJoinLogs?.get(guildId);
+  if (!joinLogsId) return;
+  const chan = await client.channels.fetch(joinLogsId).catch(() => null);
+  if (!chan || !chan.isTextBased?.()) return;
+  const serverName = BD_SERVERS[region]?.name || region;
+  const regionIcon = BD_UI.ICONS.region?.[region] || '';
+  const host = bdServerHost(region);
+  const embeds = [];
+  if (joins.length > 0) {
+    const list = joins.slice(0, 10).map(n => `• **${n}**`).join('\n');
+    const more = joins.length > 10 ? `\n… +${joins.length - 10} more` : '';
+    embeds.push(
+      new EmbedBuilder()
+        .setTitle('✅ Battledome Join Log')
+        .setColor(0x2ECC71)
+        .setDescription(
+          `${regionIcon} **${serverName}**\n` +
+          `🖥️ Server: **${host}**\n` +
+          `${BD_UI.ICONS.players} Joined: **${joins.length}**\n\n` +
+          (list || '_No named joins_') + more
+        )
+        .setFooter({ text: `Updated ${new Date().toLocaleString()}` })
+    );
+  }
+  if (leaves.length > 0) {
+    const list2 = leaves.slice(0, 10).map(n => `• **${n}**`).join('\n');
+    const more2 = leaves.length > 10 ? `\n… +${leaves.length - 10} more` : '';
+    embeds.push(
+      new EmbedBuilder()
+        .setTitle('❌ Battledome Leave Log')
+        .setColor(0xE74C3C)
+        .setDescription(
+          `${regionIcon} **${serverName}**\n` +
+          `🖥️ Server: **${host}**\n` +
+          `${BD_UI.ICONS.players} Left: **${leaves.length}**\n\n` +
+          (list2 || '_No named leaves_') + more2
+        )
+        .setFooter({ text: `Updated ${new Date().toLocaleString()}` })
+    );
+  }
+  if (embeds.length) {
+    await chan.send({ embeds });
+  }
 }
 
 // Build the persistent dashboard action rows. The public Battledome status
@@ -2554,6 +2782,20 @@ const compareBdScoresCmd = new SlashCommandBuilder()
   .setName('comparebdscores')
   .setDescription('Compare top Battledome scores across regions');
 
+// Command: Slither server leaderboard (NEW)
+// Fetches the real‑time status of a specific Slither server from NTL and
+// displays the top players, totals and update time. Accepts a numeric
+// server id corresponding to NTL’s listing (e.g. 6622). Results are
+// cached for about 15 seconds to avoid hammering NTL.
+const serverCmd = new SlashCommandBuilder()
+  .setName('server')
+  .setDescription('Show Slither leaderboard for a specific server id (NTL)')
+  .addIntegerOption(opt =>
+    opt.setName('id')
+      .setDescription('Server id from NTL list (e.g. 6622)')
+      .setRequired(true)
+  );
+
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -2563,6 +2805,7 @@ const commandsJson = [
   clansCmd, clanBattlesCmd, sendClanChallengeCmd, incomingChallengesCmd, getClanRolesCmd, setEventsChannelCmd,
   battledomeCmd, setBattledomeChannelCmd, setJoinLogsChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd,
   battledomeStatusCmd, recentlyJoinedCmd, compareBdScoresCmd
+  , serverCmd
 ].map(c => c.toJSON());
 
 
@@ -3430,6 +3673,46 @@ client.on('interactionCreate', async (interaction) => {
             } catch (err) {
               console.error('[comparebdscores]', err);
               return safeReply(interaction, { content: 'Failed to build BD score comparison.', ephemeral: true });
+            }
+        }
+
+        // Handle /server (NEW)
+        else if (commandName === 'server') {
+            // Fetch realtime leaderboard for a specific Slither server id
+            const id = interaction.options.getInteger('id');
+            try {
+              const { servers, fromCache, fetchedAt } = await getSlitherServersCached();
+              const s = servers.get(id);
+              if (!s) {
+                return safeReply(interaction, {
+                  content: `I couldn’t find server **${id}** on NTL right now. Try again in a few seconds.`,
+                  embeds: [],
+                  components: [],
+                  // Return as an ordinary message (not suppressed) since /server is public
+                  // and this command is not marked as ephemerally private.
+                });
+              }
+              // Build leaderboard lines. Escape backticks in names.
+              const lines = (s.leaderboard.length ? s.leaderboard : []).map(e => {
+                const nm = (e.name || '(no name)').replace(/`/g, 'ˋ');
+                return `\`${String(e.rank).padStart(2,' ')}.\` **${nm}** — \`${e.score}\``;
+              }).join('\n') || '_No leaderboard entries found._';
+              const ageSec = Math.floor((Date.now() - fetchedAt) / 1000);
+              const cacheNote = fromCache ? `Cached (${ageSec}s)` : `Live (${ageSec}s)`;
+              const embed = new EmbedBuilder()
+                .setTitle(`🐍 Slither Server ${s.id}`)
+                .setDescription(`**${s.ipPort}** — ${s.region}`)
+                .addFields(
+                  { name: 'Leaderboard (Top 10)', value: lines },
+                  { name: 'Total Score', value: String(s.totalScore ?? '—'), inline: true },
+                  { name: 'Total Players', value: String(s.totalPlayers ?? '—'), inline: true },
+                  { name: 'Updated', value: String(s.updated ?? '—'), inline: true },
+                )
+                .setFooter({ text: `NTL • ${cacheNote}` });
+              return safeReply(interaction, { embeds: [embed] });
+            } catch (err) {
+              console.error('[server]', err);
+              return safeReply(interaction, { content: 'Sorry, failed to fetch server data. Please try again later.', embeds: [], components: [] });
             }
         }
 
@@ -4959,6 +5242,20 @@ async function checkRegion(regionKey) {
   }
   for (const name of leaves) {
     bdRecent[regionKey].push({ name, time: now, type: 'leave' });
+  }
+
+  // If there were any joins or leaves, also post a summary block to each
+  // configured join log channel. This emits green and red embeds summarising
+  // the counts and names. It iterates through all guilds that have
+  // configured join logs and posts to each. Errors are ignored per guild.
+  if (joins.length > 0 || leaves.length > 0) {
+    for (const [guildId] of globalCache.bdJoinLogs.entries()) {
+      try {
+        await postJoinLogsBlock(guildId, regionKey, { joins, leaves });
+      } catch (e) {
+        // silent
+      }
+    }
   }
 }
 
