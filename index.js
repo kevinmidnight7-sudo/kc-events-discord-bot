@@ -1059,10 +1059,10 @@ function updateBdTopScore(regionKey, name, score, serverName = "") {
     }
   }
 
-  // Update global map
-  {
+  // Update global map only if not West. West scores should not influence all‑time/global
+  if (regionKey !== 'West') {
     const cur = bdTop.global.get(clean);
-    const curScore = (cur && typeof cur === "object") ? (cur.score ?? 0) : (Number(cur) || 0);
+    const curScore = (cur && typeof cur === 'object') ? (cur.score ?? 0) : (Number(cur) || 0);
     if (rec.score > curScore) {
       bdTop.global.set(clean, rec);
       changed = true;
@@ -3813,7 +3813,13 @@ client.on('interactionCreate', async (interaction) => {
           }
         } catch {}
         const serverList = servers.length ? servers.join(', ') : 'None';
-        // Build embed
+        // DM preference for this user in this guild (default false if missing)
+        let dmEnabled = false;
+        try {
+          const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}/dmEnabled`).get();
+          if (snap.exists() && snap.val() === true) dmEnabled = true;
+        } catch {}
+        // Build embed including DM notification status
         const embed = new EmbedBuilder()
           .setTitle('Battledome Controls')
           .setDescription('Manage your alert preferences and settings.')
@@ -3822,7 +3828,8 @@ client.on('interactionCreate', async (interaction) => {
             { name: 'Alerts', value: alertsEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
             { name: 'Servers', value: serverList, inline: true },
             { name: 'Cooldown', value: cooldownMinutes ? `${cooldownMinutes} min` : '—', inline: true },
-            { name: 'Min Players', value: minPlayers ? String(minPlayers) : '—', inline: true }
+            { name: 'Min Players', value: minPlayers ? String(minPlayers) : '—', inline: true },
+            { name: 'DM Notifications', value: dmEnabled ? '✅ Enabled' : '❌ Disabled', inline: true }
           );
         // Build control buttons
         const toggleBtn = new ButtonBuilder()
@@ -3837,7 +3844,12 @@ client.on('interactionCreate', async (interaction) => {
           .setCustomId(`bd:open_server_filter:${guildId}`)
           .setLabel('Select Servers')
           .setStyle(ButtonStyle.Secondary);
-        const row = new ActionRowBuilder().addComponents(toggleBtn, settingsBtn, serversBtn);
+        // New button for toggling DM notifications
+        const dmBtn = new ButtonBuilder()
+          .setCustomId(`bd:toggle_dm:${guildId}`)
+          .setLabel(dmEnabled ? 'Disable DMs' : 'Enable DMs')
+          .setStyle(dmEnabled ? ButtonStyle.Danger : ButtonStyle.Success);
+        const row = new ActionRowBuilder().addComponents(toggleBtn, settingsBtn, serversBtn, dmBtn);
         await safeReply(interaction, { embeds: [embed], components: [row], ephemeral: true });
         return;
       }
@@ -3887,6 +3899,25 @@ client.on('interactionCreate', async (interaction) => {
         // update status message to reflect new toggle if needed
         updateBdStatusMessages().catch(() => {});
         return safeReply(interaction, { content: alertsEnabled ? '🔔 Alerts enabled.' : '🔕 Alerts disabled.', ephemeral: true });
+      }
+      // Toggle DM notifications: enable/disable DM alerts for this user in this guild
+      if (action === 'toggle_dm') {
+        // fetch current dmEnabled (default false)
+        let dmEnabled = false;
+        try {
+          const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}/dmEnabled`).get();
+          if (snap.exists() && snap.val() === true) dmEnabled = true;
+        } catch {}
+        // invert
+        dmEnabled = !dmEnabled;
+        // persist
+        await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}`).update({
+          dmEnabled,
+          updatedAt: admin.database.ServerValue.TIMESTAMP,
+          updatedBy: interaction.user.id
+        });
+        // respond
+        return safeReply(interaction, { content: dmEnabled ? '✅ DM notifications enabled.' : '✅ DM notifications disabled.', embeds: [], components: [],  });
       }
       // Alert settings: open a modal to edit minPlayers and cooldown
       if (action === 'alert_settings') {
@@ -5309,45 +5340,50 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
       if (Object.keys(stateUpdates).length > 0) {
         rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
       }
-      // Notify each triggered user. If a join logs channel is configured for this guild,
-      // ping the user in that channel; otherwise fall back to a DM. We build the
-      // message for each user outside of the DM/send logic so it can be reused.
+      // Notify each triggered user. Apply DM preferences and join logs rules.
       for (const { userId, mode, threshold } of triggered) {
-        // Build the notification message for this user
-        let message;
-        if (mode === 'active' && typeof threshold === 'number') {
-          message = `The dome on **${serverName}** has reached your threshold of **${threshold}** players (now ${inDomeNow}).`;
-        } else {
-          const joinCount = joins.length + Math.max(0, unnamedDiff);
-          if (joinCount <= 0) continue;
-          if (joins.length > 0) {
-            // Show names if there are only a handful, else summarise count
-            if (joins.length <= 3 && unnamedDiff <= 0) {
-              message = `Players joined **${serverName}**: ${joins.map(n => `**${n}**`).join(', ')}.`;
-            } else {
-              message = `**${joinCount}** players have joined **${serverName}**.`;
-            }
-          } else {
-            message = `**${joinCount}** unnamed players have joined **${serverName}**.`;
-          }
+        // Skip join‑mode alerts for DM/logging. Joins are covered by join logs blocks.
+        if (mode !== 'active') {
+          continue;
         }
-        // If a join logs channel is configured for this guild, ping the user there
+        // Build message for threshold alerts
+        let message;
+        if (typeof threshold === 'number') {
+          // Compose a more user‑friendly threshold message
+          message = `✅ ${serverName} Battledome has reached your player count of **${threshold}** (now ${inDomeNow}).`;
+        } else {
+          // Should not happen for active mode, but fallback
+          message = `✅ ${serverName} Battledome activity notification.`;
+        }
+        // Determine DM preference for this user in this guild
+        let dmEnabledPref = false;
+        try {
+          const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${userId}/dmEnabled`).get();
+          if (snap.exists() && snap.val() === true) dmEnabledPref = true;
+        } catch {}
+        // Determine if a join logs channel is configured
         const joinLogsId = globalCache.bdJoinLogs?.get(guildId);
-        if (joinLogsId) {
+        // Delivery logic: if DM enabled, DM. Else if join logs exists, mention. Else silent.
+        if (dmEnabledPref === true) {
+          // DM the user only
           try {
-            const chan = await client.channels.fetch(joinLogsId).catch(() => null);
-            if (chan && chan.isTextBased?.()) {
-              await chan.send({ content: `<@${userId}> ${message}` });
-              continue; // skip DM when posted in join logs
+            const user = await client.users.fetch(userId).catch(() => null);
+            if (user) {
+              await user.send({ content: message });
             }
           } catch {}
+        } else {
+          // DM disabled
+          if (joinLogsId) {
+            try {
+              const chan = await client.channels.fetch(joinLogsId).catch(() => null);
+              if (chan && chan.isTextBased?.()) {
+                await chan.send({ content: `<@${userId}> ${message}` });
+              }
+            } catch {}
+          }
+          // If no join logs channel, remain silent
         }
-        // Fallback to DM
-        try {
-          const user = await client.users.fetch(userId).catch(() => null);
-          if (!user) continue;
-          await user.send({ content: message });
-        } catch {}
       }
     } catch (err) {
       console.error('[BD Broadcast] Error while processing guild', guildId, err);
@@ -5573,6 +5609,31 @@ function attachPostsListener(uid) {
             await saveBdTop();
         }
     }, 30000).unref();
+
+    // Attach process exit handlers to persist top scores on shutdown
+    const gracefulSave = async (exitCode = 0) => {
+      try {
+        if (bdTopDirty) {
+          // attempt to save without clearing the flag (avoid race conditions)
+          await saveBdTop();
+          bdTopDirty = false;
+        }
+      } catch (e) {
+        console.error('[BdTop] Failed to save on exit:', e?.message || e);
+      } finally {
+        process.exit(exitCode);
+      }
+    };
+    process.once('SIGINT', () => gracefulSave(0));
+    process.once('SIGTERM', () => gracefulSave(0));
+    process.once('uncaughtException', (err) => {
+      console.error('Uncaught exception:', err);
+      gracefulSave(1);
+    });
+    process.once('unhandledRejection', (reason) => {
+      console.error('Unhandled rejection:', reason);
+      gracefulSave(1);
+    });
 
     // Start background refresh for West stats
     setInterval(() => seedTopFromWestStats().catch(()=>{}), 20 * 60 * 1000).unref?.();
