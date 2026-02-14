@@ -85,6 +85,40 @@ const POST_EMOJIS = ['🔥','❤️','😂','👍','👎']; // same list you sho
 
 const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
+// --- Battledome UI Design System (NEW) ---
+// Define a design system for the Battledome dashboard. Centralising all emojis
+// and colours makes the UI consistent and easy to tweak. See the BD UI
+// overhaul instructions for guidance on these values.
+const BD_UI = {
+  STATUS: {
+    online: '🟢',
+    idle:   '🟡',
+    offline:'🔴'
+  },
+  ICONS: {
+    players: '👥',
+    active:  '🔥',
+    time:    '🕒',
+    region: {
+      West: '🌎',
+      East: '🇺🇸',
+      EU:   '🇪🇺'
+    }
+  },
+  COLORS: {
+    online: 0x2ECC71,
+    idle:   0xF1C40F,
+    offline:0xE74C3C
+  }
+};
+
+// Helper to format a timestamp as a Discord relative timestamp. Use this
+// instead of repeatedly writing the formatting logic. It returns a string
+// like `<t:1234567890:R>` which Discord renders as “x minutes ago”.
+function fmtRelative(ts) {
+  return `<t:${Math.floor(ts/1000)}:R>`;
+}
+
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
   userNames: new Map(), // uid -> displayName
@@ -95,6 +129,23 @@ const globalCache = {
   // Destination channels for Battledome updates (guildId -> channelId)
   bdDestinations: new Map(),
 };
+
+// Track the last manual refresh time per guild to avoid spamming refreshes. When
+// users click the Refresh button on the Battledome dashboard, we store the
+// timestamp and enforce a cooldown (see bd:refresh handler).
+const bdManualRefreshAt = new Map();
+
+// Per-guild cache of the last rendered Battledome dashboard embed and
+// components. Each entry is an object { embedJson: string, compsJson: string, updatedAt: number }
+// used to detect changes and avoid unnecessary edits. A heartbeat ensures
+// the dashboard is updated at least every 60 seconds even if nothing
+// changed, so relative timestamps stay fresh.
+const bdDashboardRenderCache = new Map();
+
+// Track the last time an alert DM was sent to a user for a given guild/region/mode. This
+// enables enforcing per-user cooldowns specified in the alert settings modal.
+// Key format: `${guildId}:${userId}:${regionKey}:${mode}` -> timestamp (ms)
+const bdAlertLastSent = new Map();
 
 // only these will be private
 const isEphemeralCommand = (name) =>
@@ -438,6 +489,119 @@ function buildBdRecentEmbeds() {
   return embeds;
 }
 
+// Build a unified Battledome dashboard embed. This embed consolidates the
+// status of all Battledome servers into a single panel. It shows a
+// high‑level summary (online/offline status, player counts, active counts)
+// along with the top three players for each region. Optional advanced
+// information such as server IPs/URLs can be toggled via the `showAdvanced`
+// parameter. The embed colour is derived from the “worst” state across
+// regions: red if any are offline, yellow if any are warming, otherwise
+// green.
+function buildBdDashboardEmbed({ showAdvanced = false } = {}) {
+  let enabledCount = 0;
+  let worstState = 'online';
+  let lastUpdated = 0;
+  const fields = [];
+  for (const region of ['West','East','EU']) {
+    const info = bdLastInfo[region];
+    const fetchedAt = bdLastFetch[region] || 0;
+    if (fetchedAt > lastUpdated) lastUpdated = fetchedAt;
+    const flag = BD_UI.ICONS.region[region] || '';
+    const title = `${flag} ${BD_SERVERS[region]?.name || region}`;
+    if (!info) {
+      // Warming up / idle state
+      worstState = worstState === 'offline' ? 'offline' : 'idle';
+      fields.push({ name: title, value: `${BD_UI.STATUS.idle} _Cache warming up…_`, inline: false });
+      continue;
+    }
+    enabledCount++;
+    const onlineCount = info.onlinenow ?? 0;
+    const activeCount = info.indomenow ?? 0;
+    // Determine state: offline if onlineCount is 0, idle if players this hour is 0 or null
+    let state = 'online';
+    if (onlineCount === 0) state = 'offline';
+    else if (!info.thishour || info.thishour === 0) state = 'idle';
+    if (state === 'offline' || (state === 'idle' && worstState !== 'offline')) worstState = state;
+    const statusEmoji = BD_UI.STATUS[state];
+    const pctActive = onlineCount > 0 ? Math.floor((activeCount / onlineCount) * 100) : 0;
+    // Build top 3 lines by score
+    let topLines = '';
+    const players = Array.isArray(info.players) ? info.players.slice(0, 3) : [];
+    if (players.length === 0) {
+      topLines = '_No players_';
+    } else {
+      topLines = players.map((p, idx) => {
+        const nm = p.name || '—';
+        return `${idx + 1}. ${nm}`;
+      }).join('\n');
+    }
+    let value = `${statusEmoji} **${state === 'online' ? 'Online' : (state === 'idle' ? 'Idle' : 'Offline')}**\n` +
+                `${BD_UI.ICONS.players} Players: **${onlineCount}**\n` +
+                `${BD_UI.ICONS.active} Active: **${activeCount}** (${pctActive}%)\n` +
+                `${topLines}`;
+    if (showAdvanced) {
+      // Append advanced info: show server URL/IP for diagnostics
+      const url = BD_SERVERS[region]?.url || '';
+      value += `\n\n🔎 **Advanced**\nIP/URL: \`${url}\``;
+    }
+    fields.push({ name: title, value, inline: false });
+  }
+  // Determine colour based on worst state
+  const colour = BD_UI.COLORS[worstState] || DEFAULT_EMBED_COLOR;
+  const embed = new EmbedBuilder()
+    .setTitle('🏟️ Battledome Status')
+    .setDescription(`Monitoring ${enabledCount} server(s) • Updated ${fmtRelative(lastUpdated || Date.now())}`)
+    .setColor(colour)
+    .addFields(fields);
+  return embed;
+}
+
+// Build component rows for the Battledome dashboard. Returns an array of
+// ActionRowBuilders containing buttons to control alert settings, toggle
+// advanced information, manually refresh the dashboard and open further
+// settings. The button appearance (label and style) depends on the
+// per‑guild settings passed in.
+function buildBdDashboardComponents({ alertsEnabled = true, showAdvanced = false } = {}) {
+  const row1 = new ActionRowBuilder();
+  // Alerts toggle button
+  row1.addComponents(
+    new ButtonBuilder()
+      .setCustomId('bd:toggle_alerts')
+      .setLabel(alertsEnabled ? 'Alerts ON' : 'Alerts OFF')
+      .setStyle(alertsEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
+  );
+  // Alert settings button (opens a modal)
+  row1.addComponents(
+    new ButtonBuilder()
+      .setCustomId('bd:open_alert_settings')
+      .setLabel('Alert Settings')
+      .setStyle(ButtonStyle.Secondary)
+  );
+  // Server filter button
+  row1.addComponents(
+    new ButtonBuilder()
+      .setCustomId('bd:open_server_filter')
+      .setLabel('Select BD Servers')
+      .setStyle(ButtonStyle.Secondary)
+  );
+  const row2 = new ActionRowBuilder();
+  // Refresh button
+  row2.addComponents(
+    new ButtonBuilder()
+      .setCustomId('bd:refresh')
+      .setLabel('Refresh')
+      .setStyle(ButtonStyle.Primary)
+  );
+  // Advanced toggle button
+  row2.addComponents(
+    new ButtonBuilder()
+      .setCustomId('bd:toggle_advanced')
+      .setLabel(showAdvanced ? 'Advanced: ON' : 'Advanced: OFF')
+      .setStyle(ButtonStyle.Secondary)
+  );
+  return [row1, row2];
+}
+
 // Send or update the live Battledome status message in each configured
 // guild/channel. For each guild configured via setbattledomechannel,
 // check if we already sent a status message. If so, edit it with the
@@ -445,25 +609,103 @@ function buildBdRecentEmbeds() {
 // function should be called after each poll to keep the status fresh and
 // when a destination channel is added.
 async function updateBdStatusMessages() {
-  const embeds = buildBdStatusEmbeds();
+  // Build and broadcast the live Battledome dashboard for each configured guild.
+  // Instead of sending multiple embeds per region, we construct a single embed
+  // per guild and attach interactive components based on guild settings. We
+  // persist message IDs in RTDB so the dashboard survives restarts.
   for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
     try {
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel || !channel.isTextBased?.()) continue;
-      const msgId = bdSummaryMessages.get(guildId);
-      if (msgId) {
-        // Try to edit existing message. If it fails (e.g. message deleted), fall back to send.
+      // Determine whether alerts are globally enabled for this guild. If the
+      // config does not exist, default to true (enabled). The value stored
+      // under config/bdAlertsEnabled/<guildId> is either boolean or null.
+      let alertsEnabled = true;
+      try {
+        const snap = await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).get();
+        if (snap.exists()) {
+          const val = snap.val();
+          alertsEnabled = (val !== false);
+        }
+      } catch {}
+      // Determine whether the advanced view is enabled for this guild. If no
+      // config exists, default to false. The value is stored under
+      // config/bdShowAdvanced/<guildId> and can be any truthy value.
+      let showAdvanced = false;
+      try {
+        const snap = await rtdb.ref(`config/bdShowAdvanced/${guildId}`).get();
+        if (snap.exists()) {
+          showAdvanced = !!snap.val();
+        }
+      } catch {}
+      // Build the embed and components for this guild
+      const embed = buildBdDashboardEmbed({ showAdvanced });
+      const comps = buildBdDashboardComponents({ alertsEnabled, showAdvanced });
+      // Compute JSON representations to detect changes. We use embed.toJSON()
+      // and ActionRowBuilder.toJSON() to capture all fields that affect the
+      // rendered message. This enables us to compare and skip edits when
+      // nothing has changed.
+      let embedJson = null;
+      let compsJson = null;
+      try {
+        embedJson = JSON.stringify(embed.toJSON());
+      } catch { embedJson = '' + embed; }
+      try {
+        compsJson = JSON.stringify(comps.map(r => r.toJSON?.() ?? r));
+      } catch { compsJson = '' + comps; }
+      // Look up existing dashboard message ID. Prefer the in-memory cache;
+      // if missing, try to hydrate from RTDB.
+      let msgId = bdSummaryMessages.get(guildId);
+      if (!msgId) {
         try {
-          const msg = await channel.messages.fetch(msgId);
-          await msg.edit({ content: '', embeds });
-          continue;
+          const snap = await rtdb.ref(`config/bdDashboardMessage/${guildId}`).get();
+          if (snap.exists()) {
+            const val = snap.val();
+            if (val && val.messageId) {
+              msgId = val.messageId;
+              bdSummaryMessages.set(guildId, msgId);
+            }
+          }
         } catch {}
       }
-      // No existing message or failed to edit; send a new one
-      const msg = await channel.send({ content: '', embeds });
-      bdSummaryMessages.set(guildId, msg.id);
+      // Check the render cache to see if the embed/components have changed.
+      const cacheEntry = bdDashboardRenderCache.get(guildId);
+      const nowTime = Date.now();
+      const heartbeatDue = !cacheEntry || (nowTime - cacheEntry.updatedAt >= 60 * 1000);
+      const hasChanged = !cacheEntry || cacheEntry.embedJson !== embedJson || cacheEntry.compsJson !== compsJson;
+      // If we already have a message ID and neither the embed nor components changed,
+      // and we are within the heartbeat interval, skip editing to avoid rate limits.
+      if (msgId && !hasChanged && !heartbeatDue) {
+        // Do not update cache.updatedAt here; keep it so heartbeat triggers after 60s.
+        continue;
+      }
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased?.()) {
+        // Even if channel is invalid, update the cache so we don't keep trying
+        // to update again within the heartbeat window.
+        bdDashboardRenderCache.set(guildId, { embedJson, compsJson, updatedAt: cacheEntry ? cacheEntry.updatedAt : nowTime });
+        continue;
+      }
+      if (msgId) {
+        try {
+          const msg = await channel.messages.fetch(msgId);
+          await msg.edit({ content: '', embeds: [embed], components: comps });
+          // Update the render cache since we just edited
+          bdDashboardRenderCache.set(guildId, { embedJson, compsJson, updatedAt: nowTime });
+          continue;
+        } catch {
+          // If the message fetch or edit fails (e.g., deleted), we'll send a new one below
+        }
+      }
+      // No existing message ID or it failed; send a new dashboard message
+      const newMsg = await channel.send({ content: '', embeds: [embed], components: comps });
+      bdSummaryMessages.set(guildId, newMsg.id);
+      // Persist the dashboard message so we can find it after a restart
+      try {
+        await rtdb.ref(`config/bdDashboardMessage/${guildId}`).set({ channelId: channelId, messageId: newMsg.id });
+      } catch {}
+      // Record the render cache for this new message
+      bdDashboardRenderCache.set(guildId, { embedJson, compsJson, updatedAt: nowTime });
     } catch (e) {
-      console.error(`[BD Status] Failed to update status message for guild ${guildId}:`, e.message);
+      console.error(`[BD Status] Failed to update dashboard for guild ${guildId}:`, e?.message || e);
     }
   }
 }
@@ -3128,9 +3370,194 @@ client.on('interactionCreate', async (interaction) => {
     }
     // --- END PATCH (Step 2/4) ---
   } 
-  // --- Button Handlers ---
+      // --- Modal Submit Handlers ---
+      else if (interaction.isModalSubmit()) {
+        const id = interaction.customId || '';
+        // Handle Battledome alert settings modal submission. The customId is of
+        // the form `bd:alert_settings_modal:<guildId>` and contains two
+        // required number fields: minPlayers and cooldownMinutes. We validate
+        // the input, clamp to reasonable ranges and persist to RTDB.
+        if (id.startsWith('bd:alert_settings_modal')) {
+          try {
+            // Extract guild ID from the customId (format: bd:alert_settings_modal:<guildId>)
+            const parts = id.split(':');
+            const guildId = parts[2];
+            if (!guildId) {
+              await safeReply(interaction, { content: 'Missing guild context.', ephemeral: true });
+              return;
+            }
+            // Retrieve values from the modal input fields
+            const minPlayersStr = interaction.fields.getTextInputValue('minPlayers');
+            const cooldownStr  = interaction.fields.getTextInputValue('cooldownMinutes');
+            let minPlayers = parseInt(minPlayersStr, 10);
+            let cooldownMinutes = parseInt(cooldownStr, 10);
+            // Validate and clamp values
+            if (isNaN(minPlayers)) minPlayers = 8;
+            if (isNaN(cooldownMinutes)) cooldownMinutes = 45;
+            // Clamp reasonable ranges: minPlayers between 1 and 100, cooldown between 1 and 1440 minutes
+            minPlayers = Math.max(1, Math.min(100, minPlayers));
+            cooldownMinutes = Math.max(1, Math.min(1440, cooldownMinutes));
+            // Persist the alert settings for this guild
+            try {
+              await rtdb.ref(`config/bdAlertSettings/${guildId}`).set({ minPlayers, cooldownMinutes });
+            } catch {}
+            // Acknowledge the modal submission with a confirmation message
+            await safeReply(interaction, { content: '✅ Alert settings saved.', ephemeral: true });
+            return;
+          } catch (err) {
+            console.error('[BD modal handler]', err);
+            await safeReply(interaction, { content: 'Failed to save alert settings.', ephemeral: true });
+            return;
+          }
+        }
+        // Let other modal handlers process if not Battledome related
+      }
+
+      // --- Button Handlers ---
   else if (interaction.isButton()) {
     const id = interaction.customId;
+
+    // -----------------------------------------------------------------------
+    // Battledome dashboard button handlers
+    // These buttons appear on the Battledome dashboard embed. We process
+    // them early before other button handlers so that they do not fall
+    // through to unrelated prefix checks. Each handler acknowledges the
+    // interaction and returns; subsequent logic is skipped.
+    if (id && id.startsWith('bd:')) {
+      try {
+        // Ensure this interaction originates from a guild context. Without a
+        // guildId we cannot read or write per‑guild settings.
+        const guildId = interaction.guildId;
+        if (!guildId) {
+          await safeReply(interaction, { content: 'This control only works in a server.', ephemeral: true });
+          return;
+        }
+        // Toggle global alerts ON/OFF
+        if (id === 'bd:toggle_alerts') {
+          // Read current value (default true) and invert
+          let current = true;
+          try {
+            const snap = await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).get();
+            if (snap.exists()) current = (snap.val() !== false);
+          } catch {}
+          const newVal = !current;
+          try {
+            await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).set(newVal);
+          } catch {}
+          // Acknowledge and refresh the dashboard
+          await safeReply(interaction, { content: newVal ? '✅ Alerts enabled.' : '🔕 Alerts disabled.', ephemeral: true });
+          updateBdStatusMessages().catch(() => {});
+          return;
+        }
+        // Toggle advanced view ON/OFF
+        else if (id === 'bd:toggle_advanced') {
+          let current = false;
+          try {
+            const snap = await rtdb.ref(`config/bdShowAdvanced/${guildId}`).get();
+            if (snap.exists()) current = !!snap.val();
+          } catch {}
+          const newVal = !current;
+          try {
+            await rtdb.ref(`config/bdShowAdvanced/${guildId}`).set(newVal);
+          } catch {}
+          await safeReply(interaction, { content: newVal ? '✅ Advanced view enabled.' : '🔧 Advanced view disabled.', ephemeral: true });
+          updateBdStatusMessages().catch(() => {});
+          return;
+        }
+        // Manual refresh of Battledome data
+        else if (id === 'bd:refresh') {
+          const now = Date.now();
+          const last = bdManualRefreshAt.get(guildId) || 0;
+          if (now - last < 5000) {
+            await safeReply(interaction, { content: '⏱️ Please wait a few seconds before refreshing again.', ephemeral: true });
+            return;
+          }
+          bdManualRefreshAt.set(guildId, now);
+          // Immediately respond with a defer to update. We do not edit the
+          // existing dashboard here; instead we perform the refresh and then
+          // update the dashboard via updateBdStatusMessages().
+          await safeDefer(interaction, { intent: 'update' });
+          // Perform sequential fetches for each region. Any errors are
+          // swallowed to avoid user-facing failures.
+          try { await checkRegion('West'); } catch {}
+          try { await checkRegion('East'); } catch {}
+          try { await checkRegion('EU'); } catch {}
+          // Update the dashboard after fetching
+          updateBdStatusMessages().catch(() => {});
+          await safeReply(interaction, { content: '🔄 Refreshed.', components: [], embeds: [] });
+          return;
+        }
+        // Open alert settings modal
+        else if (id === 'bd:open_alert_settings') {
+          // Build a modal with two short input fields
+          const modal = new ModalBuilder()
+            .setCustomId(`bd:alert_settings_modal:${guildId}`)
+            .setTitle('Alert Settings');
+          const minPlayersInput = new TextInputBuilder()
+            .setCustomId('minPlayers')
+            .setLabel('Minimum players to trigger alert')
+            .setPlaceholder('8')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+          const cooldownInput = new TextInputBuilder()
+            .setCustomId('cooldownMinutes')
+            .setLabel('Minutes between alerts')
+            .setPlaceholder('45')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(minPlayersInput),
+            new ActionRowBuilder().addComponents(cooldownInput)
+          );
+          await interaction.showModal(modal);
+          return;
+        }
+        // Open server filter selector
+        else if (id === 'bd:open_server_filter') {
+          const userId = interaction.user?.id;
+          // Fetch current subscription state for this user across regions
+          let regionSubs = {};
+          try {
+            const snap = await rtdb.ref(`bdNotify/${guildId}/${userId}/regions`).get();
+            if (snap.exists()) regionSubs = snap.val() || {};
+          } catch {}
+          // Determine which regions are currently selected (enabled). If no
+          // explicit enabled flag, default to true when a subscription exists.
+          const options = ['West', 'East', 'EU'].map(reg => {
+            const sub = regionSubs[reg];
+            const enabled = sub ? (sub.enabled !== false) : false;
+            return {
+              label: reg === 'West' ? 'West Coast' : (reg === 'East' ? 'East Coast' : 'EU'),
+              value: reg,
+              default: enabled
+            };
+          });
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId('bd:server_filter_select')
+            .setPlaceholder('Select Battledome servers…')
+            .setMinValues(1)
+            .setMaxValues(3)
+            .addOptions(options);
+          const embed = new EmbedBuilder()
+            .setTitle('Server Filter')
+            .setDescription('Choose which Battledomes you want to receive alerts for.\nYour current selection is pre‑selected below.')
+            .setColor(DEFAULT_EMBED_COLOR);
+          await safeReply(interaction, {
+            embeds: [embed],
+            components: [new ActionRowBuilder().addComponents(menu)],
+            // Use an ephemerally visible message so only the user sees it
+            // and it doesn’t clutter the channel.
+            ephemeral: true
+          });
+          return;
+        }
+      } catch (err) {
+        console.error('[BD button handler]', err);
+        await safeReply(interaction, { content: '❌ Failed to process Battledome control.', ephemeral: true });
+        return;
+      }
+    }
+
     // Handle multi‑page /help navigation buttons. Custom IDs are of the form
     // help:<prev|next>:<parentId>. Only the original invoker may use these controls.
     if (id && id.startsWith('help:')) {
@@ -4146,6 +4573,45 @@ client.on('interactionCreate', async (interaction) => {
   // --- Select Menu Handlers ---
   else if (interaction.isStringSelectMenu()) {
     const [prefix, parentInteractionId] = interaction.customId.split(':');
+
+    // ---------------------------------------------------------------------
+    // Battledome server filter multi‑select handler. We handle this early
+    // before other select menu logic. When a user submits the BD server
+    // filter selection, we update their per‑guild subscription settings in
+    // RTDB and acknowledge with an embed summarising their choices.
+    if (interaction.customId === 'bd:server_filter_select') {
+      try {
+        const guildId = interaction.guildId;
+        const userId = interaction.user?.id;
+        if (!guildId || !userId) {
+          return safeReply(interaction, { content: 'This control only works in a server.', ephemeral: true });
+        }
+        const selected = Array.isArray(interaction.values) ? interaction.values : [];
+        if (selected.length === 0) {
+          return safeReply(interaction, { content: 'You must select at least one region.', ephemeral: true });
+        }
+        // Build update payload: toggle enabled flags based on selection
+        const updates = {};
+        for (const reg of ['West','East','EU']) {
+          const enabled = selected.includes(reg);
+          updates[`bdNotify/${guildId}/${userId}/regions/${reg}/enabled`] = enabled;
+        }
+        try {
+          await rtdb.ref().update(updates);
+        } catch {}
+        const names = selected.map(r => (r === 'West' ? 'West Coast' : (r === 'East' ? 'East Coast' : 'EU')));
+        const summary = names.join(', ');
+        const embed = new EmbedBuilder()
+          .setTitle('Server Filter Updated')
+          .setDescription(`You will receive alerts for: **${summary}**`)
+          .setColor(DEFAULT_EMBED_COLOR);
+        await safeDefer(interaction, { intent: 'update' });
+        return safeReply(interaction, { embeds: [embed], components: [], content: '' });
+      } catch (err) {
+        console.error('[BD select handler]', err);
+        return safeReply(interaction, { content: 'Failed to update your server filter.', ephemeral: true });
+      }
+    }
   
     if (prefix === 'clans_select') {
       try {
@@ -4411,6 +4877,22 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
       const subSnap = await rtdb.ref(`bdNotify/${guildId}`).get();
       if (!subSnap.exists()) continue;
 
+      // Load alert settings for this guild (minPlayers & cooldown). Defaults
+      // replicate competitor: minPlayers=8, cooldownMinutes=45.
+      let minPlayers = 8;
+      let cooldownMinutes = 45;
+      try {
+        const settingsSnap = await rtdb.ref(`config/bdAlertSettings/${guildId}`).get();
+        if (settingsSnap.exists()) {
+          const val = settingsSnap.val() || {};
+          if (typeof val.minPlayers === 'number') minPlayers = val.minPlayers;
+          if (typeof val.cooldownMinutes === 'number') cooldownMinutes = val.cooldownMinutes;
+        }
+      } catch {}
+      // Compute how many players joined in this update (named + unnamed). If
+      // joinCount is below minPlayers, we do not send join alerts.
+      const joinCount = joins.length + Math.max(0, unnamedDiff);
+
       const stateUpdates = {};
       const triggered = [];
       subSnap.forEach(child => {
@@ -4433,8 +4915,8 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
             }
           }
         } else {
-          // join mode: trigger on any new named joins
-          if (joins.length > 0) {
+          // join mode: trigger only if there are new joins and count meets threshold
+          if (joinCount >= minPlayers) {
             triggered.push({ userId, mode: 'join' });
           }
         }
@@ -4443,9 +4925,18 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
         rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
       }
       // Send DM notifications to each triggered user (unique per guild). Use DM instead
-      // of channel pings so only the subscriber sees the alert. If the user has
-      // disabled DMs or cannot be fetched, we silently ignore the failure.
+      // of channel pings so only the subscriber sees the alert. Respect per-user
+      // cooldowns defined by the alert settings. If the user has disabled DMs
+      // or cannot be fetched, we silently ignore the failure.
       for (const { userId, mode, threshold } of triggered) {
+        // Enforce cooldown: skip if last alert for this guild/user/region/mode
+        // was sent within cooldownMinutes
+        const nowTs = Date.now();
+        const alertKey = `${guildId}:${userId}:${regionKey}:${mode}`;
+        const lastSent = bdAlertLastSent.get(alertKey) || 0;
+        if (nowTs - lastSent < cooldownMinutes * 60 * 1000) {
+          continue;
+        }
         try {
           const user = await client.users.fetch(userId).catch(() => null);
           if (!user) continue;
@@ -4453,7 +4944,7 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
           if (mode === 'active' && typeof threshold === 'number') {
             message = `The dome on **${serverName}** has reached your threshold of **${threshold}** players (now ${inDomeNow}).`;
           } else {
-            const joinCount = joins.length + Math.max(0, unnamedDiff);
+            // join mode: summarise the joins
             if (joinCount <= 0) continue;
             if (joins.length > 0) {
               // Show names if there are only a handful, else summarise count
@@ -4467,6 +4958,8 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
             }
           }
           await user.send({ content: message });
+          // Record the last sent time for this alert key
+          bdAlertLastSent.set(alertKey, nowTs);
         } catch (dmErr) {
           // DMs may fail if the user has them disabled; ignore
         }
@@ -4563,6 +5056,41 @@ client.once('ready', async () => {
     });
   } catch (e) {
     console.error('[BD] failed to load destinations', e);
+  }
+
+  // Load persisted Battledome dashboard messages (NEW). These IDs allow the
+  // dashboard to survive bot restarts. We store messageId per guild in
+  // rtdb under config/bdDashboardMessage/<guildId>. When loading, clear
+  // any existing in-memory entries and hydrate them from the database. Also
+  // subscribe to child add/change/remove events so the cache stays in sync.
+  try {
+    const snap = await rtdb.ref('config/bdDashboardMessage').get();
+    bdSummaryMessages.clear();
+    if (snap.exists()) {
+      const all = snap.val() || {};
+      for (const [gid, cfg] of Object.entries(all)) {
+        if (cfg && cfg.messageId) {
+          bdSummaryMessages.set(gid, cfg.messageId);
+        }
+      }
+    }
+    console.log(`[BD] loaded persisted dashboard messages: ${bdSummaryMessages.size}`);
+    // Listen for updates
+    const ref = rtdb.ref('config/bdDashboardMessage');
+    ref.on('child_added', s => {
+      const v = s.val() || {};
+      if (v.messageId) bdSummaryMessages.set(s.key, v.messageId);
+    });
+    ref.on('child_changed', s => {
+      const v = s.val() || {};
+      if (v.messageId) bdSummaryMessages.set(s.key, v.messageId);
+      else bdSummaryMessages.delete(s.key);
+    });
+    ref.on('child_removed', s => {
+      bdSummaryMessages.delete(s.key);
+    });
+  } catch (e) {
+    console.error('[BD] failed to load dashboard messages', e);
   }
 
   // Send initial Battledome status messages to all configured destinations. Do this
