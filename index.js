@@ -496,10 +496,16 @@ function buildBdStatusUnifiedEmbed(options = {}) {
         lines.push('_No players_');
       }
       // Include advanced details if requested (e.g. server URL)
-      if (showAdvanced) {
-  const serverIp = BD_SERVERS[region]?.url || 'Unknown';
+     if (showAdvanced) {
+  const serverIp =
+    info?.server ||
+    info?.ip ||
+    info?.address ||
+    'Unknown';
+
   lines.push(`🖥️ Server: ${serverIp}`);
 }
+
 
       if (fetchedAt) {
         const age = Math.floor((Date.now() - fetchedAt) / 1000);
