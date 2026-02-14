@@ -497,9 +497,10 @@ function buildBdStatusUnifiedEmbed(options = {}) {
       }
       // Include advanced details if requested (e.g. server URL)
       if (showAdvanced) {
-        const url = BD_SERVERS[region]?.url;
-        if (url) lines.push(`URL: ${url}`);
-      }
+  const serverIp = BD_SERVERS[region]?.url || 'Unknown';
+  lines.push(`🖥️ Server: ${serverIp}`);
+}
+
       if (fetchedAt) {
         const age = Math.floor((Date.now() - fetchedAt) / 1000);
         if (age > maxAgeSec) maxAgeSec = age;
