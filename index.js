@@ -85,6 +85,22 @@ const POST_EMOJIS = ['🔥','❤️','😂','👍','👎']; // same list you sho
 
 const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
+// Battledome UI design system. Provides status, icons and colours for
+// consistent embeds across all Battledome commands and features.
+// These emojis and colours are used throughout the status, recent activity
+// and leaderboard embeds so the bot always has a cohesive look and feel.
+const BD_UI = {
+  STATUS: { online: '🟢', idle: '🟡', offline: '🔴' },
+  ICONS: {
+    players: '👥',
+    active: '🔥',
+    time: '🕒',
+    // Region flag icons; fallback to empty string if missing.
+    region: { West: '🌎', East: '🇺🇸', EU: '🇪🇺' }
+  },
+  COLORS: { online: 0x2ECC71, idle: 0xF1C40F, offline: 0xE74C3C }
+};
+
 // Simple in-memory cache for frequently accessed, non-critical data
 const globalCache = {
   userNames: new Map(), // uid -> displayName
@@ -94,11 +110,14 @@ const globalCache = {
   battleDestinations: new Map(),
   // Destination channels for Battledome updates (guildId -> channelId)
   bdDestinations: new Map(),
+  // Destination channels for Battledome join logs (guildId -> channelId). When set,
+  // join alerts ping subscribers in this channel instead of sending DMs.
+  bdJoinLogs: new Map(),
 };
 
 // only these will be private
 const isEphemeralCommand = (name) =>
-  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive', 'notifybd', 'setbattledomechannel']).has(name);
+  new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive', 'notifybd', 'setbattledomechannel', 'setjoinlogschannel']).has(name);
 
 // Parse #RRGGBB -> int for embed.setColor
 function hexToInt(hex) {
@@ -445,56 +464,60 @@ function buildBdRecentEmbeds() {
 // counts, players this hour and a short leaderboard (top 10 players).
 function buildBdStatusUnifiedEmbed(options = {}) {
   const showAdvanced = options.showAdvanced || false;
-  const embed = new EmbedBuilder()
-    .setTitle('Battledome Status')
-    .setColor(DEFAULT_EMBED_COLOR);
+  const embed = new EmbedBuilder();
+  embed.setTitle('🏟️ Battledome Status');
   let maxAgeSec = 0;
-  for (const region of ['West','East','EU']) {
+  // Track worst server status across all regions. offline > idle > online
+  let worstStatus = 'online';
+  for (const region of ['West', 'East', 'EU']) {
     const info = bdLastInfo[region];
     const fetchedAt = bdLastFetch[region];
     const serverName = BD_SERVERS[region]?.name || region;
     const lines = [];
     if (info) {
-      // Basic counts
-      lines.push(`Online: ${info.onlinenow ?? '—'}`);
-      lines.push(`In Dome: ${info.indomenow ?? '—'}`);
-      lines.push(`Players This Hour: ${info.thishour ?? '—'}`);
-      // Leaderboard
+      // Determine status based on player counts
+      const onNow = info.onlinenow ?? 0;
+      const inDome = info.indomenow ?? 0;
+      let status = 'offline';
+      if (onNow > 0) status = (inDome > 0 ? 'online' : 'idle');
+      // Track worst status for embed colour
+      if (status === 'offline') worstStatus = 'offline';
+      else if (status === 'idle' && worstStatus !== 'offline') worstStatus = 'idle';
+      // Compose lines with icons
+      const pct = onNow > 0 ? Math.floor((inDome / onNow) * 100) : 0;
+      lines.push(`${BD_UI.STATUS[status]} ${status.charAt(0).toUpperCase() + status.slice(1)}`);
+      lines.push(`${BD_UI.ICONS.players} Players: ${onNow}`);
+      lines.push(`${BD_UI.ICONS.active} Active: ${inDome} (${pct}%)`);
       const players = Array.isArray(info.players) ? info.players : [];
-      const leaderboardLines = players.slice(0, 10).map((p, idx) => {
-        const rank = p.rank != null ? `#${p.rank}` : `#${idx + 1}`;
-        const name = p.name || '(unknown)';
-        const score = p.score != null ? ` (${p.score})` : '';
-        const inDome = p.indomenow === 'Yes' ? ' 🏟️' : '';
-        const idle = p.inactive && p.inactive > 60 ? ' *(idle)*' : '';
-        return `${rank} **${name}**${score}${inDome}${idle}`;
-      });
-      if (leaderboardLines.length) {
-        lines.push(leaderboardLines.join('\n'));
+      if (players.length) {
+        const top = players.slice(0, 3).map(p => `**${p.name || '(unknown)'}**`).join('\n');
+        lines.push(top);
       } else {
-        lines.push('_No players listed._');
+        lines.push('_No players_');
       }
       // Include advanced details if requested (e.g. server URL)
       if (showAdvanced) {
         const url = BD_SERVERS[region]?.url;
-        if (url) {
-          lines.push(`URL: ${url}`);
-        }
+        if (url) lines.push(`URL: ${url}`);
       }
       if (fetchedAt) {
         const age = Math.floor((Date.now() - fetchedAt) / 1000);
         if (age > maxAgeSec) maxAgeSec = age;
       }
     } else {
+      // If cache is warming, show offline status and note
+      lines.push(`${BD_UI.STATUS.offline} Offline`);
+      lines.push(`${BD_UI.ICONS.players} Players: 0`);
+      lines.push(`${BD_UI.ICONS.active} Active: 0 (0%)`);
       lines.push('_Cache warming up. Please wait…_');
     }
-    embed.addFields({ name: serverName, value: lines.join('\n'), inline: false });
+    const regionIcon = BD_UI.ICONS.region[region] || '';
+    embed.addFields({ name: `${regionIcon} ${serverName}`, value: lines.join('\n'), inline: false });
   }
-  if (maxAgeSec > 0) {
-    embed.setFooter({ text: `Updated ${maxAgeSec < 2 ? 'just now' : `${maxAgeSec}s ago`}` });
-  } else {
-    embed.setFooter({ text: 'Cache warming up' });
-  }
+  // Set description and colour based on worst status and last update
+  const updatedStr = maxAgeSec > 0 ? (maxAgeSec < 2 ? 'just now' : `${maxAgeSec}s ago`) : 'warming up';
+  embed.setDescription(`Monitoring ${Object.keys(BD_SERVERS).length} server(s) • Updated ${updatedStr}`);
+  embed.setColor(BD_UI.COLORS[worstStatus]);
   return embed;
 }
 
@@ -506,7 +529,7 @@ function buildBdStatusUnifiedEmbed(options = {}) {
 function buildBdRecentUnifiedEmbed() {
   pruneBdRecent();
   const embed = new EmbedBuilder()
-    .setTitle('Recent Battledome Activity')
+    .setTitle('🧾 Recent Battledome Activity')
     .setColor(DEFAULT_EMBED_COLOR);
   for (const region of ['West','East','EU']) {
     const info = bdLastInfo[region];
@@ -515,9 +538,9 @@ function buildBdRecentUnifiedEmbed() {
     const left   = events.filter(e => e.type === 'leave');
     const lines = [];
     if (info) {
-      lines.push(`Online: ${info.onlinenow ?? '—'}`);
-      lines.push(`In Dome: ${info.indomenow ?? '—'}`);
-      lines.push(`Players This Hour: ${info.thishour ?? '—'}`);
+      lines.push(`${BD_UI.ICONS.players} Online: ${info.onlinenow ?? '—'}`);
+      lines.push(`${BD_UI.ICONS.active} In Dome: ${info.indomenow ?? '—'}`);
+      lines.push(`${BD_UI.ICONS.time} Players This Hour: ${info.thishour ?? '—'}`);
     }
     if (joined.length) {
       const joinLines = joined.map(e => `• **${e.name}** — <t:${Math.floor(e.time/1000)}:R>`);
@@ -536,7 +559,8 @@ function buildBdRecentUnifiedEmbed() {
       lines.push('_No recent leaves._');
     }
     const serverName = BD_SERVERS[region]?.name || region;
-    embed.addFields({ name: serverName, value: lines.join('\n'), inline: false });
+    const regionIcon = BD_UI.ICONS.region[region] || '';
+    embed.addFields({ name: `${regionIcon} ${serverName}`, value: lines.join('\n'), inline: false });
   }
   return embed;
 }
@@ -556,7 +580,6 @@ function buildBdScoreCompareEmbed() {
     arr.sort((a, b) => (b.score || 0) - (a.score || 0));
     return arr.slice(0, 10);
   }
-  const globalTop = topEntries(bdTop.global);
   const westTop   = topEntries(bdTop.West);
   const eastTop   = topEntries(bdTop.East);
   const euTop     = topEntries(bdTop.EU);
@@ -568,13 +591,12 @@ function buildBdScoreCompareEmbed() {
     return `\`${rank}.\` **${name}** \`— ${score}\``;
   }).join('\n') || '_No scores recorded._';
   const embed = new EmbedBuilder()
-    .setTitle('Top Battledome Scores Comparison')
+    .setTitle('🏆 Top Battledome Scores Comparison')
     .setColor(DEFAULT_EMBED_COLOR);
   embed.addFields(
-    { name: 'Global', value: fmt(globalTop), inline: false },
-    { name: 'West',   value: fmt(westTop),   inline: false },
-    { name: 'East',   value: fmt(eastTop),   inline: false },
-    { name: 'EU',     value: fmt(euTop),     inline: false }
+    { name: `${BD_UI.ICONS.region.West || ''} West`, value: fmt(westTop),   inline: false },
+    { name: `${BD_UI.ICONS.region.East || ''} East`, value: fmt(eastTop),   inline: false },
+    { name: `${BD_UI.ICONS.region.EU || ''} EU`,     value: fmt(euTop),     inline: false }
   );
   const lastUpdate = bdTopMeta.lastUpdatedAt || Date.now();
   embed.setFooter({ text: `Updated <t:${Math.floor(lastUpdate/1000)}:R>` });
@@ -975,6 +997,62 @@ const HARDCODED_TOP_SCORES = [
   { name: "[worm] sk", score: 53 },
   { name: "evan", score: 53 },
 ];
+
+// Hardcoded “starting point” highs (seeded once; future highs overwrite). For
+// each region (West, East, EU) we provide a list of player names and scores.
+const HARDCODED_TOP_SCORES_BY_REGION = {
+  West: [
+    { name: "dont leave", score: 130 },
+    { name: "tAsTy snack", score: 112 },
+    { name: "[3D] F A R I S E O", score: 100 },
+    { name: "~Kaida~", score: 92 },
+    { name: "iyh", score: 89 },
+    { name: ":p", score: 74 },
+    { name: "welp", score: 73 },
+    { name: "mw", score: 64 },
+    { name: "azure ' th", score: 63 },
+    { name: "th' YT: @sn.Mystical", score: 62 },
+    { name: "[WOVD] m i d n i g h t", score: 57 },
+    { name: "[RR] YT@qrypticlus", score: 53 },
+    { name: "[worm] sk", score: 53 },
+    { name: "evan", score: 53 },
+    { name: "Superdonkey 100k Esy", score: 49 },
+  ],
+  EU: [
+    { name: "z", score: 103 },
+    { name: "mino", score: 93 },
+    { name: "Lx* <3 INS", score: 90 },
+    { name: "Mia", score: 89 },
+    { name: "Sigi fan", score: 88 },
+    { name: "fghj", score: 87 },
+    { name: "...", score: 85 },
+    { name: "ssko", score: 84 },
+    { name: "SCAV 0===}:-:-:-:-:-:-:>", score: 84 },
+    { name: "[RR]s #1 supporter", score: 82 },
+    { name: "corruption", score: 80 },
+    { name: "punchmade plotting", score: 79 },
+    { name: "yellow", score: 79 },
+    { name: "welppp", score: 78 },
+    { name: "wimzyyy wimwim", score: 77 },
+  ],
+  East: [
+    { name: "The best ever", score: 43 },
+    { name: "[KILLER]discord:sjuxes", score: 40 },
+    { name: "[BEST]Evan11", score: 37 },
+    { name: "YT Amp it up!", score: 35 },
+    { name: "[LB] w1de", score: 31 },
+    { name: "[KILLER] disc:Daniel_258", score: 27 },
+    { name: "alwaysfear", score: 25 },
+    { name: "[LK] - Justin - [KILLER]", score: 25 },
+    { name: "les go circle game", score: 22 },
+    { name: "lag", score: 22 },
+    { name: "fast pace phillip", score: 20 },
+    { name: "{KILLER} DYNAMITE", score: 20 },
+    { name: "fh", score: 18 },
+    { name: "chair leg charlie", score: 17 },
+    { name: "Xented", score: 15 },
+  ],
+};
 
 function seedHardcodedTopScoresOnce() {
   // Only seed once per process. Subsequent loads skip.
@@ -2368,6 +2446,20 @@ const setBattledomeChannelCmd = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+// Command: Set Join Logs Channel (NEW)
+// Allows server admins to choose a channel where Battledome join/leave notifications
+// will be posted. When set, join alerts ping users in the specified channel
+// instead of sending DMs.
+const setJoinLogsChannelCmd = new SlashCommandBuilder()
+  .setName('setjoinlogschannel')
+  .setDescription('Choose a channel for Battledome join logs (pings instead of DMs)')
+  .addChannelOption(opt =>
+    opt.setName('channel')
+      .setDescription('Text or Announcement channel')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(true)
+  );
+
 // Command: Notify BD (NEW)
 const notifyBdCmd = new SlashCommandBuilder()
   .setName('notifybd')
@@ -2453,7 +2545,7 @@ const recentlyJoinedCmd = new SlashCommandBuilder()
 // because it presents a comparative view rather than a single region.
 const compareBdScoresCmd = new SlashCommandBuilder()
   .setName('comparebdscores')
-  .setDescription('Compare top Battledome scores across regions and globally');
+  .setDescription('Compare top Battledome scores across regions');
 
 
 // Register (include it in commands array)
@@ -2462,7 +2554,7 @@ const commandsJson = [
   avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
   latestFiveCmd,
   clansCmd, clanBattlesCmd, sendClanChallengeCmd, incomingChallengesCmd, getClanRolesCmd, setEventsChannelCmd,
-  battledomeCmd, setBattledomeChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd,
+  battledomeCmd, setBattledomeChannelCmd, setJoinLogsChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd,
   battledomeStatusCmd, recentlyJoinedCmd, compareBdScoresCmd
 ].map(c => c.toJSON());
 
@@ -3075,6 +3167,28 @@ client.on('interactionCreate', async (interaction) => {
           // Trigger an immediate status update to send or edit the status message in the new channel
           updateBdStatusMessages().catch(() => {});
           return safeReply(interaction, { content: `✅ Battledome updates will post to <#${chan.id}>.`, ephemeral: true });
+        }
+        // Handle /setjoinlogschannel
+        else if (commandName === 'setjoinlogschannel') {
+          if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.',  ephemeral: true });
+          const picked = interaction.options.getChannel('channel', true);
+          if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.',  ephemeral: true });
+          if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.',  ephemeral: true });
+          const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
+          if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.',  ephemeral: true });
+          const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+          if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.',  ephemeral: true });
+          const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
+          if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+             return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.',  ephemeral: true });
+          }
+          await rtdb.ref(`config/bdJoinLogsChannel/${interaction.guildId}`).set({
+            channelId: chan.id,
+            updatedBy: interaction.user.id,
+            updatedAt: admin.database.ServerValue.TIMESTAMP
+          });
+          globalCache.bdJoinLogs.set(interaction.guildId, chan.id);
+          return safeReply(interaction, { content: `✅ Battledome join logs will post to <#${chan.id}>.`,  ephemeral: true });
         }
         // Handle /notifybd
         else if (commandName === 'notifybd') {
@@ -4891,34 +5005,45 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
       if (Object.keys(stateUpdates).length > 0) {
         rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
       }
-      // Send DM notifications to each triggered user (unique per guild). Use DM instead
-      // of channel pings so only the subscriber sees the alert. If the user has
-      // disabled DMs or cannot be fetched, we silently ignore the failure.
+      // Notify each triggered user. If a join logs channel is configured for this guild,
+      // ping the user in that channel; otherwise fall back to a DM. We build the
+      // message for each user outside of the DM/send logic so it can be reused.
       for (const { userId, mode, threshold } of triggered) {
+        // Build the notification message for this user
+        let message;
+        if (mode === 'active' && typeof threshold === 'number') {
+          message = `The dome on **${serverName}** has reached your threshold of **${threshold}** players (now ${inDomeNow}).`;
+        } else {
+          const joinCount = joins.length + Math.max(0, unnamedDiff);
+          if (joinCount <= 0) continue;
+          if (joins.length > 0) {
+            // Show names if there are only a handful, else summarise count
+            if (joins.length <= 3 && unnamedDiff <= 0) {
+              message = `Players joined **${serverName}**: ${joins.map(n => `**${n}**`).join(', ')}.`;
+            } else {
+              message = `**${joinCount}** players have joined **${serverName}**.`;
+            }
+          } else {
+            message = `**${joinCount}** unnamed players have joined **${serverName}**.`;
+          }
+        }
+        // If a join logs channel is configured for this guild, ping the user there
+        const joinLogsId = globalCache.bdJoinLogs?.get(guildId);
+        if (joinLogsId) {
+          try {
+            const chan = await client.channels.fetch(joinLogsId).catch(() => null);
+            if (chan && chan.isTextBased?.()) {
+              await chan.send({ content: `<@${userId}> ${message}` });
+              continue; // skip DM when posted in join logs
+            }
+          } catch {}
+        }
+        // Fallback to DM
         try {
           const user = await client.users.fetch(userId).catch(() => null);
           if (!user) continue;
-          let message;
-          if (mode === 'active' && typeof threshold === 'number') {
-            message = `The dome on **${serverName}** has reached your threshold of **${threshold}** players (now ${inDomeNow}).`;
-          } else {
-            const joinCount = joins.length + Math.max(0, unnamedDiff);
-            if (joinCount <= 0) continue;
-            if (joins.length > 0) {
-              // Show names if there are only a handful, else summarise count
-              if (joins.length <= 3 && unnamedDiff <= 0) {
-                message = `Players joined **${serverName}**: ${joins.map(n => `**${n}**`).join(', ')}.`;
-              } else {
-                message = `**${joinCount}** players have joined **${serverName}**.`;
-              }
-            } else {
-              message = `**${joinCount}** unnamed players have joined **${serverName}**.`;
-            }
-          }
           await user.send({ content: message });
-        } catch (dmErr) {
-          // DMs may fail if the user has them disabled; ignore
-        }
+        } catch {}
       }
     } catch (err) {
       console.error('[BD Broadcast] Error while processing guild', guildId, err);
@@ -5012,6 +5137,34 @@ client.once('ready', async () => {
     });
   } catch (e) {
     console.error('[BD] failed to load destinations', e);
+  }
+
+  // Load Battledome join log channels (NEW)
+  try {
+    const snap = await rtdb.ref('config/bdJoinLogsChannel').get();
+    globalCache.bdJoinLogs.clear();
+    if (snap.exists()) {
+      const all = snap.val() || {};
+      for (const [guildId, cfg] of Object.entries(all)) {
+        if (cfg?.channelId) globalCache.bdJoinLogs.set(guildId, cfg.channelId);
+      }
+    }
+    console.log(`[BD] loaded initial join log channels: ${globalCache.bdJoinLogs.size}`);
+
+    rtdb.ref('config/bdJoinLogsChannel').on('child_added', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.bdJoinLogs.set(s.key, v.channelId);
+    });
+    rtdb.ref('config/bdJoinLogsChannel').on('child_changed', s => {
+      const v = s.val() || {};
+      if (v.channelId) globalCache.bdJoinLogs.set(s.key, v.channelId);
+      else globalCache.bdJoinLogs.delete(s.key);
+    });
+    rtdb.ref('config/bdJoinLogsChannel').on('child_removed', s => {
+      globalCache.bdJoinLogs.delete(s.key);
+    });
+  } catch (e) {
+    console.error('[BD] failed to load join log channels', e);
   }
 
   // Send initial Battledome status messages to all configured destinations. Do this
