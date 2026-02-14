@@ -23,10 +23,10 @@ app.listen(PORT, () => console.log(`Healthcheck on :${PORT}`));
 
 // --- PATCH (Step 5): Add global error hooks ---
 process.on("unhandledRejection", (err) => {
-  console.error("[unhandledRejection]", err);
+  console.error("[unhandledRejection]", err);
 });
 process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
+  console.error("[uncaughtException]", err);
 });
 // --- END PATCH ---
 
@@ -197,54 +197,54 @@ async function withTimeout(promise, ms, label='op'){
 
 // --- Interaction Ack Helpers ---
 async function safeDefer(interaction, opts = {}) {
-  try {
-    if (interaction.deferred || interaction.replied) return;
-    if (interaction.isChatInputCommand()) {
-      return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
-    }
-    if (interaction.isMessageComponent()) {
-      if (opts.intent === "update") {
-        return await interaction.deferUpdate();
-      }
-      return;
-    }
+  try {
+    if (interaction.deferred || interaction.replied) return;
+    if (interaction.isChatInputCommand()) {
+      return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
+    }
+    if (interaction.isMessageComponent()) {
+      if (opts.intent === "update") {
+        return await interaction.deferUpdate();
+      }
+      return;
+    }
     if (interaction.isModalSubmit()) {
       return await interaction.deferReply({ ephemeral: !!opts.ephemeral });
     }
-  } catch (err) {
-    console.error("safeDefer error:", err);
-  }
+  } catch (err) {
+    console.error("safeDefer error:", err);
+  }
 }
 
 async function safeReply(interaction, options) {
-  try {
-    if (interaction.isMessageComponent()) {
-      if (interaction.deferred && !interaction.replied) {
-        return await interaction.update(options);
-      }
-      if (interaction.replied) {
-        return await interaction.followUp(options);
-      }
-      return await interaction.reply(options);
-    }
-    if (interaction.deferred) {
-      if (interaction.replied) {
-        return await interaction.followUp(options);
-      }
-      return await interaction.editReply(options);
-    }
-    if (interaction.replied) {
-      return await interaction.followUp(options);
-    }
-    return await interaction.reply(options);
-  } catch (err) {
-    console.error("safeReply error", {
-      deferred: interaction.deferred,
-      replied: interaction.replied,
-      isChatInput: interaction.isChatInputCommand(),
-      isComponent: interaction.isMessageComponent(),
+  try {
+    if (interaction.isMessageComponent()) {
+      if (interaction.deferred && !interaction.replied) {
+        return await interaction.update(options);
+      }
+      if (interaction.replied) {
+        return await interaction.followUp(options);
+      }
+      return await interaction.reply(options);
+    }
+    if (interaction.deferred) {
+      if (interaction.replied) {
+        return await interaction.followUp(options);
+      }
+      return await interaction.editReply(options);
+    }
+    if (interaction.replied) {
+      return await interaction.followUp(options);
+    }
+    return await interaction.reply(options);
+  } catch (err) {
+    console.error("safeReply error", {
+      deferred: interaction.deferred,
+      replied: interaction.replied,
+      isChatInput: interaction.isChatInputCommand(),
+      isComponent: interaction.isMessageComponent(),
       isModal: interaction.isModalSubmit(),
-    }, err);
+    }, err);
     if (err.code !== 10062) { 
         try {
             if (!interaction.replied) {
@@ -254,7 +254,7 @@ async function safeReply(interaction, options) {
             console.error("safeReply followup failed", e);
         }
     }
-  }
+  }
 }
 
 // --- Battledome Helpers (NEW) ---
@@ -305,6 +305,168 @@ const bdState = {
   East: { lastNames: new Set(), lastOnline: 0, lastIndome: 0, lastCheck: 0 },
   EU:   { lastNames: new Set(), lastOnline: 0, lastIndome: 0, lastCheck: 0 },
 };
+
+// --- Battledome Live Status & Recent Activity Storage (NEW) ---
+// Persist the most recently fetched info for each region so we can build a
+// consolidated status embed across all battledomes. Each entry holds the
+// parsed info returned from the BD API (see parseBdInfo) and the time at
+// which it was fetched. These values are updated on each poll.
+const bdLastInfo  = { West: null, East: null, EU: null };
+const bdLastFetch = { West: 0,    East: 0,    EU: 0    };
+
+// Map of guildId -> messageId for the live status messages posted by
+// updateBdStatusMessages(). When broadcasting updates we edit the existing
+// message rather than posting a new one. This keeps the channel tidy and
+// ensures a single live snapshot.
+const bdSummaryMessages = new Map();
+
+// Track recent join and leave events per region. Each entry is an object
+// { name, time, type } where type is 'join' or 'leave'. A separate list is
+// maintained for each region. Events older than BD_RECENT_WINDOW_MS are
+// automatically pruned.
+const bdRecent = { West: [], East: [], EU: [] };
+
+// How long to keep join/leave events in memory (e.g. 15 minutes). This
+// determines the window for the /recentlyjoined command. Adjust as needed.
+const BD_RECENT_WINDOW_MS = 15 * 60 * 1000;
+
+// Helper to remove stale entries from bdRecent. Called in checkRegion.
+function pruneBdRecent() {
+  const cutoff = Date.now() - BD_RECENT_WINDOW_MS;
+  for (const region of Object.keys(bdRecent)) {
+    const list = bdRecent[region];
+    let idx = 0;
+    while (idx < list.length && list[idx].time < cutoff) {
+      idx++;
+    }
+    if (idx > 0) {
+      bdRecent[region] = list.slice(idx);
+    }
+  }
+}
+
+// Build an array of embeds summarising the current status of all battledome
+// servers. Each embed covers one region and includes online counts, dome
+// counts, players this hour and a short leaderboard (top 10 players). If
+// no info has been fetched yet for a region, a warming message is shown.
+function buildBdStatusEmbeds() {
+  const embeds = [];
+  for (const region of ['West','East','EU']) {
+    const info = bdLastInfo[region];
+    const fetchedAt = bdLastFetch[region];
+    if (!info) {
+      const title = BD_SERVERS[region]?.name || `${region} Battledome`;
+      embeds.push(new EmbedBuilder()
+        .setTitle(title)
+        .setDescription('_Cache warming up. Please wait…_')
+        .setColor(DEFAULT_EMBED_COLOR)
+        .setFooter({ text: 'Cache warming up' }));
+      continue;
+    }
+    const players = Array.isArray(info.players) ? info.players : [];
+    // Build a simple leaderboard of the top 10 players by score. Show their
+    // rank, name and score. Indicate if they are currently in the dome with an
+    // emoji. Idle players (inactive > 60s) are annotated.
+    const lines = players.slice(0, 10).map((p, idx) => {
+      const inDome = p.indomenow === 'Yes' ? ' 🏟️' : '';
+      const rank = p.rank != null ? `#${p.rank}` : `#${idx + 1}`;
+      const score = p.score != null ? ` (${p.score})` : '';
+      const name = p.name || '(unknown)';
+      const idle = p.inactive && p.inactive > 60 ? ' *(idle)*' : '';
+      return `${rank} **${name}**${score}${inDome}${idle}`;
+    });
+    const ageSec = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 1000) : 0;
+    const cacheNote = 'Updated ' + (ageSec < 2 ? 'just now' : `${ageSec}s ago`);
+    const embed = new EmbedBuilder()
+      .setTitle(`Battledome — ${BD_SERVERS[region]?.name || region}`)
+      .addFields(
+        { name: 'Online now', value: String(info.onlinenow ?? '—'), inline: true },
+        { name: 'In dome now', value: String(info.indomenow ?? '—'), inline: true },
+        { name: 'Players this hour', value: String(info.thishour ?? '—'), inline: true },
+        { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' }
+      )
+      .setColor(DEFAULT_EMBED_COLOR)
+      .setFooter({ text: cacheNote });
+    embeds.push(embed);
+  }
+  return embeds;
+}
+
+// Build embeds summarising recent join/leave events. Each embed covers one
+// region and lists players who have joined or left within the recent
+// window defined by BD_RECENT_WINDOW_MS. If no events are recorded, a
+// friendly message is displayed instead. A small status header is also
+// included (online/in‑dome counts) to provide context.
+function buildBdRecentEmbeds() {
+  const embeds = [];
+  pruneBdRecent();
+  for (const region of ['West','East','EU']) {
+    const info = bdLastInfo[region];
+    const events = bdRecent[region] || [];
+    const joined = events.filter(e => e.type === 'join');
+    const left   = events.filter(e => e.type === 'leave');
+    const linesJoin = joined.map(e => {
+      const ago = Math.floor((Date.now() - e.time) / 1000);
+      const secs = ago;
+      return `• **${e.name}** \- <t:${Math.floor(e.time/1000)}:R>`;
+    });
+    const linesLeave = left.map(e => {
+      return `• **${e.name}** \- <t:${Math.floor(e.time/1000)}:R>`;
+    });
+    const embed = new EmbedBuilder()
+      .setTitle(`Recent Activity — ${BD_SERVERS[region]?.name || region}`)
+      .setColor(DEFAULT_EMBED_COLOR);
+    if (info) {
+      embed.addFields(
+        { name: 'Online now', value: String(info.onlinenow ?? '—'), inline: true },
+        { name: 'In dome now', value: String(info.indomenow ?? '—'), inline: true },
+        { name: 'Players this hour', value: String(info.thishour ?? '—'), inline: true }
+      );
+    }
+    if (linesJoin.length) {
+      embed.addFields({ name: `Joined (${linesJoin.length})`, value: linesJoin.join('\n') });
+    } else {
+      embed.addFields({ name: 'Joined', value: '_No recent joins._' });
+    }
+    if (linesLeave.length) {
+      embed.addFields({ name: `Left (${linesLeave.length})`, value: linesLeave.join('\n') });
+    } else {
+      embed.addFields({ name: 'Left', value: '_No recent leaves._' });
+    }
+    embeds.push(embed);
+  }
+  return embeds;
+}
+
+// Send or update the live Battledome status message in each configured
+// guild/channel. For each guild configured via setbattledomechannel,
+// check if we already sent a status message. If so, edit it with the
+// latest embeds; otherwise send a new message and remember its ID. This
+// function should be called after each poll to keep the status fresh and
+// when a destination channel is added.
+async function updateBdStatusMessages() {
+  const embeds = buildBdStatusEmbeds();
+  for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
+    try {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased?.()) continue;
+      const msgId = bdSummaryMessages.get(guildId);
+      if (msgId) {
+        // Try to edit existing message. If it fails (e.g. message deleted), fall back to send.
+        try {
+          const msg = await channel.messages.fetch(msgId);
+          await msg.edit({ content: '', embeds });
+          continue;
+        } catch {}
+      }
+      // No existing message or failed to edit; send a new one
+      const msg = await channel.send({ content: '', embeds });
+      bdSummaryMessages.set(guildId, msg.id);
+    } catch (e) {
+      console.error(`[BD Status] Failed to update status message for guild ${guildId}:`, e.message);
+    }
+  }
+}
 
 // --- Cache Globals ---
 const bdFetchCache = new Map();
@@ -2098,6 +2260,30 @@ const battledomeTopCmd = new SlashCommandBuilder()
     .setRequired(false)
   );
 
+// Command: Battledome Status (NEW)
+// Provides a snapshot of all Battledome regions showing who is online,
+// players in the dome, players this hour and a top‑10 leaderboard for
+// each region. This command can be used at any time to fetch the
+// latest snapshot on demand.
+const battledomeStatusCmd = new SlashCommandBuilder()
+  .setName('battledomestatus')
+  .setDescription('Show live status for all Battledome regions and top 10 players');
+
+// Command: Recently Joined (NEW)
+// Displays recent join and leave activity across all Battledomes. The
+// window of activity is configurable via BD_RECENT_WINDOW_MS (defaults to 15 minutes).
+const recentlyJoinedCmd = new SlashCommandBuilder()
+  .setName('recentlyjoined')
+  .setDescription('Show recent join/leave activity across Battledome regions');
+
+// Command: Compare BD Scores (NEW)
+// Compare the top Battledome scores across regions and globally. Shows the top
+// players for each region side by side. This differs from /battledometop
+// because it presents a comparative view rather than a single region.
+const compareBdScoresCmd = new SlashCommandBuilder()
+  .setName('comparebdscores')
+  .setDescription('Compare top Battledome scores across regions and globally');
+
 
 // Register (include it in commands array)
 const commandsJson = [
@@ -2105,7 +2291,8 @@ const commandsJson = [
   avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
   latestFiveCmd,
   clansCmd, clanBattlesCmd, sendClanChallengeCmd, incomingChallengesCmd, getClanRolesCmd, setEventsChannelCmd,
-  battledomeCmd, setBattledomeChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd
+  battledomeCmd, setBattledomeChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd,
+  battledomeStatusCmd, recentlyJoinedCmd, compareBdScoresCmd
 ].map(c => c.toJSON());
 
 
@@ -2714,6 +2901,8 @@ client.on('interactionCreate', async (interaction) => {
             updatedAt: admin.database.ServerValue.TIMESTAMP
           });
           globalCache.bdDestinations.set(interaction.guildId, chan.id);
+          // Trigger an immediate status update to send or edit the status message in the new channel
+          updateBdStatusMessages().catch(() => {});
           return safeReply(interaction, { content: `✅ Battledome updates will post to <#${chan.id}>.`, ephemeral: true });
         }
         // Handle /notifybd
@@ -2866,6 +3055,68 @@ client.on('interactionCreate', async (interaction) => {
                 .setColor(DEFAULT_EMBED_COLOR);
 
             return safeReply(interaction, { embeds: [embed] });
+        }
+        // Handle /battledomestatus (NEW)
+        else if (commandName === 'battledomestatus') {
+            await safeDefer(interaction);
+            const embeds = buildBdStatusEmbeds();
+            return safeReply(interaction, { embeds });
+        }
+        // Handle /recentlyjoined (NEW)
+        else if (commandName === 'recentlyjoined') {
+            await safeDefer(interaction);
+            const embeds = buildBdRecentEmbeds();
+            return safeReply(interaction, { embeds });
+        }
+        // Handle /comparebdscores (NEW)
+        else if (commandName === 'comparebdscores') {
+            await safeDefer(interaction);
+            try {
+              // Build comparative top players across regions and global. Convert each
+              // Map into an array of { name, score } objects, sort by score desc
+              function topEntries(map) {
+                const arr = [];
+                map.forEach((val, key) => {
+                  const score = (val && typeof val === 'object') ? (val.score ?? 0) : (Number(val) || 0);
+                  arr.push({ name: key, score });
+                });
+                arr.sort((a, b) => (b.score || 0) - (a.score || 0));
+                return arr.slice(0, 10);
+              }
+              const globalTop = topEntries(bdTop.global);
+              const westTop   = topEntries(bdTop.West);
+              const eastTop   = topEntries(bdTop.East);
+              const euTop     = topEntries(bdTop.EU);
+              // Helper to format leaderboard lines
+              const fmt = list => list.map((p, i) => {
+                return `\`${String(i+1).padStart(2,' ')}.\` **${clampName(p.name, 25).padEnd(27)}** \`— ${String(p.score).padStart(5)}\``;
+              }).join('\n') || '_No scores recorded._';
+              const embeds = [];
+              embeds.push(new EmbedBuilder()
+                .setTitle('Top BD Scores — Global')
+                .setDescription(fmt(globalTop))
+                .setColor(DEFAULT_EMBED_COLOR)
+                .setFooter({ text: `Updated <t:${Math.floor((bdTopMeta.lastUpdatedAt||Date.now())/1000)}:R>` }));
+              embeds.push(new EmbedBuilder()
+                .setTitle('Top BD Scores — West')
+                .setDescription(fmt(westTop))
+                .setColor(DEFAULT_EMBED_COLOR)
+                .setFooter({ text: `Updated <t:${Math.floor((bdTopMeta.lastUpdatedAt||Date.now())/1000)}:R>` }));
+              embeds.push(new EmbedBuilder()
+                .setTitle('Top BD Scores — East')
+                .setDescription(fmt(eastTop))
+                .setColor(DEFAULT_EMBED_COLOR)
+                .setFooter({ text: `Updated <t:${Math.floor((bdTopMeta.lastUpdatedAt||Date.now())/1000)}:R>` }));
+              embeds.push(new EmbedBuilder()
+                .setTitle('Top BD Scores — EU')
+                .setDescription(fmt(euTop))
+                .setColor(DEFAULT_EMBED_COLOR)
+                .setFooter({ text: `Updated <t:${Math.floor((bdTopMeta.lastUpdatedAt||Date.now())/1000)}:R>` }));
+              return safeReply(interaction, { embeds });
+            } catch (err) {
+              console.error('[comparebdscores]', err);
+              return safeReply(interaction, { content: 'Failed to build BD score comparison.', ephemeral: true });
+            }
         }
 
     } catch (err) {
@@ -4066,6 +4317,12 @@ async function checkRegion(regionKey) {
   // If no data (start up fail), just return
   if (!info || !Array.isArray(info.players)) return;
 
+  // Update the last info snapshot for summary embeds. This allows us to
+  // construct consolidated status messages across all regions. Store the
+  // fetchedAt time as well so we can display relative age in footers.
+  bdLastInfo[regionKey] = info;
+  bdLastFetch[regionKey] = r?.fetchedAt || Date.now();
+
   // Update top scores
   updateBdTop(regionKey, info.players);
 
@@ -4121,6 +4378,18 @@ async function checkRegion(regionKey) {
 
   // Broadcast
   await broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info });
+
+  // Record recent join/leave events. We do this after the broadcast call so
+  // notifications reflect the current event. We push each player name along
+  // with a timestamp. Prune old entries first to keep memory bounded.
+  pruneBdRecent();
+  const now = Date.now();
+  for (const name of joins) {
+    bdRecent[regionKey].push({ name, time: now, type: 'join' });
+  }
+  for (const name of leaves) {
+    bdRecent[regionKey].push({ name, time: now, type: 'leave' });
+  }
 }
 
 async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }) {
@@ -4128,79 +4397,89 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
   const onlineNow = info.onlinenow || 0;
   const inDomeNow = info.indomenow || 0;
 
-  // Build a minimal status embed. We intentionally omit join/leave fields to reduce noise.
-  const embed = new EmbedBuilder()
-    .setTitle(`Battledome Status — ${serverName}`)
-    .setDescription(`**Online:** ${onlineNow}  |  **In Dome:** ${inDomeNow}  |  **This Hour:** ${info.thishour ?? '?'}`)
-    .setColor(DEFAULT_EMBED_COLOR)
-    .setFooter({ text: `Live snapshot • ${new Date().toLocaleTimeString('en-GB')}` });
-
-  // Broadcast to all configured guilds
-  for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
+  // Iterate through configured guilds to determine which users need to be alerted.
+  for (const [guildId, _channelId] of globalCache.bdDestinations.entries()) {
     try {
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel || !channel.isTextBased?.()) continue;
-
-      // Default to no mentions
-      let content = '';
-
-      // Fetch subscribers for this guild/region regardless of join/leave diffs
-      const subSnap = await rtdb.ref(`bdNotify/${guildId}`).get();
-      // Determine if alerts are globally enabled for this guild
+      // Skip if alerts are globally disabled for this guild
       let alertsEnabled = true;
       try {
         const enabledSnap = await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).get();
         if (enabledSnap.exists() && enabledSnap.val() === false) alertsEnabled = false;
       } catch {}
+      if (!alertsEnabled) continue;
 
-      if (alertsEnabled && subSnap.exists()) {
-        const triggeredUserIds = [];
-        const stateUpdates = {};
-        subSnap.forEach(child => {
-          const userId = child.key;
-          const val = child.val() || {};
-          const sub = val.regions?.[regionKey];
-          if (!sub || !sub.enabled) return;
+      const subSnap = await rtdb.ref(`bdNotify/${guildId}`).get();
+      if (!subSnap.exists()) continue;
 
-          const threshold = sub.threshold;
-          // Mode determines behaviour: active for threshold; legacy join if no threshold
-          const mode = sub.mode || (typeof threshold === 'number' ? 'active' : 'join');
-          const prevState = sub.state || 'below';
-
-          if (mode === 'active' && typeof threshold === 'number') {
-            if (inDomeNow >= threshold) {
-              // Crossed or remains above threshold
-              if (prevState !== 'above') {
-                triggeredUserIds.push(userId);
-                stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
-              }
-            } else {
-              // Below threshold – rearm if necessary
-              if (prevState !== 'below') {
-                stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
-              }
+      const stateUpdates = {};
+      const triggered = [];
+      subSnap.forEach(child => {
+        const userId = child.key;
+        const val = child.val() || {};
+        const sub = val.regions?.[regionKey];
+        if (!sub || !sub.enabled) return;
+        const threshold = sub.threshold;
+        const mode = sub.mode || (typeof threshold === 'number' ? 'active' : 'join');
+        const prevState = sub.state || 'below';
+        if (mode === 'active' && typeof threshold === 'number') {
+          if (inDomeNow >= threshold) {
+            if (prevState !== 'above') {
+              triggered.push({ userId, mode: 'active', threshold });
+              stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
             }
           } else {
-            // Legacy join mode: ping on new named joins only
-            if (joins.length > 0) {
-              triggeredUserIds.push(userId);
+            if (prevState !== 'below') {
+              stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'below';
             }
           }
-        });
-        // Apply state updates asynchronously
-        if (Object.keys(stateUpdates).length > 0) {
-          rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
+        } else {
+          // join mode: trigger on any new named joins
+          if (joins.length > 0) {
+            triggered.push({ userId, mode: 'join' });
+          }
         }
-        if (triggeredUserIds.length > 0) {
-          content = triggeredUserIds.map(id => `<@${id}>`).join(' ');
+      });
+      if (Object.keys(stateUpdates).length > 0) {
+        rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
+      }
+      // Send DM notifications to each triggered user (unique per guild). Use DM instead
+      // of channel pings so only the subscriber sees the alert. If the user has
+      // disabled DMs or cannot be fetched, we silently ignore the failure.
+      for (const { userId, mode, threshold } of triggered) {
+        try {
+          const user = await client.users.fetch(userId).catch(() => null);
+          if (!user) continue;
+          let message;
+          if (mode === 'active' && typeof threshold === 'number') {
+            message = `The dome on **${serverName}** has reached your threshold of **${threshold}** players (now ${inDomeNow}).`;
+          } else {
+            const joinCount = joins.length + Math.max(0, unnamedDiff);
+            if (joinCount <= 0) continue;
+            if (joins.length > 0) {
+              // Show names if there are only a handful, else summarise count
+              if (joins.length <= 3 && unnamedDiff <= 0) {
+                message = `Players joined **${serverName}**: ${joins.map(n => `**${n}**`).join(', ')}.`;
+              } else {
+                message = `**${joinCount}** players have joined **${serverName}**.`;
+              }
+            } else {
+              message = `**${joinCount}** unnamed players have joined **${serverName}**.`;
+            }
+          }
+          await user.send({ content: message });
+        } catch (dmErr) {
+          // DMs may fail if the user has them disabled; ignore
         }
       }
-
-      await channel.send({ content, embeds: [embed] });
-    } catch (e) {
-      console.error(`[BD Broadcast] Failed to send to guild ${guildId}:`, e.message);
+    } catch (err) {
+      console.error('[BD Broadcast] Error while processing guild', guildId, err);
     }
   }
+
+  // After notifying subscribers, update or send the consolidated status message
+  // across all guilds. This replaces sending per-update status embeds and
+  // keeps channels tidy. Errors are logged inside updateBdStatusMessages().
+  updateBdStatusMessages().catch(() => {});
 }
 
 // Polling Loop
@@ -4285,6 +4564,14 @@ client.once('ready', async () => {
   } catch (e) {
     console.error('[BD] failed to load destinations', e);
   }
+
+  // Send initial Battledome status messages to all configured destinations. Do this
+  // after loading bdDestinations so that each configured guild receives a
+  // consolidated status embed on startup. Subsequent updates are handled by
+  // the poller and broadcast logic.
+  try {
+    updateBdStatusMessages().catch(() => {});
+  } catch {}
 
   // Attach listeners for all existing and new users to broadcast clips
   try {
