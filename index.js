@@ -1217,21 +1217,21 @@ async function seedTopFromWestStats() {
 
 // Hardcoded scores to seed (All-Time Top LB)
 const HARDCODED_TOP_SCORES = [
-  { name: "B L /\\ C K S T /\\ R 2", score: 115 },
-  { name: "z", score: 103 },
+  { name: "BL/\\CKST/\\R2", score: 115 },
+  { name: "BL/\\CKST/\\R", score: 109 },
+  { name: "BL/\\CKST/\\R4", score: 104 },
+  { name: "z", score: 102 },
+  { name: "@Flying Tacos rusty af", score: 101 },
   { name: "SCAVENGER", score: 98 },
+  { name: "BL/\\CKST/\\R3", score: 94 },
+  { name: "banana llama", score: 94 },
+  { name: "[RR] prime", score: 94 },
   { name: "mino", score: 93 },
-  { name: "B L /\\ C K S T /\\ R 3", score: 93 },
-  { name: "banana llama", score: 93 },
-  { name: "Lx* <3 INS", score: 90 },
-  { name: "Mia", score: 89 },
-  { name: "Sigi fan", score: 88 },
-  { name: "...", score: 88 },
+  { name: "[tgrs] WIVATE", score: 92 },
+  { name: "Lx* <3 INS", score: 89 },
+  { name: "Skilla 00.1", score: 89 },
   { name: "100", score: 88 },
-  { name: "fghj", score: 87 },
-  { name: "sigi>bs>mia", score: 86 },
-  { name: "OTR2", score: 85 },
-  { name: "ssko", score: 84 },
+  { name: "Mia 2", score: 88 },
 ];
 
 // Hardcoded “starting point” highs (seeded once; future highs overwrite). For
@@ -1274,23 +1274,25 @@ const HARDCODED_TOP_SCORES_BY_REGION = {
   ],
 
   EU: [
+    // Blackstar (all EU)
     { name: "B L /\\ C K S T /\\ R 2", score: 115 },
-    { name: "z", score: 103 },
+    { name: "B L /\\ C K S T /\\ R", score: 109 },
+    { name: "B L /\\ C K S T /\\ R 4", score: 104 },
+    { name: "B L /\\ C K S T /\\ R 3", score: 94 },
+    { name: "z", score: 102 },
+    { name: "@Flying Tacos rusty af", score: 101 },
     { name: "SCAVENGER", score: 98 },
+    { name: "banana llama", score: 94 },
+    { name: "[RR] prime", score: 94 },
     { name: "mino", score: 93 },
-    { name: "B L /\\ C K S T /\\ R 3", score: 93 },
-    { name: "banana llama", score: 93 },
-    { name: "Lx* <3 INS", score: 90 },
-    { name: "Mia", score: 89 },
-    { name: "Sigi fan", score: 88 },
-    { name: "...", score: 88 },
+    { name: "[tgrs] WIVATE", score: 92 },
+    { name: "Lx* <3 INS", score: 89 },
+    { name: "Skilla 00.1", score: 89 },
     { name: "100", score: 88 },
-    { name: "fghj", score: 87 },
-    { name: "sigi>bs>mia", score: 86 },
-    { name: "OTR2", score: 85 },
-    { name: "ssko", score: 84 },
+    { name: "Mia 2", score: 88 },
   ],
 };
+
 
 
 function seedHardcodedTopScoresOnce() {
