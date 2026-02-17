@@ -1,9 +1,19 @@
-// index.js // Discord.js v14 + Firebase Admin (Realtime Database &
-Firestore) // Commands: /link (DMs auth link), /badges (public profile
-embed), /whoami (debug), /dumpme (debug)
+/*
+index.js
+Discord.js v14 + Firebase Admin (Realtime Database & Firestore)
 
-// Make dotenv optional (used locally, ignored on Render if not
-installed) try { require(‘dotenv’).config(); } catch (_) {}
+Commands:
+- /link (DMs auth link)
+- /badges (public profile embed)
+- /whoami (debug)
+- /dumpme (debug)
+*/
+
+// Make dotenv optional (used locally, ignored on Render if not installed)
+try {
+  require('dotenv').config();
+} catch (_) {}
+
 
 // Healthcheck server for Render const express = require(‘express’);
 const app = express(); app.get(‘/’, (_req, res) =>
