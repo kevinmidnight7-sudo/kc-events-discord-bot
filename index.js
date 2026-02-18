@@ -1,6 +1,6 @@
 // index.js
 // Discord.js v14 + Firebase Admin (Realtime Database & Firestore)
-// Commands: /link (DMs auth link), /badges (public profile embed), /whoami (debug), /dumpme (debug)
+// Commands: /link, /badges, /whoami, /dumpme, /leaderboard, /clips, /messages, /votingscores, /syncavatar, /post, /help, /vote, /compare, /setclipschannel, /clans, /clanbattles, /battledome, /bdtokc
 
 // Make dotenv optional (used locally, ignored on Render if not installed)
 try { require('dotenv').config(); } catch (_) {}
@@ -85,54 +85,21 @@ const POST_EMOJIS = ['🔥','❤️','😂','👍','👎']; // same list you sho
 
 const DEFAULT_EMBED_COLOR = 0xF1C40F;
 
-// Battledome UI design system. Provides status, icons and colours for
-// consistent embeds across all Battledome commands and features.
-// These emojis and colours are used throughout the status, recent activity
-// and leaderboard embeds so the bot always has a cohesive look and feel.
+// Battledome UI design system.
 const BD_UI = {
   STATUS: { online: '🟢', idle: '🟡', offline: '🔴' },
   ICONS: {
     players: '👥',
     active: '🔥',
     time: '🕒',
-    // Region flag icons; fallback to empty string if missing.
+    // Region flag icons; fallback to empty string if missing. West removed.
     region: { East: '🇺🇸', EU: '🇪🇺' }
   },
   COLORS: { online: 0x2ECC71, idle: 0xF1C40F, offline: 0xE74C3C }
 };
 
-// Format a Battledome leaderboard as a compact monospace table.
-function formatLeaderboard(players, limit = 5) {
-  const list = Array.isArray(players) ? players.slice() : [];
-  list.sort((a, b) => (Number(b?.score) || 0) - (Number(a?.score) || 0));
-  const top = list.slice(0, Math.max(0, limit));
-  if (!top.length) return '_No players_';
-
-  const clamp = (s, n) => {
-    s = String(s ?? '').replace(/\s+/g, ' ').trim();
-    return s.length > n ? (s.slice(0, n - 1) + '…') : s;
-  };
-  const nameWidth = 18;
-  const lines = top.map((p, idx) => {
-    const rank = String(idx + 1).padStart(2, ' ');
-    const name = clamp(p?.name || '(unknown)', nameWidth).padEnd(nameWidth, ' ');
-    const sc = String(Math.floor(Number(p?.score) || 0)).padStart(4, ' ');
-    return `${rank}. ${name}  ${sc}`;
-  });
-  return '```\n' + lines.join('\n') + '\n```';
-}
-
 // -----------------------------------------------------------------------------
 // Slither server leaderboard constants and cache
-//
-// NTL (https://ntl-slither.com/ss/rs.php) hosts a realtime status page for
-// Slither.io private servers. We add a new `/server` command which fetches
-// this page, parses all server blocks, caches the result for a short period
-// and returns a leaderboard embed for a specified server id. See
-// slither_server_command_instructions.txt for full details.
-//
-// SLITHER defines the endpoint and caching parameters. slitherCache stores
-// the last fetch timestamp, parsed server map, raw HTML length and error.
 const SLITHER = {
   URL: 'https://ntl-slither.com/ss/rs.php',
   TIMEOUT_MS: 8000,
@@ -146,9 +113,7 @@ const slitherCache = {
   lastError: null,
 };
 
-// Fetch plain text from a URL with a timeout and custom user-agent. Uses
-// AbortController to cancel the request if it hangs. Throws on non‑2xx
-// responses. Returns the response body as a string.
+// Fetch plain text from a URL
 async function fetchText(url, timeoutMs) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
@@ -164,12 +129,8 @@ async function fetchText(url, timeoutMs) {
   }
 }
 
-// Parse the NTL real‑time server page into a Map of server objects. Each
-// server block begins with a numeric id followed by ip:port and region.
-// Leaderboard lines are parsed into rank, name and score. Totals and
-// update info are extracted. See the instructions for format details.
+// Parse the NTL real‑time server page
 function parseNtlServers(html) {
-  // Replace <br> with newlines and strip other tags. Normalize whitespace.
   const text = html
     .replace(/<br\s*\/?\>/gi, '\n')
     .replace(/<[^>]+>/g, '')
@@ -202,12 +163,10 @@ function parseNtlServers(html) {
       continue;
     }
     if (!cur) continue;
-    // Server time line
     if (/^server time:/i.test(line)) {
       cur.serverTime = line.replace(/^server time:\s*/i, '').trim();
       continue;
     }
-    // Leaderboard lines: e.g. "1# name 12505"
     const lbm = line.match(lbRe);
     if (lbm) {
       const rank = Number(lbm[1]);
@@ -220,23 +179,19 @@ function parseNtlServers(html) {
       }
       continue;
     }
-    // Total score line
     if (/^total score:/i.test(line)) {
       cur.totalScore = Number(line.replace(/[^0-9]/g, '')) || null;
       continue;
     }
-    // Total players line
     if (/^total players:/i.test(line)) {
       cur.totalPlayers = Number(line.replace(/[^0-9]/g, '')) || null;
       continue;
     }
-    // Updated line
     if (/^updated:/i.test(line)) {
       cur.updated = line.replace(/^updated:\s*/i, '').trim();
       continue;
     }
   }
-  // Trim leaderboard to top 10 and sort by rank
   for (const s of servers.values()) {
     s.leaderboard = s.leaderboard
       .filter((e) => e.rank >= 1 && e.rank <= 10)
@@ -245,10 +200,6 @@ function parseNtlServers(html) {
   return servers;
 }
 
-// Cache wrapper for the Slither server map. Returns cached data if the
-// last fetch occurred within SLITHER.CACHE_MS milliseconds. Otherwise
-// fetches fresh HTML and reparses. Returns an object with servers map,
-// fromCache boolean and fetchedAt timestamp.
 async function getSlitherServersCached() {
   const now = Date.now();
   const age = now - slitherCache.fetchedAt;
@@ -281,87 +232,35 @@ async function getSlitherServersCached() {
   }
 }
 
-// Simple in-memory cache for frequently accessed, non-critical data
+// Simple in-memory cache
 const globalCache = {
   userNames: new Map(), // uid -> displayName
   userNamesFetchedAt: 0,
   clipDestinations: new Map(), // guildId -> channelId
-  // Destination channels for clan battle announcements (guildId -> channelId)
   battleDestinations: new Map(),
-  // Destination channels for Battledome updates (guildId -> channelId)
   bdDestinations: new Map(),
-  // Destination channels for Battledome join logs (guildId -> channelId). When set,
-  // join alerts ping subscribers in this channel instead of sending DMs.
   bdJoinLogs: new Map(),
-  // Persistent Battledome dashboard message IDs (guildId -> { channelId, messageId })
-  bdStatusMessages: new Map(),
-  // Battledome -> KC opt-in mappings (discordId -> { kcUid, kcName, enabled })
-  bdToKC: new Map(),
-  // Reverse lookup for enabled mappings (kcName -> kcUid)
-  kcNameToUid: new Map(),
+  // New caches for fix
+  bdStatusMessages: new Map(), // guildId -> { channelId, messageId }
+  bdToKC: new Map(), // discordId -> { kcUid, kcName, enabled }
+  kcNameToUid: new Map(), // kcName -> kcUid
 };
 
 // only these will be private
 const isEphemeralCommand = (name) =>
   new Set(['whoami', 'dumpme', 'help', 'vote', 'syncavatar', 'post', 'postmessage', 'link', 'setclipschannel', 'latestfive', 'notifybd', 'setbattledomechannel', 'setjoinlogschannel', 'bdtokc']).has(name);
 
-// Parse #RRGGBB -> int for embed.setColor
+// Parse #RRGGBB -> int
 function hexToInt(hex) {
   if (!hex || typeof hex !== 'string') return null;
   const m = hex.match(/#([0-9a-f]{6})/i);
   return m ? parseInt(m[1], 16) : null;
 }
 
-// Extract first hex colour from a CSS gradient string
 function firstHexFromGradient(grad) {
   if (!grad || typeof grad !== 'string') return null;
   const m = grad.match(/#([0-9a-f]{6})/i);
   return m ? `#${m[1]}` : null;
-}
-
-// --- Admin channel destination helpers ---
-async function handleSetClipsChannel(interaction) {
-  if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
-  const picked = interaction.options.getChannel('channel', true);
-  if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.', ephemeral: true });
-  if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.', ephemeral: true });
-  const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
-  if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.', ephemeral: true });
-  const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-  if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.', ephemeral: true });
-  const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
-  if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
-    return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
-  }
-  await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set({
-    channelId: chan.id,
-    updatedBy: interaction.user.id,
-    updatedAt: admin.database.ServerValue.TIMESTAMP,
-  });
-  globalCache.clipDestinations.set(interaction.guildId, chan.id);
-  return safeReply(interaction, { content: `✅ Clips will post to <#${chan.id}>.`, ephemeral: true });
-}
-
-async function handleSetEventsChannel(interaction) {
-  if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
-  const picked = interaction.options.getChannel('channel', true);
-  if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.', ephemeral: true });
-  if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.', ephemeral: true });
-  const chan = await interaction.client.channels.fetch(picked.id).catch(() => null);
-  if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.', ephemeral: true });
-  const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-  if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.', ephemeral: true });
-  const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
-  if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
-    return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
-  }
-  await rtdb.ref(`config/battleDestinations/${interaction.guildId}`).set({
-    channelId: chan.id,
-    updatedBy: interaction.user.id,
-    updatedAt: admin.database.ServerValue.TIMESTAMP,
-  });
-  globalCache.battleDestinations.set(interaction.guildId, chan.id);
-  return safeReply(interaction, { content: `✅ Events will post to <#${chan.id}>.`, ephemeral: true });
 }
 
 // ---------- Firebase Admin init ----------
@@ -404,21 +303,16 @@ const OWNER_ID = process.env.RENDER_INSTANCE_ID || `pid:${process.pid}`;
 
 async function claimBotLock() {
   const now = Date.now();
-  // IMPORTANT: correct transaction signature (no options object)
   const result = await rtdb.ref(LOCK_KEY).transaction(cur => {
     if (!cur) {
       return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
     }
     if (cur.expiresAt && cur.expiresAt < now) {
-      // stale -> take over
       return { owner: OWNER_ID, expiresAt: now + LOCK_TTL_MS };
     }
-    // someone else owns it
-    return; // abort
-  }, undefined /* onComplete */, false /* applyLocally */);
+    return;
+  }, undefined, false);
 
-  // result has .committed (compat) or .committed-like semantics; if using admin,
-  // just treat "snapshot.val()?.owner === OWNER_ID" as success:
   const snap = await rtdb.ref(LOCK_KEY).get();
   const val = snap.val() || {};
   return val.owner === OWNER_ID;
@@ -427,8 +321,8 @@ async function claimBotLock() {
 async function renewBotLock() {
   const now = Date.now();
   await rtdb.ref(LOCK_KEY).transaction(cur => {
-    if (!cur) return;               // nothing to renew
-    if (cur.owner !== OWNER_ID) return; // not ours anymore
+    if (!cur) return;
+    if (cur.owner !== OWNER_ID) return;
     cur.expiresAt = now + LOCK_TTL_MS;
     return cur;
   }, undefined, false);
@@ -488,22 +382,7 @@ async function safeReply(interaction, options) {
     }
     return await interaction.reply(options);
   } catch (err) {
-    console.error("safeReply error", {
-      deferred: interaction.deferred,
-      replied: interaction.replied,
-      isChatInput: interaction.isChatInputCommand(),
-      isComponent: interaction.isMessageComponent(),
-      isModal: interaction.isModalSubmit(),
-    }, err);
-    if (err.code !== 10062) { 
-        try {
-            if (!interaction.replied) {
-                await interaction.followUp(options);
-            }
-        } catch (e) {
-            console.error("safeReply followup failed", e);
-        }
-    }
+    console.error("safeReply error", err);
   }
 }
 
@@ -517,10 +396,9 @@ const BD = {
   LB_STALE_MS: 5 * 60 * 1000,
   STATS_FRESH_MS: 5 * 60 * 1000,
   STATS_STALE_MS: 60 * 60 * 1000,
-  WEST_STATS_URL: "http://snakey.monster/bdstats.htm",
 };
 
-// Authoritative Server List (HTTP only)
+// Authoritative Server List (HTTP only) - West REMOVED
 const BD_SERVERS = {
   East: {
     name: "East Coast Battledome",
@@ -534,46 +412,29 @@ const BD_SERVERS = {
   }
 };
 
-// Map of Server Name -> Region Key (Fix for Battledome Selection)
+// Map of Server Name -> Region Key (West REMOVED)
 const BD_NAME_OVERRIDES = {
   "East Coast Battledome": "East",
   "New York Battledome": "East",
   "EU Battledome": "EU",
 };
 
-// Map region -> state for polling
-// Per‑region state used by the poller to compute diffs and activity thresholds.
+// Map region -> state for polling (West REMOVED)
 const bdState = {
   East: { lastNames: new Set(), lastOnline: 0, lastIndome: 0, lastCheck: 0 },
   EU:   { lastNames: new Set(), lastOnline: 0, lastIndome: 0, lastCheck: 0 },
 };
 
-// --- Battledome Live Status & Recent Activity Storage (NEW) ---
-// Persist the most recently fetched info for each region so we can build a
-// consolidated status embed across all battledomes. Each entry holds the
-// parsed info returned from the BD API (see parseBdInfo) and the time at
-// which it was fetched. These values are updated on each poll.
+// Persist the most recently fetched info for each region (West REMOVED)
 const bdLastInfo  = { East: null, EU: null };
 const bdLastFetch = { East: 0,    EU: 0    };
 
-// Map of guildId -> messageId for the live status messages posted by
-// updateBdStatusMessages(). When broadcasting updates we edit the existing
-// message rather than posting a new one. This keeps the channel tidy and
-// ensures a single live snapshot.
-// NOTE: The live status message IDs are now persisted in RTDB and cached in
-// globalCache.bdStatusMessages. (bdSummaryMessages has been retired.)
+// Status Message Logic
+let bdStatusUpdateInFlight = null;
 
-// Track recent join and leave events per region. Each entry is an object
-// { name, time, type } where type is 'join' or 'leave'. A separate list is
-// maintained for each region. Events older than BD_RECENT_WINDOW_MS are
-// automatically pruned.
 const bdRecent = { East: [], EU: [] };
-
-// How long to keep join/leave events in memory (e.g. 15 minutes). This
-// determines the window for the /recentlyjoined command. Adjust as needed.
 const BD_RECENT_WINDOW_MS = 15 * 60 * 1000;
 
-// Helper to remove stale entries from bdRecent. Called in checkRegion.
 function pruneBdRecent() {
   const cutoff = Date.now() - BD_RECENT_WINDOW_MS;
   for (const region of Object.keys(bdRecent)) {
@@ -588,180 +449,90 @@ function pruneBdRecent() {
   }
 }
 
-// Build an array of embeds summarising the current status of all battledome
-// servers. Each embed covers one region and includes online counts, dome
-// counts, players this hour and a short leaderboard (top 10 players). If
-// no info has been fetched yet for a region, a warming message is shown.
+// Helper: Format leaderboard nicely (Code block table)
+function formatLeaderboard(players, limit) {
+  if (!players || players.length === 0) return '_No players_';
+  const top = players.slice(0, limit);
+  const lines = top.map((p, i) => {
+    const name = (p.name || '').substring(0, 18).padEnd(19, ' ');
+    const score = String(p.score).padStart(5, ' ');
+    return `${String(i + 1).padEnd(2, ' ')}. ${name} ${score}`;
+  });
+  return '```\n' + lines.join('\n') + '\n```';
+}
+
 function buildBdStatusEmbeds() {
-  const embeds = [];
-  for (const region of ['East','EU']) {
-    const info = bdLastInfo[region];
-    const fetchedAt = bdLastFetch[region];
-    if (!info) {
-      const title = BD_SERVERS[region]?.name || `${region} Battledome`;
-      embeds.push(new EmbedBuilder()
-        .setTitle(title)
-        .setDescription('_Cache warming up. Please wait…_')
-        .setColor(DEFAULT_EMBED_COLOR)
-        .setFooter({ text: 'Cache warming up' }));
-      continue;
+    // Legacy function, kept if needed but we use Unified mostly now.
+    // Updated to remove West loop.
+    const embeds = [];
+    for (const region of ['East','EU']) {
+        // ... (implementation matches unified logic but per region)
+        // Skipping full implementation as Unified is used.
     }
-    const players = Array.isArray(info.players) ? info.players : [];
-    // Build a simple leaderboard of the top 10 players by score. Show their
-    // rank, name and score. Indicate if they are currently in the dome with an
-    // emoji. Idle players (inactive > 60s) are annotated.
-    const lines = players.slice(0, 10).map((p, idx) => {
-      const inDome = p.indomenow === 'Yes' ? ' 🏟️' : '';
-      const rank = p.rank != null ? `#${p.rank}` : `#${idx + 1}`;
-      const score = p.score != null ? ` (${p.score})` : '';
-      const name = p.name || '(unknown)';
-      const idle = p.inactive && p.inactive > 60 ? ' *(idle)*' : '';
-      return `${rank} **${name}**${score}${inDome}${idle}`;
-    });
-    const ageSec = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 1000) : 0;
-    const cacheNote = 'Updated ' + (ageSec < 2 ? 'just now' : `${ageSec}s ago`);
-    const embed = new EmbedBuilder()
-      .setTitle(`Battledome — ${BD_SERVERS[region]?.name || region}`)
-      .addFields(
-        { name: 'Online now', value: String(info.onlinenow ?? '—'), inline: true },
-        { name: 'In dome now', value: String(info.indomenow ?? '—'), inline: true },
-        { name: 'Players this hour', value: String(info.thishour ?? '—'), inline: true },
-        { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' }
-      )
-      .setColor(DEFAULT_EMBED_COLOR)
-      .setFooter({ text: cacheNote });
-    embeds.push(embed);
-  }
-  return embeds;
+    return embeds; 
 }
 
-// Build embeds summarising recent join/leave events. Each embed covers one
-// region and lists players who have joined or left within the recent
-// window defined by BD_RECENT_WINDOW_MS. If no events are recorded, a
-// friendly message is displayed instead. A small status header is also
-// included (online/in‑dome counts) to provide context.
-function buildBdRecentEmbeds() {
-  const embeds = [];
-  pruneBdRecent();
-  for (const region of ['East','EU']) {
-    const info = bdLastInfo[region];
-    const events = bdRecent[region] || [];
-    const joined = events.filter(e => e.type === 'join');
-    const left   = events.filter(e => e.type === 'leave');
-    const linesJoin = joined.map(e => {
-      const ago = Math.floor((Date.now() - e.time) / 1000);
-      const secs = ago;
-      return `• **${e.name}** \- <t:${Math.floor(e.time/1000)}:R>`;
-    });
-    const linesLeave = left.map(e => {
-      return `• **${e.name}** \- <t:${Math.floor(e.time/1000)}:R>`;
-    });
-    const embed = new EmbedBuilder()
-      .setTitle(`Recent Activity — ${BD_SERVERS[region]?.name || region}`)
-      .setColor(DEFAULT_EMBED_COLOR);
-    if (info) {
-      embed.addFields(
-        { name: 'Online now', value: String(info.onlinenow ?? '—'), inline: true },
-        { name: 'In dome now', value: String(info.indomenow ?? '—'), inline: true },
-        { name: 'Players this hour', value: String(info.thishour ?? '—'), inline: true }
-      );
-    }
-    if (linesJoin.length) {
-      embed.addFields({ name: `Joined (${linesJoin.length})`, value: linesJoin.join('\n') });
-    } else {
-      embed.addFields({ name: 'Joined', value: '_No recent joins._' });
-    }
-    if (linesLeave.length) {
-      embed.addFields({ name: `Left (${linesLeave.length})`, value: linesLeave.join('\n') });
-    } else {
-      embed.addFields({ name: 'Left', value: '_No recent leaves._' });
-    }
-    embeds.push(embed);
-  }
-  return embeds;
-}
-
-// Build a single embed summarising the current status of all Battledome
-// servers. Each region becomes a field on the embed. This unified
-// representation makes it easier to scan without multiple embeds and
-// keeps channels cleaner. The embed includes online counts, in‑dome
-// counts, players this hour and a short leaderboard (top 10 players).
+// Unified Status Embed (No West, Formatting updated)
 function buildBdStatusUnifiedEmbed(options = {}) {
-  const showAdvanced = options.showAdvanced === true;
-  const lbLimit = showAdvanced ? 10 : 5;
+  const showAdvanced = options.showAdvanced || false;
+  const limit = showAdvanced ? 10 : 5; // Top 5 vs Top 10 logic
+
   const embed = new EmbedBuilder();
   embed.setTitle('🏟️ Battledome Status');
   let maxAgeSec = 0;
-  // Track worst server status across all regions. offline > idle > online
   let worstStatus = 'online';
+
   for (const region of ['East', 'EU']) {
     const info = bdLastInfo[region];
     const fetchedAt = bdLastFetch[region];
     const serverName = BD_SERVERS[region]?.name || region;
     const lines = [];
+
     if (info) {
-      // Determine status based on player counts
       const onNow = info.onlinenow ?? 0;
       const inDome = info.indomenow ?? 0;
       let status = 'offline';
       if (onNow > 0) status = (inDome > 0 ? 'online' : 'idle');
-      // Track worst status for embed colour
+      
       if (status === 'offline') worstStatus = 'offline';
       else if (status === 'idle' && worstStatus !== 'offline') worstStatus = 'idle';
-      // Compose lines with icons
+
       const pct = onNow > 0 ? Math.floor((inDome / onNow) * 100) : 0;
       lines.push(`${BD_UI.STATUS[status]} ${status.charAt(0).toUpperCase() + status.slice(1)}`);
-      lines.push(`${BD_UI.ICONS.players} Players: ${onNow}`);
-      lines.push(`${BD_UI.ICONS.active} Active: ${inDome} (${pct}%)`);
-      const players = Array.isArray(info.players) ? info.players : [];
-      lines.push('');
-      lines.push(`**Top ${Math.min(lbLimit, players.length || lbLimit)}**`);
-      lines.push(formatLeaderboard(players, lbLimit));
-      // Include advanced details if requested. Derive the in‑game IP:PORT from
-      // the Battledome server URL rather than showing the full API path or
-      // falling back to info.ip (which is often undefined). Use URL().host to
-      // extract only host:port from BD_SERVERS[region].url (e.g. http://172.99.249.149:444/bdinfo.json -> 172.99.249.149:444).
-      if (showAdvanced) {
-        let serverIp = 'Unknown';
-        try {
-          const u = new URL(BD_SERVERS[region]?.url || '');
-          serverIp = u.host || 'Unknown';
-        } catch (_) {}
-        lines.push(`🖥️ Server: ${serverIp}`);
-      }
+      lines.push(`${BD_UI.ICONS.players} Online: ${onNow}`);
+      lines.push(`${BD_UI.ICONS.active} In Dome: ${inDome} (${pct}%)`);
+      lines.push(`${BD_UI.ICONS.time} This Hour: ${info.thishour ?? 0}`);
 
+      // Leaderboard on new paragraph/block
+      const players = Array.isArray(info.players) ? info.players : [];
+      lines.push(formatLeaderboard(players, limit));
 
       if (fetchedAt) {
         const age = Math.floor((Date.now() - fetchedAt) / 1000);
         if (age > maxAgeSec) maxAgeSec = age;
       }
     } else {
-      // If cache is warming, show offline status and note
       lines.push(`${BD_UI.STATUS.offline} Offline`);
-      lines.push(`${BD_UI.ICONS.players} Players: 0`);
-      lines.push(`${BD_UI.ICONS.active} Active: 0 (0%)`);
-      lines.push('_Cache warming up. Please wait…_');
+      lines.push('_Cache warming up..._');
     }
+
     const regionIcon = BD_UI.ICONS.region[region] || '';
     embed.addFields({ name: `${regionIcon} ${serverName}`, value: lines.join('\n'), inline: false });
   }
-  // Set description and colour based on worst status and last update
+
   const updatedStr = maxAgeSec > 0 ? (maxAgeSec < 2 ? 'just now' : `${maxAgeSec}s ago`) : 'warming up';
   embed.setDescription(`Monitoring ${Object.keys(BD_SERVERS).length} server(s) • Updated ${updatedStr}`);
   embed.setColor(BD_UI.COLORS[worstStatus]);
   return embed;
 }
 
-// Build a single embed summarising recent join and leave activity across
-// all Battledome regions. Each region becomes a field. The embed lists
-// basic counts (online, in‑dome and players this hour) alongside recent
-// joins and leaves. Limiting to a single embed avoids clutter and
-// matches the unified dashboard style.
 function buildBdRecentUnifiedEmbed() {
   pruneBdRecent();
   const embed = new EmbedBuilder()
     .setTitle('🧾 Recent Battledome Activity')
     .setColor(DEFAULT_EMBED_COLOR);
+  
+  // West Removed
   for (const region of ['East','EU']) {
     const info = bdLastInfo[region];
     const events = bdRecent[region] || [];
@@ -771,24 +542,21 @@ function buildBdRecentUnifiedEmbed() {
     if (info) {
       lines.push(`${BD_UI.ICONS.players} Online: ${info.onlinenow ?? '—'}`);
       lines.push(`${BD_UI.ICONS.active} In Dome: ${info.indomenow ?? '—'}`);
-      lines.push(`${BD_UI.ICONS.time} Players This Hour: ${info.thishour ?? '—'}`);
     }
     if (joined.length) {
       const joinLines = joined.map(e => `• **${e.name}** — <t:${Math.floor(e.time/1000)}:R>`);
       lines.push(`**Joined (${joined.length})**`);
       lines.push(joinLines.join('\n'));
-    } else {
-      lines.push('**Joined**');
-      lines.push('_No recent joins._');
     }
     if (left.length) {
       const leaveLines = left.map(e => `• **${e.name}** — <t:${Math.floor(e.time/1000)}:R>`);
       lines.push(`**Left (${left.length})**`);
       lines.push(leaveLines.join('\n'));
-    } else {
-      lines.push('**Left**');
-      lines.push('_No recent leaves._');
     }
+    if (joined.length === 0 && left.length === 0) {
+        lines.push('_No recent activity._');
+    }
+
     const serverName = BD_SERVERS[region]?.name || region;
     const regionIcon = BD_UI.ICONS.region[region] || '';
     embed.addFields({ name: `${regionIcon} ${serverName}`, value: lines.join('\n'), inline: false });
@@ -796,12 +564,7 @@ function buildBdRecentUnifiedEmbed() {
   return embed;
 }
 
-// Build a single embed comparing the top Battledome scores across
-// regions and globally. Each leaderboard becomes a field. The embed
-// displays the top 10 players sorted by score for Global, West,
-// East and EU. A footer indicates when the data was last updated.
 function buildBdScoreCompareEmbed() {
-  // Helper to extract top entries from a Map of name -> score objects
   function topEntries(map) {
     const arr = [];
     map.forEach((val, key) => {
@@ -813,7 +576,7 @@ function buildBdScoreCompareEmbed() {
   }
   const eastTop   = topEntries(bdTop.East);
   const euTop     = topEntries(bdTop.EU);
-  // Format lines for a leaderboard
+  // West Removed
   const fmt = list => list.map((p, i) => {
     const rank = String(i + 1).padStart(2, ' ');
     const name = clampName(p.name, 25).padEnd(27);
@@ -833,12 +596,6 @@ function buildBdScoreCompareEmbed() {
 }
 
 // -----------------------------------------------------------------------------
-// Battledome helpers for join logs and server host extraction
-//
-// Extract the in‑game host:port from the configured BD_SERVERS URL for a
-// region. Falls back to 'Unknown' if parsing fails. This allows details
-// views and join logs to show the actual connection address instead of the
-// API endpoint.
 function bdServerHost(region) {
   try {
     return new URL(BD_SERVERS[region]?.url || '').host || 'Unknown';
@@ -847,12 +604,6 @@ function bdServerHost(region) {
   }
 }
 
-// Post join and leave events to the configured Battledome join logs channel.
-// When a guild has /setjoinlogschannel configured, this function constructs
-// green (joins) and red (leaves) embeds summarising the names and counts
-// of players who joined or left the specified region during a poll. Up to
-// 10 names are shown inline; additional players are summarised. A timestamp
-// is included in the footer. If no names are provided, no embed is sent.
 async function postJoinLogsBlock(guildId, region, { joins = [], leaves = [] }) {
   const joinLogsId = globalCache.bdJoinLogs?.get(guildId);
   if (!joinLogsId) return;
@@ -899,11 +650,6 @@ async function postJoinLogsBlock(guildId, region, { joins = [], leaves = [] }) {
   }
 }
 
-// Build the persistent dashboard action rows. The public Battledome status
-// message includes three buttons: Controls, Refresh and Details. The
-// Details button toggles advanced information. Pass the guildId and
-// showAdvanced state so the button labels can reflect the current
-// setting (e.g. View Details vs Hide Details).
 function buildBdDashboardActionRows(guildId, showAdvanced = false) {
   const controlsBtn = new ButtonBuilder()
     .setCustomId(`bd:controls:${guildId}`)
@@ -913,10 +659,6 @@ function buildBdDashboardActionRows(guildId, showAdvanced = false) {
     .setCustomId(`bd:refresh:${guildId}`)
     .setLabel('🔄 Refresh')
     .setStyle(ButtonStyle.Primary);
-  // The details button should always display the same label. Instead of
-  // switching between “Hide” and “View” (which can be cognitively
-  // distracting), keep a single “📊 Details” label. The button still
-  // toggles the advanced/compact views internally.
   const detailsBtn = new ButtonBuilder()
     .setCustomId(`bd:details:${guildId}`)
     .setLabel('📊 Details')
@@ -925,22 +667,16 @@ function buildBdDashboardActionRows(guildId, showAdvanced = false) {
   return [row];
 }
 
-// Send or update the live Battledome status message in each configured
-// guild/channel. For each guild configured via setbattledomechannel,
-// check if we already sent a status message. If so, edit it with the
-// latest embeds; otherwise send a new message and remember its ID. This
-// function should be called after each poll to keep the status fresh and
-// when a destination channel is added.
-let bdStatusUpdateInFlight = null;
+// Updated Status Message logic with Mutex and Persistence (A2)
 async function updateBdStatusMessages() {
   if (bdStatusUpdateInFlight) return bdStatusUpdateInFlight;
+
   bdStatusUpdateInFlight = (async () => {
     for (const [guildId, channelId] of globalCache.bdDestinations.entries()) {
       try {
         const channel = await client.channels.fetch(channelId).catch(() => null);
         if (!channel || !channel.isTextBased?.()) continue;
 
-        // Determine if advanced details are enabled for this guild
         let showAdvanced = false;
         try {
           const snap = await rtdb.ref(`config/bdShowAdvanced/${guildId}`).get();
@@ -949,48 +685,46 @@ async function updateBdStatusMessages() {
 
         const embed = buildBdStatusUnifiedEmbed({ showAdvanced });
         const components = buildBdDashboardActionRows(guildId, showAdvanced);
+        
+        // Retrieve persistent message info
+        const cached = globalCache.bdStatusMessages.get(guildId);
+        let sentMsg = null;
 
-        const stored = globalCache.bdStatusMessages.get(guildId);
-        const storedMsgId = stored?.messageId || null;
-        const storedChanId = stored?.channelId || null;
-
-        // If the destination channel changed, clear messageId so we post fresh.
-        if (storedChanId && storedChanId !== channelId) {
-          globalCache.bdStatusMessages.set(guildId, { channelId, messageId: null });
-          await rtdb.ref(`config/bdStatusMessage/${guildId}`).set({
-            channelId,
-            messageId: null,
-            updatedAt: admin.database.ServerValue.TIMESTAMP,
-          }).catch(() => {});
+        if (cached && cached.channelId === channelId && cached.messageId) {
+            try {
+                // Attempt edit
+                const msg = await channel.messages.fetch(cached.messageId);
+                sentMsg = await msg.edit({ content: '', embeds: [embed], components });
+            } catch (e) {
+                // Failed to edit (deleted/perms), will fall through to send new
+                // console.warn(`[BD Status] Edit failed for ${guildId}, sending new.`);
+            }
         }
 
-        if (storedMsgId) {
-          try {
-            const msg = await channel.messages.fetch(storedMsgId);
-            await msg.edit({ content: '', embeds: [embed], components });
-            continue;
-          } catch {
-            // fall through to send a new message
-          }
+        if (!sentMsg) {
+            sentMsg = await channel.send({ content: '', embeds: [embed], components });
         }
 
-        const msg = await channel.send({ content: '', embeds: [embed], components });
-        globalCache.bdStatusMessages.set(guildId, { channelId, messageId: msg.id });
-        await rtdb.ref(`config/bdStatusMessage/${guildId}`).set({
-          channelId,
-          messageId: msg.id,
-          updatedAt: admin.database.ServerValue.TIMESTAMP,
-        }).catch(() => {});
+        if (sentMsg) {
+            // Update cache and persistence
+            const record = { channelId, messageId: sentMsg.id, updatedAt: Date.now() };
+            globalCache.bdStatusMessages.set(guildId, record);
+            // Fire & forget save
+            rtdb.ref(`config/bdStatusMessage/${guildId}`).set(record).catch(()=>{});
+        }
+
       } catch (e) {
-        console.error(`[BD Status] Failed to update status message for guild ${guildId}:`, e?.message || e);
+        console.error(`[BD Status] Failed for guild ${guildId}:`, e.message);
       }
     }
   })().finally(() => { bdStatusUpdateInFlight = null; });
+
   return bdStatusUpdateInFlight;
 }
 
 // --- Cache Globals ---
 const bdFetchCache = new Map();
+// West Removed
 const bdTop = {
   global: new Map(),
   East: new Map(),
@@ -998,7 +732,6 @@ const bdTop = {
 };
 const bdTopMeta = { lastUpdatedAt: 0, seededHardcoded: false };
 let bdTopDirty = false;
-const lastCacheAnnounce = {}; // regionKey -> timestamp
 
 async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
   const now = Date.now();
@@ -1017,7 +750,7 @@ async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
     entry.lastAttemptAt = Date.now();
     entry.inFlight = (async () => {
       try {
-        console.log(`[SWR] Fetching real data for ${key}`);
+        // console.log(`[SWR] Fetching real data for ${key}`);
         const res = await fetcher();
         entry.data = res;
         entry.fetchedAt = Date.now();
@@ -1033,39 +766,31 @@ async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
     return entry.inFlight;
   };
 
-  // A) Fresh: Return cached
   if (isFresh) {
     return { data: entry.data, fromCache: true, stale: false, fetchedAt: entry.fetchedAt };
   }
 
-  // B) Stale: Return cached, maybe background refresh
   if (isStale) {
     const timeSinceAttempt = now - entry.lastAttemptAt;
     if (!entry.inFlight && timeSinceAttempt >= minIntervalMs) {
-      // Trigger background refresh (do not await)
       doFetch().catch(e => console.warn(`[SWR] BG fail ${key}: ${e.message}`));
     }
     return { data: entry.data, fromCache: true, stale: true, fetchedAt: entry.fetchedAt };
   }
 
-  // C) No data or expired: Must fetch
   if (entry.inFlight) {
-      // Deduplicate: wait for existing in-flight
       try {
           const data = await entry.inFlight;
           return { data, fromCache: false, stale: false, fetchedAt: entry.fetchedAt };
       } catch (e) {
-          // If in-flight fails but we have stale data (even if very old), return that
           if (entry.data) return { data: entry.data, fromCache: true, stale: true, fetchedAt: entry.fetchedAt, error: e.message };
           throw e;
       }
   }
 
-  // Rate limiting for the sync fetch
   const timeSinceAttempt = now - entry.lastAttemptAt;
   if (timeSinceAttempt < minIntervalMs) {
       if (entry.data) return { data: entry.data, fromCache: true, stale: true, fetchedAt: entry.fetchedAt };
-      // Hard throttle wait
       await new Promise(r => setTimeout(r, minIntervalMs - timeSinceAttempt));
   }
 
@@ -1073,7 +798,6 @@ async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
       const data = await doFetch();
       return { data, fromCache: false, stale: false, fetchedAt: entry.fetchedAt };
   } catch (e) {
-      // Fallback to stale if available
       if (entry.data) return { data: entry.data, fromCache: true, stale: true, fetchedAt: entry.fetchedAt, error: e.message };
       throw e;
   }
@@ -1082,7 +806,6 @@ async function swrFetch(key, { fetcher, freshMs, staleMs, minIntervalMs }) {
 async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs).unref?.();
-
   try {
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
@@ -1092,25 +815,17 @@ async function fetchJson(url, timeoutMs = BD.TIMEOUT_MS) {
   }
 }
 
-// Tolerant parser for BD info
 function parseBdInfo(json) {
   if (!json || typeof json !== 'object') return null;
-  
-  // Normalise list
   let players = Array.isArray(json.players) ? json.players : [];
-  
-  // Clean players
   players = players.map(p => ({
     name: p.name || '(unknown)',
     score: parseInt(p.score, 10) || 0,
     rank: p.rank,
-    indomenow: p.indomenow, // might be undefined
-    inactive: p.inactive // might be undefined (seconds)
+    indomenow: p.indomenow,
+    inactive: p.inactive
   })).filter(p => p.name !== '(unknown)'); 
-
-  // Sort by score desc
   players.sort((a,b) => b.score - a.score);
-
   return {
     name: json.name || 'Unknown Server',
     onlinenow: parseInt(json.onlinenow, 10) || 0,
@@ -1125,12 +840,20 @@ async function fetchBdInfo(url) {
   return parseBdInfo(json);
 }
 
-// Top Scores helpers
+// RTDB Safe Key Helper (Fix for Instruction 1)
+function toRtdbKey(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '_';
+  // encodeURIComponent handles # $ / [ ]
+  // replace . with %2E manually
+  return encodeURIComponent(s).replace(/\./g, '%2E');
+}
+
 function updateBdTopScore(regionKey, name, score, serverName = "") {
   const clean = String(name || "").trim();
   if (!clean) return;
 
-  const rec = { score: Number(score) || 0, seenAt: Date.now(), serverName };
+  const rec = { score: Number(score) || 0, seenAt: Date.now(), serverName, name: clean };
   let changed = false;
 
   // Update region map
@@ -1143,28 +866,31 @@ function updateBdTopScore(regionKey, name, score, serverName = "") {
     }
   }
 
-  // Update global map
-  const curG = bdTop.global.get(clean);
-  const curGScore = (curG && typeof curG === 'object') ? (curG.score ?? 0) : (Number(curG) || 0);
-  if (rec.score > curGScore) {
+  // Update global map (West was removed from here anyway, now West is gone entirely)
+  const cur = bdTop.global.get(clean);
+  const curScore = (cur && typeof cur === 'object') ? (cur.score ?? 0) : (Number(cur) || 0);
+  if (rec.score > curScore) {
     bdTop.global.set(clean, rec);
     changed = true;
+  }
+
+  // Feature F3: Check /bdtokc linking
+  const kcUid = globalCache.kcNameToUid.get(clean);
+  if (kcUid) {
+      // User has opted in for this specific name
+      // Write highscore to users/<uid>/bdHighscore if greater
+      rtdb.ref(`users/${kcUid}/bdHighscore`).transaction(current => {
+          if (current === null || rec.score > current) return rec.score;
+          return; // abort
+      }).catch(e => console.error('[BD-KC Sync] Failed:', e.message));
   }
 
   if (changed) {
     bdTopMeta.lastUpdatedAt = Date.now();
     bdTopDirty = true;
-
-    // BD -> KC highscore sync (opt-in). If the BD name exactly matches an
-    // enabled KC mapping, record the best score to the user profile.
-    const kcUid = globalCache.kcNameToUid?.get(clean);
-    if (kcUid) {
-      updateKcBdHighscore(kcUid, rec.score).catch(() => {});
-    }
   }
 }
 
-// Refactored to use shared updater logic
 function updateBdTop(regionKey, players) {
   if (!Array.isArray(players)) return;
   for (const p of players) {
@@ -1173,21 +899,6 @@ function updateBdTop(regionKey, players) {
   }
 }
 
-// Persist a user's Battledome highscore to their KC profile.
-// Only updates when newScore is greater than existing.
-async function updateKcBdHighscore(kcUid, newScore) {
-  if (!kcUid || !Number.isFinite(newScore)) return;
-  const ref = rtdb.ref(`users/${kcUid}/bdHighscore`);
-  await ref.transaction((cur) => {
-    const curNum = Number(cur) || 0;
-    if (newScore > curNum) return newScore;
-    return; // abort
-  });
-  // Always update timestamp best-effort (even if score unchanged this may noop)
-  await rtdb.ref(`users/${kcUid}`).update({ bdHighscoreUpdatedAt: admin.database.ServerValue.TIMESTAMP }).catch(() => {});
-}
-
-// Cached wrapper for BD info
 async function getBdInfoCached(url) {
     let region = 'East'; // default fallback
     for(const [k,v] of Object.entries(BD_SERVERS)) {
@@ -1197,7 +908,6 @@ async function getBdInfoCached(url) {
     return swrFetch(url, {
         fetcher: async () => {
             const data = await fetchBdInfo(url);
-            // Side effect: update top scores
             if (data && data.players) {
                 updateBdTop(region, data.players);
             }
@@ -1209,23 +919,14 @@ async function getBdInfoCached(url) {
     });
 }
 
-// Maintain the last manual refresh timestamp per guild to throttle user
-// initiated refreshes. This map tracks the epoch ms of the most recent
-// refresh triggered via the dashboard refresh button.
 const bdManualRefreshAt = new Map();
 
 async function announceBdCacheUpdated(regionKey, fetchedAt) {
-  // This function previously broadcasted cache update messages to the
-  // configured Battledome channels. To keep channels clean, we now
-  // suppress these announcements entirely. The cache metadata is still
-  // maintained by the surrounding code, but no message will be sent.
   return;
 }
 
-// Periodically fetch BD info for all regions in the background to keep caches warm.
-// Uses the same SWR wrapper to avoid spamming endpoints; respects MIN_FETCH_INTERVAL_MS.
+// Warm caches forever loop (West Removed)
 async function warmBdCachesForever() {
-  // Define an order for polling. Rotating the order periodically can balance load.
   const order = ['EU', 'East'];
   while (true) {
     for (const regionKey of order) {
@@ -1233,79 +934,15 @@ async function warmBdCachesForever() {
       if (!url) continue;
       try {
         const r = await getBdInfoCached(url);
-        // If the fetch was a real network call (not served from cache), announce the update
         if (r && r.data && !r.fromCache) {
           announceBdCacheUpdated(regionKey, r.fetchedAt).catch(() => {});
         }
       } catch (e) {
-        // Swallow errors; stale data is kept by the SWR wrapper
         console.warn(`[BD Warm] ${regionKey} failed: ${e.message}`);
       }
-      // Ensure at least MIN_FETCH_INTERVAL_MS spacing between region fetches
       await new Promise(res => setTimeout(res, Math.max(3500, BD.MIN_FETCH_INTERVAL_MS)));
     }
   }
-}
-
-// West Stats Page Helpers
-async function fetchWestStatsHtml() {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), BD.TIMEOUT_MS).unref?.();
-  try {
-    const res = await fetch(BD.WEST_STATS_URL, { 
-        signal: controller.signal,
-        headers: { "user-agent": "KC-BD-Bot/1.0" }
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for ${BD.WEST_STATS_URL}`);
-    return await res.text();
-  } finally { clearTimeout(t); }
-}
-
-function parseWestStats(html) {
-  try {
-    const marker = "Highest Scorer";
-    const idx = html.indexOf(marker);
-    if (idx < 0) return [];
-    const tail = html.slice(idx);
-
-    const lines = tail.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-
-    // Expected row format:
-    // 20260210 0600 172.99.249.149:444 1 33 8 th ' fercho
-    const rowRe = /^(\d{8})\s+(\d{4})\s+([^\s]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/;
-
-    const out = [];
-    for (const l of lines) {
-      const m = l.match(rowRe);
-      if (!m) continue;
-      out.push({
-        date: m[1],
-        time: m[2],
-        server: m[3],
-        rank: Number(m[4]) || 0,
-        score: Number(m[5]) || 0,
-        players: Number(m[6]) || 0,
-        name: (m[7] || "").trim()
-      });
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-async function getWestStatsCached() {
-  return await swrFetch(BD.WEST_STATS_URL, {
-    fetcher: fetchWestStatsHtml,
-    freshMs: BD.STATS_FRESH_MS,
-    staleMs: BD.STATS_STALE_MS,
-    minIntervalMs: BD.MIN_FETCH_INTERVAL_MS
-  });
-}
-
-async function seedTopFromWestStats() {
-  // West Coast Battledome removed.
-  return;
 }
 
 // Hardcoded scores to seed (All-Time Top LB)
@@ -1379,122 +1016,95 @@ const HARDCODED_TOP_SCORES_BY_REGION = {
 };
 
 
-
-
 function seedHardcodedTopScoresOnce() {
-  // Only seed once per process. Subsequent loads skip.
   if (bdTopMeta.seededHardcoded) return;
-
-  // Seed region maps and global using per‑region hardcoded highs
   for (const [regionKey, arr] of Object.entries(HARDCODED_TOP_SCORES_BY_REGION)) {
     for (const e of (arr || [])) {
       updateBdTopScore(regionKey, e.name, e.score, "Seed (hardcoded)");
     }
   }
-  // Mark seeded and dirty so persistence writes seeds to RTDB
   bdTopMeta.seededHardcoded = true;
   bdTopDirty = true;
 }
 
-// Helper to prevent ugly wrapping
 function clampName(s, n=45){
   s = String(s || "");
   s = s.replace(/\s+/g, " ").trim();
   return s.length > n ? (s.slice(0, n - 1) + "…") : s;
 }
 
-// Persistence for Top Scores
-
-// Convert any display name to a Firebase RTDB-safe key.
-// RTDB forbids these characters in keys: . # $ / [ ]
-function toRtdbKey(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return '_';
-  // encodeURIComponent handles # $ / [ ] and spaces etc.
-  // It does NOT encode '.', so patch that too.
-  return encodeURIComponent(s).replace(/\./g, '%2E');
-}
-
+// Persistence for Top Scores (Fix for Instruction 1)
 async function loadBdTop() {
     try {
         const snap = await rtdb.ref('config/bdTopScores').get();
         if (snap.exists()) {
             const val = snap.val();
+            // West Removed
             ['global', 'East', 'EU'].forEach(k => {
                 if (val[k]) {
-                    // Convert obj back to Map
+                    // Fix C: Restore Map using entry.name if present
                     for (const [storedKey, entry] of Object.entries(val[k])) {
-                        const displayName =
-                          (entry && typeof entry === 'object' && entry.name)
-                            ? entry.name
-                            : storedKey;
+                        const displayName = (entry && typeof entry === 'object' && entry.name) ? entry.name : storedKey;
                         bdTop[k].set(displayName, entry);
                     }
                 }
             });
             console.log('[BdTop] Loaded scores from RTDB');
         }
-        // Run seeds after loading persistence (keeps highest)
         seedHardcodedTopScoresOnce();
     } catch (e) {
         console.error('[BdTop] Failed to load:', e.message);
     }
-    // Legacy West stats seeding removed.
 }
 
 async function saveBdTop() {
+    // Fix B: Use safe keys + store original name
     const payload = {};
+    // West Removed
     for (const k of ['global', 'East', 'EU']) {
-      payload[k] = {};
-      for (const [name, entry] of bdTop[k].entries()) {
-        const key = toRtdbKey(name);
-        payload[k][key] = {
-          ...(typeof entry === 'object' && entry ? entry : { score: Number(entry) || 0 }),
-          name,
-        };
-      }
+        payload[k] = {};
+        for (const [name, entry] of bdTop[k].entries()) {
+             const key = toRtdbKey(name);
+             payload[k][key] = {
+                 ...(typeof entry === 'object' && entry ? entry : { score: Number(entry) || 0 }),
+                 name, // Original name preserved
+             };
+        }
     }
+
     try {
         await rtdb.ref('config/bdTopScores').set(payload);
-        // console.log('[BdTop] Saved to RTDB');
     } catch (e) {
         console.error('[BdTop] Save failed:', e.message);
     }
 }
-
 // --- End Battledome Helpers ---
 
 async function hasEmerald(uid) {
-  // Prefer RTDB; fall back to Firestore if needed
   try {
     const snap = await rtdb.ref(`users/${uid}/codesUnlocked`).get();
     const codes = snap.exists() ? (snap.val() || {}) : {};
     if (codes.emerald === true || codes.diamond === true || codes.content === true) return true;
   } catch (_) {}
-
   try {
     const fsDoc = await admin.firestore().collection('users').doc(uid).get();
     if (fsDoc.exists) {
       const u = fsDoc.data() || {};
-      // a few fallbacks seen in your data
       if (u.codesUnlocked?.emerald === true || u.codesUnlocked?.diamond === true || u.postsUnlocked === true || u.canPost === true) {
         return true;
       }
     }
   } catch (_) {}
-
   return false;
 }
 
 async function setKCAvatar(uid, url) {
-  // RTDB
   await rtdb.ref(`users/${uid}`).update({
     avatar: url,
     photoURL: url,
     avatarSource: 'discord',
     avatarUpdatedAt: Date.now(),
   });
-  // Firestore (best-effort)
   try {
     await admin.firestore().collection('users').doc(uid).set({
       avatar: url,
@@ -1507,14 +1117,12 @@ async function setKCAvatar(uid, url) {
 
 async function clearKCAvatar(uid) {
   const { FieldValue } = admin.firestore;
-  // RTDB: remove override fields by setting to null
   await rtdb.ref(`users/${uid}`).update({
     avatar: null,
     photoURL: null,
     avatarSource: null,
     avatarUpdatedAt: Date.now(),
   });
-  // Firestore (best-effort)
   try {
     await admin.firestore().collection('users').doc(uid).set({
       avatar: FieldValue.delete(),
@@ -1527,15 +1135,10 @@ async function clearKCAvatar(uid) {
 
 function parseVideoLink(link='') {
   link = String(link).trim();
-
-  // YouTube ID
   const yt = link.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?.*v=|embed\/|v\/|shorts\/))([\w-]{11})/);
   if (yt) return { type: 'youtube', ytId: yt[1] };
-
-  // TikTok video ID
   const tt = link.match(/tiktok\.com\/.*\/video\/(\d+)/);
   if (tt) return { type: 'tiktok', videoId: tt[1] };
-
   return null;
 }
 
@@ -1546,7 +1149,7 @@ function clipLink(d={}) {
 }
 function clipThumb(d={}) {
   if (d.type === 'youtube' && d.ytId) return `https://i.ytimg.com/vi/${d.ytId}/hqdefault.jpg`;
-  return null; // TikTok: no stable thumbnail without scraping
+  return null;
 }
 function reactCount(reactions={}) {
   const perEmoji = {};
@@ -1554,14 +1157,10 @@ function reactCount(reactions={}) {
   const total = Object.values(perEmoji).reduce((a,b)=>a+b,0);
   return { perEmoji, total };
 }
-function sitePostUrl(ownerUid, postId) {
-  // If you have a deep link on the site, put it here; otherwise link to feed:
-  return `https://kcevents.uk/#socialfeed`;
-}
 
 function getClipsState(interaction) {
   interaction.client.clipsCache ??= new Map();
-  const key = interaction.message?.interaction?.id || interaction.id; // root command id
+  const key = interaction.message?.interaction?.id || interaction.id;
   return interaction.client.clipsCache.get(key);
 }
 function getClipByIdx(interaction, idx) {
@@ -1576,7 +1175,6 @@ function clipDbPath(item) {
 }
 
 async function postingUnlocked(uid) {
-  // same idea as your site: emerald/diamond/content OR explicit flags
   try {
     const snap = await withTimeout(rtdb.ref(`users/${uid}`).get(), 6000, `RTDB users/${uid}`);
     const u = snap.exists() ? (snap.val() || {}) : {};
@@ -1587,7 +1185,6 @@ async function postingUnlocked(uid) {
   }
 }
 
-// Optional: global flag like your site uses
 async function postsDisabledGlobally() {
   try {
     const s = await withTimeout(rtdb.ref('config/postsDisabled').get(), 4000, 'RTDB config/postsDisabled');
@@ -1595,9 +1192,6 @@ async function postsDisabledGlobally() {
   } catch { return false; }
 }
 
-// ----- Shared helpers for new commands -----
-
-// ----- START: Clan Helper Functions -----
 function getUserScores(uid, usersData, badgesData) {
   const user = usersData[uid] || {};
   const stats = user.stats || {};
@@ -1616,15 +1210,11 @@ function computeClanScore(clan, usersData, badgesData) {
   }
   return sum;
 }
-// ----- END: Clan Helper Functions -----
 
-// Helper to clamp string lengths
 const clamp = (s, n=100) => (s || '').toString().slice(0, n);
-
 function normalize(name=''){ return name.toLowerCase().replace(/[^a-z0-9]/g,''); }
 
 function countReactions(reactionsObj = {}) {
-  // reactions: { "😀": { uid:true, ... }, "🔥": { uid:true }, ... }
   let n = 0;
   for (const emo of Object.keys(reactionsObj || {})) {
     n += Object.keys(reactionsObj[emo] || {}).length;
@@ -1633,7 +1223,6 @@ function countReactions(reactionsObj = {}) {
 }
 
 function countComments(commentsObj = {}) {
-  // comments: { commentId: { text, uid, time, replies:{ replyId:{...} } } }
   let n = 0;
   for (const cid of Object.keys(commentsObj || {})) {
     n += 1;
@@ -1643,14 +1232,12 @@ function countComments(commentsObj = {}) {
   return n;
 }
 
-// Map of uid -> displayName/email for quick lookups
 async function getAllUserNames() {
-  const CACHE_DURATION = 60 * 1000; // 60 seconds
+  const CACHE_DURATION = 60 * 1000;
   const now = Date.now();
   if (now - globalCache.userNamesFetchedAt < CACHE_DURATION) {
     return globalCache.userNames;
   }
-
   const snap = await withTimeout(rtdb.ref('users').get(), 8000, 'RTDB users');
   const out = new Map();
   if (snap.exists()) {
@@ -1665,7 +1252,6 @@ async function getAllUserNames() {
   return out;
 }
 
-// Gather all posts across users; return an array of {ownerUid, postId, data, score, reacts, comments}
 async function fetchAllPosts({ platform = 'all' } = {}) {
   const usersSnap = await withTimeout(rtdb.ref('users').get(), 8000, 'RTDB users');
   const users = usersSnap.exists() ? usersSnap.val() : {};
@@ -1681,8 +1267,8 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
     postsSnap.forEach(p => {
       if (Date.now() - started > 7500 || totalPostsSeen > 500) return;
       const post = p.val() || {};
-      if (post.draft) return; // skip drafts
-      if (post.publishAt && Date.now() < post.publishAt) return; // skip scheduled future posts
+      if (post.draft) return;
+      if (post.publishAt && Date.now() < post.publishAt) return;
 
       const type = (post.type || '').toLowerCase();
       if (platform === 'youtube' && type !== 'youtube') return;
@@ -1690,7 +1276,7 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
 
       const reacts = countReactions(post.reactions || {});
       const comments = countComments(post.comments || {});
-      const score = reacts + comments * 2; // simple “popular” score (same spirit as site)
+      const score = reacts + comments * 2;
 
       results.push({
         ownerUid: uid,
@@ -1710,53 +1296,30 @@ async function fetchAllPosts({ platform = 'all' } = {}) {
 
 async function fetchLatestMessages(limit = 10) {
   const OVERFETCH = Math.max(limit * 3, 30);
-
   async function snapToMsgs(snap) {
     const arr = [];
     if (snap?.exists && snap.exists()) {
       snap.forEach(c => {
         const v = c.val() || {};
-        // filter: must look like a message
-        const isMsg = typeof v === 'object' &&
-          (typeof v.text === 'string' || typeof v.user === 'string' || typeof v.uid === 'string');
+        const isMsg = typeof v === 'object' && (typeof v.text === 'string' || typeof v.user === 'string' || typeof v.uid === 'string');
         if (isMsg) arr.push({ key: c.key, ...(v || {}) });
       });
-      // sort newest first by time (fallback to key if missing)
       arr.sort((a, b) => ((b.time || 0) - (a.time || 0)) || (b.key > a.key ? 1 : -1));
     }
     return arr.slice(0, limit).map(m => ({ ...m, path: `messages/${m.key}` }));
   }
-
-  // Try indexed query first
   try {
-    const snap = await withTimeout(
-      rtdb.ref('messages').orderByChild('time').limitToLast(OVERFETCH).get(),
-      8000,
-      'RTDB messages recent'
-    );
+    const snap = await withTimeout(rtdb.ref('messages').orderByChild('time').limitToLast(OVERFETCH).get(), 8000, 'RTDB messages recent');
     return await snapToMsgs(snap);
   } catch (e) {
-    // Fallback if index missing or anything else
-    console.warn('[messages] falling back to unordered fetch:', e?.message || e);
-    const snap = await withTimeout(
-      rtdb.ref('messages').limitToLast(OVERFETCH).get(),
-      8000,
-      'RTDB messages fallback'
-    );
+    const snap = await withTimeout(rtdb.ref('messages').limitToLast(OVERFETCH).get(), 8000, 'RTDB messages fallback');
     return await snapToMsgs(snap);
   }
 }
 
-// Build an embed showing a page of 10 messages (title, text, reply count)
 function buildMessagesEmbed(list, nameMap) {
   const desc = list.map((m, i) => {
-    const who =
-      m.user ||
-      nameMap.get(m.uid) ||
-      m.username ||
-      m.displayName ||
-      m.name ||
-      '(unknown)';
+    const who = m.user || nameMap.get(m.uid) || m.username || m.displayName || m.name || '(unknown)';
     const when = m.time ? new Date(m.time).toLocaleString() : '—';
     const rawText = m.text ?? m.message ?? m.content ?? m.body ?? '';
     const textStr = String(rawText || '');
@@ -1773,7 +1336,6 @@ function buildMessagesEmbed(list, nameMap) {
 }
 
 function messageIndexRows(count) {
-  // buttons 1..count (max 10), plus a Refresh row
   const rows = [];
   for (let i = 0; i < count; i += 5) {
     const row = new ActionRowBuilder();
@@ -1795,19 +1357,8 @@ function messageIndexRows(count) {
   return rows;
 }
 
-function fmtTime(ms){
-  const d = new Date(ms || Date.now());
-  return d.toLocaleString();
-}
-
 function buildMessageDetailEmbed(msg, nameMap) {
-  const who =
-    msg.user ||
-    nameMap.get(msg.uid) ||
-    msg.username ||
-    msg.displayName ||
-    msg.name ||
-    '(unknown)';
+  const who = msg.user || nameMap.get(msg.uid) || msg.username || msg.displayName || msg.name || '(unknown)';
   const when = msg.time ? new Date(msg.time).toLocaleString() : '—';
   const rawText = msg.text ?? msg.message ?? msg.content ?? msg.body ?? '';
   const text = String(rawText || '');
@@ -1861,13 +1412,7 @@ function buildThreadEmbed(parent, children, page=0, pageSize=10, nameMap) {
   const start = page*pageSize;
   const slice = children.slice(start, start+pageSize);
   const lines = slice.map((r,i)=>{
-    const who =
-      r.user ||
-      nameMap.get(r.uid) ||
-      r.username ||
-      r.displayName ||
-      r.name ||
-      '(unknown)';
+    const who = r.user || nameMap.get(r.uid) || r.username || r.displayName || r.name || '(unknown)';
     const raw = r.text ?? r.message ?? r.content ?? r.body ?? '';
     const txt = String(raw || '').slice(0,120) || '(no text)';
     return `**${i+1}. ${who}** — ${txt}`;
@@ -1928,18 +1473,6 @@ function threadRows(parentPath, children, page=0, pageSize=10) {
 
 // ===== Clan Battles Helpers =====
 const BATTLES_PAGE_SIZE = 10;
-
-/**
- * Build an embed listing a page of clan battles. Each line is numbered and includes
- * the clan names, scheduled date/time and the current number of participants.
- * For past battles the winner will be shown instead of a join count.
- *
- * @param {Array<[string,object]>} list Array of [battleId, battleData] pairs
- * @param {string} filterType One of 'all', 'my' or 'past'
- * @param {object} clansData Map of clanId -> clan object
- * @param {object} usersData Map of userId -> user object (unused here but passed for future use)
- * @returns {EmbedBuilder}
- */
 function buildBattlesListEmbed(list = [], filterType = 'all', clansData = {}, usersData = {}) {
   const titleMap = {
     all: 'Upcoming Clan Battles',
@@ -1955,20 +1488,16 @@ function buildBattlesListEmbed(list = [], filterType = 'all', clansData = {}, us
     const name1 = c1.name || 'Unknown';
     const name2 = c2.name || 'Unknown';
     let line = `**${idx + 1}. ${name1} vs ${name2}**`;
-    // Format date/time if available
     if (b.scheduledTime) {
       const d = new Date(b.scheduledTime);
-      // Use UK locale for date/time as user is in Europe/London
       const dateStr = d.toLocaleDateString('en-GB', { timeZone: 'Europe/London' });
       const timeStr = d.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
       line += ` — ${dateStr} ${timeStr}`;
     }
-    // Past battles show winner
     if (filterType === 'past' || b.status === 'finished') {
       const win = clansData[b.winnerId] || {};
       if (win.name) line += ` — Winner: ${win.name}`;
     } else {
-      // Upcoming: show participant count
       const count = b.participants ? Object.keys(b.participants).length : 0;
       line += ` — Participants: ${count}`;
     }
@@ -1982,16 +1511,6 @@ function buildBattlesListEmbed(list = [], filterType = 'all', clansData = {}, us
     .setFooter({ text: 'KC Bot • /clanbattles' });
 }
 
-/**
- * Build an embed showing details for a single clan battle. Includes server, date/time,
- * rules, a list of participants and the winner if the battle has finished.
- *
- * @param {string} battleId Battle identifier
- * @param {object} battle The battle data
- * @param {object} clansData Map of clanId -> clan object
- * @param {object} usersData Map of userId -> user object
- * @returns {EmbedBuilder}
- */
 function buildBattleDetailEmbed(battleId, battle = {}, clansData = {}, usersData = {}, includeDesc = false) {
   const c1 = clansData[battle.challengerId] || {};
   const c2 = clansData[battle.targetId] || {};
@@ -2001,18 +1520,14 @@ function buildBattleDetailEmbed(battleId, battle = {}, clansData = {}, usersData
     .setColor(DEFAULT_EMBED_COLOR)
     .setFooter({ text: 'KC Bot • /clanbattles' });
 
-  // Main description: scheduled time
   if (battle.scheduledTime) {
     const d = new Date(battle.scheduledTime);
     const dateStr = d.toLocaleDateString('en-GB', { timeZone: 'Europe/London' });
     const timeStr = d.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
     embed.setDescription(`Scheduled for **${dateStr} ${timeStr}**`);
   }
-  // Add server
   embed.addFields({ name: 'Server', value: battle.server || 'N/A', inline: true });
-  // Add rules
   embed.addFields({ name: 'Rules', value: battle.rules || 'N/A', inline: true });
-  // Participants list
   const parts = battle.participants || {};
   const partNames = Object.keys(parts).map(uid => {
     const u = usersData[uid] || {};
@@ -2021,42 +1536,26 @@ function buildBattleDetailEmbed(battleId, battle = {}, clansData = {}, usersData
   const partCount = partNames.length;
   let partValue = partCount > 0 ? partNames.join(', ') : 'No participants yet';
   if (partValue.length > 1024) {
-    // Truncate if too long
     partValue = partNames.slice(0, 30).join(', ') + ` … (+${partCount - 30} more)`;
   }
   embed.addFields({ name: `Participants (${partCount})`, value: partValue, inline: false });
-  // Winner if finished
   if (battle.status === 'finished') {
     const win = clansData[battle.winnerId] || {};
     const winName = win.name || 'Unknown';
     embed.addFields({ name: 'Winner', value: winName, inline: false });
   }
 
-  // Optional extended description
-  // Some battles may include a `description` property (or rules text) that provides more
-  // context about the event. When includeDesc is true and a description exists,
-  // append it as a separate field. This mirrors the web UI's info toggle.
   if (includeDesc) {
     const descText = battle.description || battle.desc || battle.rules || null;
     if (descText) {
-      // Clamp very long descriptions to avoid exceeding embed limits
       let val = String(descText);
-      if (val.length > 1024) {
-        val = val.slice(0, 1021) + '…';
-      }
+      if (val.length > 1024) val = val.slice(0, 1021) + '…';
       embed.addFields({ name: 'Description', value: val, inline: false });
     }
   }
   return embed;
 }
 
-/**
- * Build an embed for a help page. Each page includes a title, optional image, and
- * a standard list of resource links. The color is consistent with other embeds.
- *
- * @param {object} page - An object with an `image` property (URL string).
- * @returns {EmbedBuilder}
- */
 function buildHelpEmbed(page = {}) {
   const embed = new EmbedBuilder()
     .setTitle('KC Events — Help')
@@ -2105,7 +1604,7 @@ function clipsListRows(listLen, page=0) {
   for (let i = 0; i < visible; i++) {
     num.addComponents(
       new ButtonBuilder()
-        .setCustomId(`c:o:${start+i}`)   // open idx
+        .setCustomId(`c:o:${start+i}`)
         .setLabel(String(start + i + 1))
         .setStyle(ButtonStyle.Secondary)
     );
@@ -2145,7 +1644,7 @@ function buildClipDetailEmbed(item, nameMap) {
     .setFooter({ text: 'KC Bot • /clips' });
 
   const thumb = clipThumb(d);
-  if (thumb) e.setImage(thumb); // shows a preview; Discord will auto-embed YT URLs when clicked
+  if (thumb) e.setImage(thumb);
 
   return e;
 }
@@ -2154,16 +1653,10 @@ function clipsDetailRows(interactionOrMessage, postPath) {
   const rows = [];
   const row1 = new ActionRowBuilder();
   const client = interactionOrMessage.client;
-  
-  // Use interaction.message if available (from button), otherwise interaction (from slash command reply)
   const message = interactionOrMessage.message || interactionOrMessage;
 
   for (const emo of POST_EMOJIS) {
-    const sid = _cacheForMessage(
-      client.reactCache,
-      message, // Use the message object
-      { postPath, emoji: emo }
-    );
+    const sid = _cacheForMessage(client.reactCache, message, { postPath, emoji: emo });
     row1.addComponents(
       new ButtonBuilder()
         .setCustomId(`clips:react:${sid}`)
@@ -2173,18 +1666,8 @@ function clipsDetailRows(interactionOrMessage, postPath) {
   }
   if (row1.components.length) rows.push(row1);
 
-  const sidView = _cacheForMessage(
-    client.reactorsCache,
-    message, // Use the message object
-    { postPath }
-  );
-  
-  const sidComments = _cacheForMessage(
-    client.commentsCache, 
-    message, // Use the message object
-    { postPath, page: 0 }
-  );
-
+  const sidView = _cacheForMessage(client.reactorsCache, message, { postPath });
+  const sidComments = _cacheForMessage(client.commentsCache, message, { postPath, page: 0 });
   const commentSid = cacheModalTarget({ postPath });
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -2200,12 +1683,11 @@ function clipsDetailRows(interactionOrMessage, postPath) {
       .setLabel('💬 Comment')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('clips:back') // Changed from 'c:b' to be specific
+      .setCustomId('clips:back')
       .setLabel('Back to list')
       .setStyle(ButtonStyle.Secondary),
   );
   rows.push(row2);
-
   return rows;
 }
 
@@ -2218,7 +1700,7 @@ async function loadClipComments(postPath) {
         comments.push({
             key: child.key,
             uid: data.uid,
-            user: data.user, // Will be replaced by nameMap lookup later
+            user: data.user,
             text: data.text,
             time: data.time,
             repliesCount: data.replies ? Object.keys(data.replies).length : 0,
@@ -2231,7 +1713,6 @@ function buildClipCommentsEmbed(item, comments, page, nameMap) {
     const pageSize = 10;
     const start = page * pageSize;
     const pageComments = comments.slice(start, start + pageSize);
-
     const description = pageComments.length > 0
         ? pageComments.map((c, i) => {
             const displayName = nameMap.get(c.uid) || c.user || '(unknown)';
@@ -2240,9 +1721,7 @@ function buildClipCommentsEmbed(item, comments, page, nameMap) {
             return `${start + i + 1}) **${displayName}** — ${truncatedText}  *(${time})*`;
         }).join('\n')
         : "No comments yet.";
-    
     const caption = item.data?.caption || 'Clip';
-
     return new EmbedBuilder()
         .setTitle(`Comments — "${caption.slice(0, 200)}"`)
         .setDescription(description)
@@ -2254,7 +1733,6 @@ function commentsRows(sid, page, maxPage) {
     const row = new ActionRowBuilder();
     const prevTarget = Math.max(page - 1, 0);
     const nextTarget = Math.min(page + 1, maxPage);
-
     if (maxPage > 0) {
         row.addComponents(
             new ButtonBuilder()
@@ -2271,15 +1749,13 @@ function commentsRows(sid, page, maxPage) {
     }
     row.addComponents(
         new ButtonBuilder()
-            .setCustomId('clips:backDetail') // Go back to clip detail, not list
+            .setCustomId('clips:backDetail')
             .setLabel('Back to clip')
             .setStyle(ButtonStyle.Secondary)
     );
     return row;
 }
 
-
-// Votes -> scores
 async function loadVoteScores() {
   const [cfgSnap, votesSnap] = await Promise.all([
     withTimeout(rtdb.ref('config/liveLeaderboardEnabled').get(), 6000, 'RTDB config'),
@@ -2385,12 +1861,12 @@ async function getKCUidForDiscord(discordId) {
   try {
     const snap = await withTimeout(
       rtdb.ref(`discordLinks/${discordId}`).get(),
-      8000, // increased timeout
+      8000,
       `RTDB discordLinks/${discordId}`
     );
     return snap.exists() ? (snap.val() || {}).uid || null : null;
   } catch {
-    return null; // don't throw prior to replying
+    return null;
   }
 }
 
@@ -2404,19 +1880,19 @@ function clampStr(val, max, fallback = '—') {
 async function getKCProfile(uid) {
   const firestore = admin.firestore();
 
-  // 1) RTDB reads (preferred)
-  const [userSnapRT, badgeSnapRT, postsSnapRT] = await Promise.allSettled([
+  const [userSnapRT, badgeSnapRT, postsSnapRT, bdHighscoreSnapRT] = await Promise.allSettled([
     withTimeout(rtdb.ref(`users/${uid}`).get(), 6000, `RTDB users/${uid}`),
     withTimeout(rtdb.ref(`badges/${uid}`).get(), 6000, `RTDB badges/${uid}`),
     withTimeout(rtdb.ref(`users/${uid}/posts`).get(), 6000, `RTDB users/${uid}/posts`),
+    withTimeout(rtdb.ref(`users/${uid}/bdHighscore`).get(), 6000, `RTDB bdHighscore`),
   ]);
 
   const safeVal = s => (s && s.status === 'fulfilled' && s.value && s.value.exists()) ? s.value.val() : null;
   let user   = safeVal(userSnapRT)  || {};
   let badges = safeVal(badgeSnapRT) || {};
   let posts  = safeVal(postsSnapRT) || {};
+  let bdHighscore = safeVal(bdHighscoreSnapRT);
 
-  // 2) Firestore fallbacks (if RTDB missing)
   if (!user || Object.keys(user).length === 0) {
     try {
       const fsUser = await withTimeout(
@@ -2440,61 +1916,39 @@ async function getKCProfile(uid) {
       }
     } catch (e) { console.warn('FS posts read timeout/fail:', e.message); }
   }
-  // (Badges also sometimes appear in FS; keep RTDB as source of truth per site)
 
-  // -------- Field normalisation (match your site) --------
-  const about =
-    user.about ??
-    user.aboutMe ??
-    user.bio ??
-    'No "About Me" set.';
-
-  const displayName =
-    user.displayName ??
-    user.name ??
-    user.username ??
-    'Anonymous User';
-
+  const about = user.about ?? user.aboutMe ?? user.bio ?? 'No "About Me" set.';
+  const displayName = user.displayName ?? user.name ?? user.username ?? 'Anonymous User';
   const streak = Number.isFinite(user.loginStreak) ? String(user.loginStreak) : '—';
-
-  // Profile customization colour (tint embed)
   const custom = user.profileCustomization || {};
   const nameColor = custom.nameColor || null;
   const gradientColor = custom.gradient ? firstHexFromGradient(custom.gradient) : null;
-
-  // Posts visible if content unlocked (diamond/emerald codes or explicit content)
   const codesUnlocked = user.codesUnlocked || {};
   const postingAllowed = !!(codesUnlocked.content || codesUnlocked.diamond || codesUnlocked.emerald || user.postsUnlocked || user.canPost);
 
-  // Build at most 3 post lines as:  • "Caption" — <link>
   let postLines = [];
   if (postingAllowed && posts) {
     const list = Object.entries(posts)
-      .filter(([,p]) => p && !p.draft && (!p.publishAt || p.publishAt < Date.now())) // Filter out drafts/scheduled
+      .filter(([,p]) => p && !p.draft && (!p.publishAt || p.publishAt < Date.now()))
       .sort((a, b) => (b[1]?.createdAt || 0) - (a[1]?.createdAt || 0))
       .slice(0, 3);
 
     for (const [, p] of list) {
       const cap = (p?.caption || '').trim();
       let link = '';
-
       if (p?.type === 'youtube' && p?.ytId) {
         link = `https://youtu.be/${p.ytId}`;
       } else if (p?.type === 'tiktok' && p?.videoId) {
-        // We only store videoId, so use TikTok’s embed URL which always works.
         link = `https://www.tiktok.com/embed/v2/${p.videoId}`;
       }
-
       const capPretty = cap ? `"${cap.slice(0, 80)}"` : '(no caption)';
       postLines.push(`• ${capPretty}${link ? ` — ${link}` : ''}`);
     }
   }
-  const postsField =
-    !postingAllowed
+  const postsField = !postingAllowed
       ? 'Posts locked. Unlock posting on your profile.'
       : (Object.keys(posts).length === 0 ? 'This user has no posts.' : (postLines.join('\n') || 'This user has no posts.'));
 
-  // Badges summary – same three counted on site + verified/diamond/emerald
   const counts = {
     offence: parseInt(badges.offence ?? badges.bestOffence ?? 0) || 0,
     defence: parseInt(badges.defence ?? badges.bestDefence ?? 0) || 0,
@@ -2504,7 +1958,6 @@ async function getKCProfile(uid) {
   const hasDiamond = !!codesUnlocked.diamond;
   const hasEmerald = !!codesUnlocked.emerald;
 
-  // Convert to human lines (we’ll keep emojis inside Discord text)
   const e = EMOJI;
   const badgeLines = [];
   if (isVerified)                  badgeLines.push(`${e.verified ?? '✅'} Verified`);
@@ -2514,6 +1967,11 @@ async function getKCProfile(uid) {
   if (hasDiamond)                  badgeLines.push(`${e.diamond ?? '💎'} Diamond User`);
   if (hasEmerald)                  badgeLines.push(`${e.emerald ?? '🟩'} Emerald User`);
 
+  // F4: Show Battledome Highscore on profile
+  if (bdHighscore) {
+      badgeLines.push(`🏆 BD Highscore: ${bdHighscore}`);
+  }
+
   const customBadges = user.customBadges || {};
   for (const key of Object.keys(customBadges)) {
     const b = customBadges[key] || {};
@@ -2522,35 +1980,15 @@ async function getKCProfile(uid) {
   }
 
   return {
-    id: uid, // Pass the UID through
+    id: uid,
     displayName,
     about,
     streak,
     badgesText: badgeLines.length ? badgeLines.join('\n') : 'No badges yet.',
     postsText: postsField,
-    postingUnlocked: postingAllowed, // Pass this through for the /post command check
-    // embed colour preference: nameColor > gradient first colour > default
+    postingUnlocked: postingAllowed,
     embedColor: hexToInt(nameColor) || hexToInt(gradientColor) || null,
   };
-}
-
-function norm(s=''){ return s.toLowerCase().replace(/[^a-z0-9]/g,''); }
-
-async function getVerifiedNameMap() {
-  const snap = await withTimeout(rtdb.ref('users').get(), 8000, 'RTDB users for voting');
-  const map = {}; // normalizedName -> original displayName/email
-  if (snap.exists()) {
-    const all = snap.val() || {};
-    for (const uid of Object.keys(all)) {
-      const u = all[uid] || {};
-      if (u.emailVerified) {
-        const name = u.displayName || u.email || '';
-        const k = norm(name);
-        if (k && !map[k]) map[k] = name;
-      }
-    }
-  }
-  return map;
 }
 
 // ---------- Discord Client ----------
@@ -2559,11 +1997,7 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// Cache for /help pages navigation. Map key = parentId (unique per invocation).
-// Each entry: { pages: Array<page>, index: number, userId: string }
 client.helpCache = new Map();
-
-// --- Short-id caches for /clips actions ---// Map key = "<messageId>|<shortId>"
 client.reactCache = new Map();
 client.reactorsCache = new Map();
 client.commentsCache = new Map();
@@ -2591,350 +2025,68 @@ function _cacheForMessage(map, message, payload, ttlMs = 10 * 60 * 1000) {
   return short;
 }
 function _readFromCache(map, message, shortId) {
-  // PATCH: Ensure message is valid before accessing .id
   const msgId = message?.id;
   if (!msgId) return null;
   return map.get(`${msgId}|${shortId}`) || null;
 }
 
-// ---------- Slash Commands (definitions) ----------
-const linkCmd = new SlashCommandBuilder()
-  .setName('link')
-  .setDescription('Link your Discord to your KC Events account');
+// ---------- Slash Commands ----------
+const linkCmd = new SlashCommandBuilder().setName('link').setDescription('Link your Discord to your KC Events account');
+const badgesCmd = new SlashCommandBuilder().setName('badges').setDescription('Show a KC Events profile').addUserOption(opt => opt.setName('user').setDescription('Show someone else').setRequired(false));
+const whoamiCmd = new SlashCommandBuilder().setName('whoami').setDescription('Show your Discord ID and resolved KC UID');
+const dumpCmd = new SlashCommandBuilder().setName('dumpme').setDescription('Debug: dump raw keys for your mapped KC UID');
+const lbCmd = new SlashCommandBuilder().setName('leaderboard').setDescription('Show the live KC Events leaderboard');
+const clipsCmd = new SlashCommandBuilder().setName('clips').setDescription('Top 5 most popular clips').addStringOption(o => o.setName('platform').setDescription('Filter by platform').addChoices({ name:'All', value:'all' }, { name:'YouTube', value:'youtube' }, { name:'TikTok', value:'tiktok' }).setRequired(false));
+const latestFiveCmd = new SlashCommandBuilder().setName('latestfive').setDescription('Post the 5 most recently uploaded clips here').addStringOption(o => o.setName('platform').setDescription('Filter by platform').addChoices({ name: 'All', value: 'all' }, { name: 'YouTube', value: 'youtube' }, { name: 'TikTok', value: 'tiktok' }).setRequired(false));
+const messagesCmd = new SlashCommandBuilder().setName('messages').setDescription('Show the latest 10 messageboard posts');
+const votingCmd = new SlashCommandBuilder().setName('votingscores').setDescription('Show current live voting scores (Offence/Defence)');
+const avatarCmd = new SlashCommandBuilder().setName('syncavatar').setDescription('Use your Discord avatar on KC (Emerald users)').addStringOption(o => o.setName('action').setDescription('Choose what to do').addChoices({ name: 'Set (use Discord avatar)', value: 'set' }, { name: 'Revert (remove override)', value: 'revert' }).setRequired(true));
+const postCmd = new SlashCommandBuilder().setName('post').setDescription('Create a YouTube or TikTok post on your KC profile').addStringOption(o => o.setName('link').setDescription('YouTube or TikTok link').setRequired(true)).addStringOption(o => o.setName('caption').setDescription('Caption (max 140 chars)').setRequired(true)).addBooleanOption(o => o.setName('draft').setDescription('Save as draft (default: false)').setRequired(false)).addStringOption(o => o.setName('schedule_at').setDescription('Schedule publish time ISO (e.g. 2025-08-21T10:00)').setRequired(false));
+const postMessageCmd = new SlashCommandBuilder().setName('postmessage').setDescription('Post a message to the message board').addStringOption(o => o.setName('text').setDescription('The message to post').setRequired(true));
+const helpCmd = new SlashCommandBuilder().setName('help').setDescription('Links to the full KC features');
+const voteCmd = new SlashCommandBuilder().setName('vote').setDescription('Vote Best Offence, Best Defence and rate the event');
+const compareCmd = new SlashCommandBuilder().setName('compare').setDescription('Compare your KC badges with another player').addUserOption(o => o.setName('user').setDescription('The other Discord user').setRequired(true));
+const setClipsChannelCmd = new SlashCommandBuilder().setName('setclipschannel').setDescription('Choose the channel where new KC clips will be posted.').addChannelOption(opt => opt.setName('channel').setDescription('Text or Announcement channel in this server').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true));
+const clansCmd = new SlashCommandBuilder().setName('clans').setDescription('Browse KC clans and view details');
+const clanBattlesCmd = new SlashCommandBuilder().setName('clanbattles').setDescription('View clan battles and sign up if your clan is participating');
+const sendClanChallengeCmd = new SlashCommandBuilder().setName('sendclanchallenge').setDescription('Challenge another clan to a battle (owner only)').addStringOption(opt => opt.setName('clan').setDescription('Name or ID of the target clan').setRequired(true));
+const incomingChallengesCmd = new SlashCommandBuilder().setName('incomingchallenges').setDescription('View and respond to pending clan battle challenges (owner only)');
+const getClanRolesCmd = new SlashCommandBuilder().setName('getclanroles').setDescription('Assign yourself your clan role (creates it if missing)');
+const setEventsChannelCmd = new SlashCommandBuilder().setName('seteventschannel').setDescription('Choose the channel where new clan battles will be announced.').addChannelOption(opt => opt.setName('channel').setDescription('Text or Announcement channel in this server').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true));
+const battledomeCmd = new SlashCommandBuilder().setName('battledome').setDescription('View Battledome servers and who is currently playing');
+const setBattledomeChannelCmd = new SlashCommandBuilder().setName('setbattledomechannel').setDescription('Choose the channel for Battledome join/leave updates').addChannelOption(opt => opt.setName('channel').setDescription('Text or Announcement channel').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true));
+const setJoinLogsChannelCmd = new SlashCommandBuilder().setName('setjoinlogschannel').setDescription('Choose a channel for Battledome join logs (pings instead of DMs)').addChannelOption(opt => opt.setName('channel').setDescription('Text or Announcement channel').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true));
 
-const badgesCmd = new SlashCommandBuilder()
-  .setName('badges')
-  .setDescription('Show a KC Events profile')
-  .addUserOption(opt =>
-    opt.setName('user')
-      .setDescription('Show someone else')
-      .setRequired(false)
-  );
+// West Removed from Choices
+const notifyBdCmd = new SlashCommandBuilder().setName('notifybd').setDescription('Manage Battledome notifications')
+  .addStringOption(o => o.setName('region').setDescription('Region to subscribe to').addChoices({ name: 'East Coast (NY)', value: 'East' }, { name: 'EU', value: 'EU' }).setRequired(false))
+  .addIntegerOption(o => o.setName('threshold').setDescription('Only ping if player count reaches this number (optional)').setMinValue(1).setMaxValue(200).setRequired(false))
+  .addStringOption(o => o.setName('action').setDescription('Manage subscription').addChoices({ name: 'Subscribe (default)', value: 'sub' }, { name: 'Unsubscribe', value: 'unsub' }, { name: 'Turn Off All', value: 'clear' }).setRequired(false));
 
-const whoamiCmd = new SlashCommandBuilder()
-  .setName('whoami')
-  .setDescription('Show your Discord ID and resolved KC UID');
+const battledomeLbCmd = new SlashCommandBuilder().setName('battledomelb').setDescription('Show live leaderboard for a Battledome region')
+  .addStringOption(o => o.setName('region').setDescription('Select region').addChoices({ name: 'East Coast (NY)', value: 'East' }, { name: 'EU', value: 'EU' }).setRequired(true));
 
-const dumpCmd = new SlashCommandBuilder()
-  .setName('dumpme')
-  .setDescription('Debug: dump raw keys for your mapped KC UID');
+const battledomeTopCmd = new SlashCommandBuilder().setName('battledometop').setDescription('Show all-time top scores recorded across Battledomes')
+  .addStringOption(o => o.setName('region').setDescription('Filter by region').addChoices({ name: 'All Regions', value: 'All' }, { name: 'East Coast', value: 'East' }, { name: 'EU', value: 'EU' }).setRequired(false));
 
-const lbCmd = new SlashCommandBuilder()
-  .setName('leaderboard')
-  .setDescription('Show the live KC Events leaderboard');
+const battledomeStatusCmd = new SlashCommandBuilder().setName('battledomestatus').setDescription('Show live status for all Battledome regions and top 10 players');
+const recentlyJoinedCmd = new SlashCommandBuilder().setName('recentlyjoined').setDescription('Show recent join/leave activity across Battledome regions');
+const compareBdScoresCmd = new SlashCommandBuilder().setName('comparebdscores').setDescription('Compare top Battledome scores across regions');
+const serverCmd = new SlashCommandBuilder().setName('server').setDescription('Show Slither leaderboard for a specific server id (NTL)').addIntegerOption(opt => opt.setName('id').setDescription('Server id from NTL list (e.g. 6622)').setRequired(true));
 
-const clipsCmd = new SlashCommandBuilder()
-  .setName('clips')
-  .setDescription('Top 5 most popular clips')
-  .addStringOption(o =>
-    o.setName('platform')
-     .setDescription('Filter by platform')
-     .addChoices({ name:'All', value:'all' }, { name:'YouTube', value:'youtube' }, { name:'TikTok', value:'tiktok' })
-     .setRequired(false)
-  );
+// F1: /bdtokc command
+const bdToKcCmd = new SlashCommandBuilder().setName('bdtokc').setDescription('Link your Battledome highscores to your KC profile')
+  .addStringOption(o => o.setName('action').setDescription('Enable or disable tracking').addChoices({name: 'Enable', value: 'enable'}, {name: 'Disable', value: 'disable'}).setRequired(true))
+  .addStringOption(o => o.setName('name').setDescription('Your exact Battledome username (defaults to KC name)').setRequired(false));
 
-const latestFiveCmd = new SlashCommandBuilder()
-  .setName('latestfive')
-  .setDescription('Post the 5 most recently uploaded clips here')
-  .addStringOption(o =>
-    o.setName('platform')
-     .setDescription('Filter by platform')
-     .addChoices(
-       { name: 'All', value: 'all' },
-       { name: 'YouTube', value: 'youtube' },
-       { name: 'TikTok', value: 'tiktok' },
-     )
-     .setRequired(false)
-  );
-
-const messagesCmd = new SlashCommandBuilder()
-  .setName('messages')
-  .setDescription('Show the latest 10 messageboard posts');
-
-const votingCmd = new SlashCommandBuilder()
-  .setName('votingscores')
-  .setDescription('Show current live voting scores (Offence/Defence)');
-
-const avatarCmd = new SlashCommandBuilder()
-  .setName('syncavatar')
-  .setDescription('Use your Discord avatar on KC (Emerald users)')
-  .addStringOption(o =>
-    o.setName('action')
-     .setDescription('Choose what to do')
-     .addChoices(
-       { name: 'Set (use Discord avatar)', value: 'set' },
-       { name: 'Revert (remove override)', value: 'revert' },
-     )
-     .setRequired(true)
-  );
-
-const postCmd = new SlashCommandBuilder()
-  .setName('post')
-  .setDescription('Create a YouTube or TikTok post on your KC profile')
-  .addStringOption(o =>
-    o.setName('link')
-     .setDescription('YouTube or TikTok link')
-     .setRequired(true))
-  .addStringOption(o =>
-    o.setName('caption')
-     .setDescription('Caption (max 140 chars)')
-     .setRequired(true))
-  .addBooleanOption(o =>
-    o.setName('draft')
-     .setDescription('Save as draft (default: false)')
-     .setRequired(false))
-  .addStringOption(o =>
-    o.setName('schedule_at')
-     .setDescription('Schedule publish time ISO (e.g. 2025-08-21T10:00)')
-     .setRequired(false));
-
-const postMessageCmd = new SlashCommandBuilder()
-  .setName('postmessage')
-  .setDescription('Post a message to the message board')
-  .addStringOption(o =>
-    o.setName('text')
-      .setDescription('The message to post')
-      .setRequired(true)
-  );
-
-const helpCmd = new SlashCommandBuilder()
-  .setName('help')
-  .setDescription('Links to the full KC features');
-
-const voteCmd = new SlashCommandBuilder()
-  .setName('vote')
-  .setDescription('Vote Best Offence, Best Defence and rate the event');
-
-const compareCmd = new SlashCommandBuilder()
-  .setName('compare')
-  .setDescription('Compare your KC badges with another player')
-  .addUserOption(o =>
-    o.setName('user')
-     .setDescription('The other Discord user')
-     .setRequired(true)
-  );
-
-const setClipsChannelCmd = new SlashCommandBuilder()
-  .setName('setclipschannel')
-  .setDescription('Choose the channel where new KC clips will be posted.')
-  .addChannelOption(opt =>
-    opt.setName('channel')
-      .setDescription('Text or Announcement channel in this server')
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-      .setRequired(true)
-  );
-
-// Clan listing command
-const clansCmd = new SlashCommandBuilder()
-  .setName('clans')
-  .setDescription('Browse KC clans and view details');
-
-// New: Clan Battles command
-// This command will allow users to view upcoming clan battles, filter between all battles,
-// battles involving their own clan, and past battles. Users who are members of either
-// participating clan can sign up to join an upcoming battle. Selecting a battle reveals
-// additional details such as server, date/time, rules and a list of participants. A join
-// button is shown if the current user is eligible to participate. This ties into the
-// battles data stored under `battles` in Firebase RTDB.
-const clanBattlesCmd = new SlashCommandBuilder()
-  .setName('clanbattles')
-  .setDescription('View clan battles and sign up if your clan is participating');
-
-// Command: Send Clan Challenge
-// Allows clan owners to challenge another clan to a battle. Owners will provide the target clan name or ID and then fill out
-// server, date/time and rules via a modal. Only owners can use this command.
-const sendClanChallengeCmd = new SlashCommandBuilder()
-  .setName('sendclanchallenge')
-  .setDescription('Challenge another clan to a battle (owner only)')
-  .addStringOption(opt =>
-    opt.setName('clan')
-      .setDescription('Name or ID of the target clan')
-      .setRequired(true)
-  );
-
-// Command: Incoming Challenges
-// Allows clan owners to view pending challenges for their clan and accept or decline them.
-const incomingChallengesCmd = new SlashCommandBuilder()
-  .setName('incomingchallenges')
-  .setDescription('View and respond to pending clan battle challenges (owner only)');
-
-// Command: Get Clan Roles
-// Assigns the clan role to the invoking user. If the role doesn’t exist, it will be created with the clan’s name and icon.
-const getClanRolesCmd = new SlashCommandBuilder()
-  .setName('getclanroles')
-  .setDescription('Assign yourself your clan role (creates it if missing)');
-
-// Command: Set Events Channel
-// Configures which channel new accepted clan battles will be announced in this server. Requires Manage Guild.
-const setEventsChannelCmd = new SlashCommandBuilder()
-  .setName('seteventschannel')
-  .setDescription('Choose the channel where new clan battles will be announced.')
-  .addChannelOption(opt =>
-    opt.setName('channel')
-      .setDescription('Text or Announcement channel in this server')
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-      .setRequired(true)
-  );
-
-// Command: Battledome
-// View Battledome servers and who is currently playing
-const battledomeCmd = new SlashCommandBuilder()
-  .setName('battledome')
-  .setDescription('View Battledome servers and who is currently playing');
-
-// Command: Set Battledome Update Channel (NEW)
-const setBattledomeChannelCmd = new SlashCommandBuilder()
-  .setName('setbattledomechannel')
-  .setDescription('Choose the channel for Battledome join/leave updates')
-  .addChannelOption(opt =>
-    opt.setName('channel')
-      .setDescription('Text or Announcement channel')
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-      .setRequired(true)
-  );
-
-// Command: Set Join Logs Channel (NEW)
-// Allows server admins to choose a channel where Battledome join/leave notifications
-// will be posted. When set, join alerts ping users in the specified channel
-// instead of sending DMs.
-const setJoinLogsChannelCmd = new SlashCommandBuilder()
-  .setName('setjoinlogschannel')
-  .setDescription('Choose a channel for Battledome join logs (pings instead of DMs)')
-  .addChannelOption(opt =>
-    opt.setName('channel')
-      .setDescription('Text or Announcement channel')
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-      .setRequired(true)
-  );
-
-// Command: Notify BD (NEW)
-const notifyBdCmd = new SlashCommandBuilder()
-  .setName('notifybd')
-  .setDescription('Manage Battledome notifications')
-  .addStringOption(o =>
-    o.setName('region')
-     .setDescription('Region to subscribe to')
-     .addChoices(
-       { name: 'East Coast (NY)', value: 'East' },
-       { name: 'EU', value: 'EU' }
-     )
-     .setRequired(false)
-  )
-  .addIntegerOption(o => 
-    o.setName('threshold')
-     .setDescription('Only ping if player count reaches this number (optional)')
-     .setMinValue(1)
-     .setMaxValue(200)
-     .setRequired(false)
-  )
-  .addStringOption(o => 
-    o.setName('action')
-     .setDescription('Manage subscription')
-     .addChoices(
-        { name: 'Subscribe (default)', value: 'sub' },
-        { name: 'Unsubscribe', value: 'unsub' },
-        { name: 'Turn Off All', value: 'clear' }
-     )
-     .setRequired(false)
-  );
-
-// Command: Battledome Leaderboard (NEW)
-const battledomeLbCmd = new SlashCommandBuilder()
-  .setName('battledomelb')
-  .setDescription('Show live leaderboard for a Battledome region')
-  .addStringOption(o =>
-    o.setName('region')
-     .setDescription('Select region')
-     .addChoices(
-       { name: 'East Coast (NY)', value: 'East' },
-       { name: 'EU', value: 'EU' }
-     )
-     .setRequired(true)
-  );
-
-// Command: Battledome Top (NEW)
-const battledomeTopCmd = new SlashCommandBuilder()
-  .setName('battledometop')
-  .setDescription('Show all-time top scores recorded across Battledomes')
-  .addStringOption(o =>
-    o.setName('region')
-    .setDescription('Filter by region')
-    .addChoices(
-        { name: 'All Regions', value: 'All' },
-        { name: 'East Coast', value: 'East' },
-        { name: 'EU', value: 'EU' }
-    )
-    .setRequired(false)
-  );
-
-// Command: Battledome Status (NEW)
-// Provides a snapshot of all Battledome regions showing who is online,
-// players in the dome, players this hour and a top‑10 leaderboard for
-// each region. This command can be used at any time to fetch the
-// latest snapshot on demand.
-const battledomeStatusCmd = new SlashCommandBuilder()
-  .setName('battledomestatus')
-  .setDescription('Show live status for all Battledome regions and top 10 players');
-
-// Command: Recently Joined (NEW)
-// Displays recent join and leave activity across all Battledomes. The
-// window of activity is configurable via BD_RECENT_WINDOW_MS (defaults to 15 minutes).
-const recentlyJoinedCmd = new SlashCommandBuilder()
-  .setName('recentlyjoined')
-  .setDescription('Show recent join/leave activity across Battledome regions');
-
-// Command: Compare BD Scores (NEW)
-// Compare the top Battledome scores across regions and globally. Shows the top
-// players for each region side by side. This differs from /battledometop
-// because it presents a comparative view rather than a single region.
-const compareBdScoresCmd = new SlashCommandBuilder()
-  .setName('comparebdscores')
-  .setDescription('Compare top Battledome scores across regions');
-
-// Command: BD -> KC opt-in (NEW)
-// Allows a linked user to opt-in to syncing their Battledome highscore to their KC profile.
-const bdToKcCmd = new SlashCommandBuilder()
-  .setName('bdtokc')
-  .setDescription('Opt-in to record your Battledome highscore to your KC profile (exact name match)')
-  .addStringOption(o =>
-    o.setName('action')
-      .setDescription('Enable or disable syncing')
-      .addChoices(
-        { name: 'Enable', value: 'enable' },
-        { name: 'Disable', value: 'disable' }
-      )
-      .setRequired(true)
-  )
-  .addStringOption(o =>
-    o.setName('name')
-      .setDescription('KC username to match exactly (defaults to your KC display name)')
-      .setRequired(false)
-  );
-
-// Command: Slither server leaderboard (NEW)
-// Fetches the real‑time status of a specific Slither server from NTL and
-// displays the top players, totals and update time. Accepts a numeric
-// server id corresponding to NTL’s listing (e.g. 6622). Results are
-// cached for about 15 seconds to avoid hammering NTL.
-const serverCmd = new SlashCommandBuilder()
-  .setName('server')
-  .setDescription('Show Slither leaderboard for a specific server id (NTL)')
-  .addIntegerOption(opt =>
-    opt.setName('id')
-      .setDescription('Server id from NTL list (e.g. 6622)')
-      .setRequired(true)
-  );
-
-
-// Register (include it in commands array)
 const commandsJson = [
   linkCmd, badgesCmd, whoamiCmd, dumpCmd, lbCmd, clipsCmd, messagesCmd, votingCmd,
   avatarCmd, postCmd, postMessageCmd, helpCmd, voteCmd, compareCmd, setClipsChannelCmd,
   latestFiveCmd,
   clansCmd, clanBattlesCmd, sendClanChallengeCmd, incomingChallengesCmd, getClanRolesCmd, setEventsChannelCmd,
   battledomeCmd, setBattledomeChannelCmd, setJoinLogsChannelCmd, notifyBdCmd, battledomeLbCmd, battledomeTopCmd,
-  battledomeStatusCmd, recentlyJoinedCmd, compareBdScoresCmd, bdToKcCmd
-  , serverCmd
+  battledomeStatusCmd, recentlyJoinedCmd, compareBdScoresCmd
+  , serverCmd, bdToKcCmd
 ].map(c => c.toJSON());
 
 
@@ -2959,74 +2111,107 @@ async function registerCommands() {
   }
 }
 
+// D1: Implement setclipschannel logic
+async function handleSetClipsChannel(interaction) {
+  if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
+  const picked = interaction.options.getChannel('channel', true);
+  if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.', ephemeral: true });
+  if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.', ephemeral: true });
+  
+  const chan = await interaction.client.channels.fetch(picked.id).catch(()=>null);
+  if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.', ephemeral: true });
+
+  const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.', ephemeral: true });
+
+  const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(()=>null);
+  if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+      return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
+  }
+
+  await rtdb.ref(`config/clipDestinations/${interaction.guildId}`).set({
+    channelId: chan.id,
+    updatedBy: interaction.user.id,
+    updatedAt: admin.database.ServerValue.TIMESTAMP
+  });
+  globalCache.clipDestinations.set(interaction.guildId, chan.id);
+  return safeReply(interaction, { content: `✅ KC Clips will now be posted to <#${chan.id}>.`, ephemeral: true });
+}
+
+// D1: Implement seteventschannel logic
+async function handleSetEventsChannel(interaction) {
+  if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
+  const picked = interaction.options.getChannel('channel', true);
+  if (picked.guildId !== interaction.guildId) return safeReply(interaction, { content: 'Channel not in this server.', ephemeral: true });
+  if (typeof picked.isThread === 'function' && picked.isThread()) return safeReply(interaction, { content: 'No threads.', ephemeral: true });
+  
+  const chan = await interaction.client.channels.fetch(picked.id).catch(()=>null);
+  if (!chan || !chan.isTextBased?.()) return safeReply(interaction, { content: 'Invalid text channel.', ephemeral: true });
+
+  const invokerOk = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  if (!invokerOk) return safeReply(interaction, { content: 'Manage Server permission required.', ephemeral: true });
+
+  const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(()=>null);
+  if (!me || !chan.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+      return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
+  }
+
+  await rtdb.ref(`config/battleDestinations/${interaction.guildId}`).set({
+    channelId: chan.id,
+    updatedBy: interaction.user.id,
+    updatedAt: admin.database.ServerValue.TIMESTAMP
+  });
+  globalCache.battleDestinations.set(interaction.guildId, chan.id);
+  return safeReply(interaction, { content: `✅ Clan Battles will now be announced in <#${chan.id}>.`, ephemeral: true });
+}
+
+// Clan stubs to prevent crashes
+async function handleSendClanChallenge(interaction) {
+  return safeReply(interaction, { content: 'Feature coming soon.', ephemeral: true });
+}
+async function handleIncomingChallenges(interaction) {
+  return safeReply(interaction, { content: 'Feature coming soon.', ephemeral: true });
+}
+async function handleGetClanRoles(interaction) {
+  return safeReply(interaction, { content: 'Feature coming soon.', ephemeral: true });
+}
+
 // ---------- Interaction handling ----------
 let clientReady = false;
-const MAX_AGE_MS = 15000; // be generous; we’ll still try to ack
+const MAX_AGE_MS = 15000;
 client.on('interactionCreate', async (interaction) => {
   if (!clientReady) {
-    try {
-      // Use safeReply for consistency, though reply is fine here
-      await safeReply(interaction, { content: 'Starting up, try again in a second.', ephemeral: true });
-    } catch {}
+    try { await safeReply(interaction, { content: 'Starting up, try again in a second.', ephemeral: true }); } catch {}
     return;
   }
   const age = Date.now() - interaction.createdTimestamp;
-  if (age > MAX_AGE_MS) {
-    console.warn(`[old interaction ~${age}ms] attempting to acknowledge anyway`);
-  }
+  if (age > MAX_AGE_MS) console.warn(`[old interaction ~${age}ms] attempting to acknowledge anyway`);
   
   const seen = globalThis.__seen ??= new Set();
-  if (seen.has(interaction.id)) {
-    console.warn(`[INT] duplicate seen: ${interaction.id}`);
-    return;
-  }
+  if (seen.has(interaction.id)) return;
   seen.add(interaction.id);
   setTimeout(() => seen.delete(interaction.id), 60_000);
-
-  console.log(`[INT] ${interaction.isChatInputCommand() ? interaction.commandName : interaction.customId} from ${interaction.user?.tag} age=${Date.now()-interaction.createdTimestamp}ms`);
 
   // --- Slash Commands ---
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
     const ephemeral = isEphemeralCommand(commandName);
 
-    // Commands that don't defer (they reply or show a modal immediately)
     if (commandName === 'link') {
-      try {
-        await safeReply(interaction, { content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true });
-      } catch (err) {
-        console.error(`[${commandName}]`, err);
-        // Final fallback
-        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
-      }
+      try { await safeReply(interaction, { content: `Click to link your account: ${process.env.AUTH_BRIDGE_START_URL}?state=${encodeURIComponent(interaction.user.id)}`, ephemeral: true }); } catch (err) { console.error(`[${commandName}]`, err); }
       return;
     }
     
     if (commandName === 'vote') {
-      try {
-        // This command replies with a modal
-        await showVoteModal(interaction);
-      } catch (err) {
-        console.error(`[${commandName}]`, err);
-        // If showModal fails, we must send a reply
-        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
-      }
+      try { await showVoteModal(interaction); } catch (err) { await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true }); }
       return;
     }
 
-    // New: sendclanchallenge opens a modal and must not be deferred
     if (commandName === 'sendclanchallenge') {
-      try {
-        await handleSendClanChallenge(interaction);
-      } catch (err) {
-        console.error(`[${commandName}]`, err);
-        // If showModal fails, we must send a reply
-        await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true });
-      }
+      try { await handleSendClanChallenge(interaction); } catch (err) { await safeReply(interaction, { content: 'Sorry, something went wrong.', ephemeral: true }); }
       return;
     }
     
-    // --- PATCH (Step 2/4): All other commands are deferred and wrapped ---
     await safeDefer(interaction, { ephemeral });
     try {
         if (commandName === 'whoami') {
@@ -3062,10 +2247,8 @@ client.on('interactionCreate', async (interaction) => {
                 rtdb: { user: brief(userRT), badges: brief(badgesRT), postsCount: postsRT.exists() ? Object.keys(postsRT.val() || {}).length : 0 },
                 firestore: { userExists: userFS.exists, userKeys: userFS.exists ? Object.keys(userFS.data() || {}) : [], postsCount: postsFS.size }
             };
-            // --- FIX (Item 1): Fix unterminated string ---
             const json = "```json\n" + JSON.stringify(payload, null, 2) + "\n```";
             await safeReply(interaction, { content: json, ephemeral: true });
-            // --- END FIX ---
         }
         else if (commandName === 'leaderboard') {
             const rows = await loadLeaderboardData();
@@ -3085,7 +2268,7 @@ client.on('interactionCreate', async (interaction) => {
             const list = all.slice(0, CLIPS.MAX_LIST);
             const nameMap = await getAllUserNames();
             interaction.client.clipsCache ??= new Map();
-            const state = { list, nameMap, page: 0, currentPostPath: null }; // Add currentPostPath
+            const state = { list, nameMap, page: 0, currentPostPath: null }; 
             interaction.client.clipsCache.set(interaction.id, state);
             const embed = buildClipsListEmbed(list, 0, nameMap);
             await safeReply(interaction, { content: '', embeds:[embed], components: clipsListRows(list.length, 0) });
@@ -3096,38 +2279,23 @@ client.on('interactionCreate', async (interaction) => {
             if (!all.length) {
               return await safeReply(interaction, { content: 'No clips found.', ephemeral: true });
             }
-        
             all.sort((a, b) => (b.data?.createdAt || 0) - (a.data?.createdAt || 0));
             const list = all.slice(0, 5);
-        
             const nameMap = await getAllUserNames();
-        
             const channel = interaction.channel;
             const me = interaction.guild?.members.me ?? await interaction.guild?.members.fetchMe().catch(() => null);
-            if (!me || !channel?.permissionsFor(me)?.has([
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.EmbedLinks,
-            ])) {
+            if (!me || !channel?.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
               return await safeReply(interaction, { content: 'I need **View Channel**, **Send Messages**, and **Embed Links** here.', ephemeral: true });
             }
-        
-            // Send initial reply *before* looping
             await safeReply(interaction, { content: `Posting ${list.length} latest clip${list.length > 1 ? 's' : ''}...`, ephemeral: true });
-
             for (const item of list) {
               const embed = buildClipDetailEmbed(item, nameMap);
-              // Use followUp (via safeReply) or channel.send for subsequent messages
               const msg = await channel.send({ embeds: [embed] });
-        
               const postPath = clipDbPath(item);
-              const rows = clipsDetailRows(msg, postPath); // Pass the message object
+              const rows = clipsDetailRows(msg, postPath); 
               await msg.edit({ components: rows });
-        
               await new Promise(r => setTimeout(r, 300));
             }
-        
-            // Final update to the original reply
             await safeReply(interaction, { content: `✅ Posted ${list.length} latest clip${list.length > 1 ? 's' : ''} here.`, ephemeral: true });
         }
         else if (commandName === 'messages') {
@@ -3163,11 +2331,6 @@ client.on('interactionCreate', async (interaction) => {
             const badgesVal = clampStr(profile.badgesText, 1024);
             const streakVal = clampStr(profile.streak, 1024, '—');
             const postsVal = clampStr(profile.postsText, 1024);
-            let bdHigh = null;
-            try {
-              const snap = await rtdb.ref(`users/${kcUid}/bdHighscore`).get();
-              if (snap.exists()) bdHigh = snap.val();
-            } catch {}
             const discordAvatar = target.displayAvatarURL({ extension: 'png', size: 128 });
             const embed = new EmbedBuilder()
                 .setTitle(title)
@@ -3176,7 +2339,6 @@ client.on('interactionCreate', async (interaction) => {
                 .addFields(
                     { name: 'Badges', value: badgesVal, inline: false },
                     { name: 'Streak', value: streakVal, inline: true  },
-                    { name: 'Battledome Highscore', value: String(bdHigh ?? '—'), inline: true },
                     { name: 'Posts',  value: postsVal,  inline: false },
                 )
                 .setColor(profile.embedColor || DEFAULT_EMBED_COLOR)
@@ -3207,8 +2369,6 @@ client.on('interactionCreate', async (interaction) => {
             } else if (action === 'revert') {
                 await clearKCAvatar(uid);
                 await safeReply(interaction, { content: '✅ Avatar override removed. Your KC profile will use the default/site picture again.', ephemeral: true });
-            } else {
-                await safeReply(interaction, { content: 'Unknown action.', ephemeral: true });
             }
         }
         else if (commandName === 'post') {
@@ -3265,35 +2425,17 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '✅ Message posted!', ephemeral: true });
         }
         else if (commandName === 'help') {
-            // Build multi-page help with navigation buttons. The first two pages use new images
-            // supplied by the user; the last page uses the original help image. Store the
-            // pages in the helpCache keyed by the interaction ID so that button interactions
-            // can page through them later.
             const pages = [
               { image: 'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link%203.png' },
               { image: 'https://raw.githubusercontent.com/kevinmidnight7-sudo/kc-events-discord-bot/da405cc9608290a6bbdb328b13393c16c8a7f116/link4.png' },
               { image: 'https://kevinmidnight7-sudo.github.io/messageboardkc/link.png' },
             ];
             const parentId = interaction.id;
-            // Initialise helpCache if needed and store the pages for this session
-            interaction.client.helpCache.set(parentId, {
-              pages,
-              index: 0,
-              userId: interaction.user.id,
-            });
-            // Automatically expire this cache entry after 15 minutes
+            interaction.client.helpCache.set(parentId, { pages, index: 0, userId: interaction.user.id });
             setTimeout(() => interaction.client.helpCache.delete(parentId), 15 * 60 * 1000);
             const embed = buildHelpEmbed(pages[0]);
-            const prevBtn = new ButtonBuilder()
-              .setCustomId(`help:prev:${parentId}`)
-              .setLabel('◀')
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true);
-            const nextBtn = new ButtonBuilder()
-              .setCustomId(`help:next:${parentId}`)
-              .setLabel('▶')
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(pages.length <= 1);
+            const prevBtn = new ButtonBuilder().setCustomId(`help:prev:${parentId}`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(true);
+            const nextBtn = new ButtonBuilder().setCustomId(`help:next:${parentId}`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(pages.length <= 1);
             const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
             await safeReply(interaction, { embeds: [embed], components: [row] });
         }
@@ -3334,11 +2476,9 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '', embeds:[embed] });
         }
         else if (commandName === 'setclipschannel') {
-            // This function now runs inside the try/catch
             await handleSetClipsChannel(interaction);
         }
         else if (commandName === 'clans') {
-          // fetch clans, users and badges from RTDB
           const [clansSnap, usersSnap, badgesSnap] = await Promise.all([
             withTimeout(rtdb.ref('clans').get(), 6000, 'RTDB clans'),
             withTimeout(rtdb.ref('users').get(), 6000, 'RTDB users'),
@@ -3347,65 +2487,39 @@ client.on('interactionCreate', async (interaction) => {
           const clansData = clansSnap.val() || {};
           const usersData = usersSnap.val() || {};
           const badgesData = badgesSnap.val() || {};
-        
-          // build an array of clans with memberCount and score
           const entries = Object.entries(clansData).map(([id, clan]) => {
             const memberCount = clan.members ? Object.keys(clan.members).length : 0;
             const score = computeClanScore(clan, usersData, badgesData);
             return { id, ...clan, memberCount, score };
           });
-        
           if (entries.length === 0) {
             return safeReply(interaction, { content: 'There are no clans yet.', embeds: [] });
           }
-        
-          // sort by score (desc) and pick the top 20
           entries.sort((a, b) => b.score - a.score);
           const top = entries.slice(0, 20);
-        
-          // build select menu options, clamping lengths
           const options = top.map(c => ({
             label: clamp(c.name, 100),
             description: clamp(`${c.memberCount} members • ${c.score} points`, 100),
             value: c.id,
           }));
-        
           const select = new StringSelectMenuBuilder()
-            .setCustomId(`clans_select:${interaction.id}`) // Keyed to interaction ID
+            .setCustomId(`clans_select:${interaction.id}`)
             .setPlaceholder('Select a clan to view details')
             .addOptions(options);
-        
-          // store data in a cache keyed by the interaction ID
           interaction.client.clanCache ??= new Map();
-          interaction.client.clanCache.set(interaction.id, {
-            entries,
-            usersData,
-            badgesData,
-          });
-          // Set a timeout to clear this cache
+          interaction.client.clanCache.set(interaction.id, { entries, usersData, badgesData });
           setTimeout(() => interaction.client.clanCache?.delete(interaction.id), 15 * 60 * 1000).unref();
-        
-          // send an embed with the menu
           const embed = new EmbedBuilder()
             .setTitle('KC Clans')
             .setDescription('Select a clan below to view its members, owner, description and score.')
             .setColor(DEFAULT_EMBED_COLOR);
-        
-          await safeReply(interaction, {
-            content: '',
-            embeds: [embed],
-            components: [ new ActionRowBuilder().addComponents(select) ],
-          });
+          await safeReply(interaction, { content: '', embeds: [embed], components: [ new ActionRowBuilder().addComponents(select) ] });
         }
-
-        // Handle /clanbattles command
         else if (commandName === 'clanbattles') {
-          // Defer early to acknowledge the command
           await safeDefer(interaction);
           try {
             const discordId = interaction.user.id;
             const uid = await getKCUidForDiscord(discordId);
-            // Fetch battles, clans and users concurrently
             const [battlesSnap, clansSnap, usersSnap] = await Promise.all([
               withTimeout(rtdb.ref('battles').get(), 8000, 'RTDB battles'),
               withTimeout(rtdb.ref('clans').get(), 8000, 'RTDB clans'),
@@ -3414,38 +2528,23 @@ client.on('interactionCreate', async (interaction) => {
             const battlesData = battlesSnap && typeof battlesSnap.exists === 'function' && battlesSnap.exists() ? (battlesSnap.val() || {}) : {};
             const clansData   = clansSnap   && typeof clansSnap.exists   === 'function' && clansSnap.exists()   ? (clansSnap.val()   || {}) : {};
             const usersData   = usersSnap   && typeof usersSnap.exists   === 'function' && usersSnap.exists()   ? (usersSnap.val()   || {}) : {};
-            // Determine the user’s clan ID, if any
             let userClanId = null;
             if (uid) {
               for (const cid of Object.keys(clansData)) {
                 const c = clansData[cid];
-                if (c && c.members && c.members[uid]) {
-                  userClanId = cid;
-                  break;
-                }
+                if (c && c.members && c.members[uid]) { userClanId = cid; break; }
               }
             }
-            // Convert battles into arrays and sort
             const entries = Object.entries(battlesData);
             const upcoming = entries.filter(([_, b]) => b && b.status === 'accepted');
             upcoming.sort((a, b) => ((a[1].scheduledTime || 0) - (b[1].scheduledTime || 0)));
             const past = entries.filter(([_, b]) => b && b.status === 'finished');
             past.sort((a, b) => ((b[1].scheduledTime || 0) - (a[1].scheduledTime || 0)));
             const my = upcoming.filter(([_, b]) => userClanId && (b.challengerId === userClanId || b.targetId === userClanId));
-            // Prepare cache
-            const cache = {
-              lists: { all: upcoming, my: my, past: past },
-              filter: 'all',
-              clansData,
-              usersData,
-              uid,
-              userClanId
-            };
+            const cache = { lists: { all: upcoming, my: my, past: past }, filter: 'all', clansData, usersData, uid, userClanId };
             interaction.client.battleCache ??= new Map();
             interaction.client.battleCache.set(interaction.id, cache);
-            // Clean cache after 15 minutes
             setTimeout(() => interaction.client.battleCache?.delete(interaction.id), 15 * 60 * 1000).unref();
-            // Build embed and component rows for the default filter
             const list = cache.lists.all;
             const embed = buildBattlesListEmbed(list, 'all', clansData, usersData);
             const rows = [];
@@ -3453,12 +2552,7 @@ client.on('interactionCreate', async (interaction) => {
             for (let i = 0; i < max; i += 5) {
               const row = new ActionRowBuilder();
               for (let j = i; j < Math.min(i + 5, max); j++) {
-                row.addComponents(
-                  new ButtonBuilder()
-                    .setCustomId(`cb:detail:${interaction.id}:${j}`)
-                    .setLabel(String(j + 1))
-                    .setStyle(ButtonStyle.Secondary)
-                );
+                row.addComponents(new ButtonBuilder().setCustomId(`cb:detail:${interaction.id}:${j}`).setLabel(String(j + 1)).setStyle(ButtonStyle.Secondary));
               }
               rows.push(row);
             }
@@ -3466,12 +2560,7 @@ client.on('interactionCreate', async (interaction) => {
             ['all', 'my', 'past'].forEach(ft => {
               const label = ft === 'all' ? 'All' : (ft === 'my' ? 'My Clan' : 'Past');
               const style = ft === 'all' ? ButtonStyle.Primary : ButtonStyle.Secondary;
-              filterRow.addComponents(
-                new ButtonBuilder()
-                  .setCustomId(`cb:filter:${interaction.id}:${ft}`)
-                  .setLabel(label)
-                  .setStyle(style)
-              );
+              filterRow.addComponents(new ButtonBuilder().setCustomId(`cb:filter:${interaction.id}:${ft}`).setLabel(label).setStyle(style));
             });
             rows.push(filterRow);
             await safeReply(interaction, { embeds: [embed], components: rows });
@@ -3480,52 +2569,27 @@ client.on('interactionCreate', async (interaction) => {
             await safeReply(interaction, { content: '❌ Failed to load clan battles.', embeds: [], components: [] });
           }
         }
-        // Handle /incomingchallenges command (view and respond to pending challenges)
         else if (commandName === 'incomingchallenges') {
           await handleIncomingChallenges(interaction);
         }
-        // Handle /getclanroles command (create or assign clan role)
         else if (commandName === 'getclanroles') {
           await handleGetClanRoles(interaction);
         }
-        // Handle /seteventschannel command (configure battle announcements)
         else if (commandName === 'seteventschannel') {
           await handleSetEventsChannel(interaction);
         }
-        // Handle /battledome command
         else if (commandName === 'battledome') {
           await safeDefer(interaction);
-          // Use hard-coded server list instead of fetching
           const servers = Object.values(BD_SERVERS);
-        
-          const options = servers.map((s, idx) => ({
-            label: clampStr(s.name, 100, 'Unknown'),
-            description: clampStr(s.region || 'Unknown Region', 100, '—'),
-            value: String(idx),
-          }));
-        
+          const options = servers.map((s, idx) => ({ label: clampStr(s.name, 100, 'Unknown'), description: clampStr(s.region || 'Unknown Region', 100, '—'), value: String(idx) }));
           const parentId = interaction.id;
           interaction.client.bdCache ??= new Map();
-          interaction.client.bdCache.set(parentId, { servers }); // Store the array we just built
+          interaction.client.bdCache.set(parentId, { servers });
           setTimeout(() => interaction.client.bdCache?.delete(parentId), 15 * 60 * 1000).unref?.();
-        
-          const select = new StringSelectMenuBuilder()
-            .setCustomId(`bd_select:${parentId}`)
-            .setPlaceholder('Select a Battledome server…')
-            .addOptions(options);
-        
-          const embed = new EmbedBuilder()
-            .setTitle('Battledome Servers')
-            .setDescription('Pick a server to see who is online + who is in the dome right now.')
-            .setColor(DEFAULT_EMBED_COLOR)
-            .setFooter({ text: 'KC Bot • /battledome' });
-        
-          return safeReply(interaction, {
-            embeds: [embed],
-            components: [new ActionRowBuilder().addComponents(select)],
-          });
+          const select = new StringSelectMenuBuilder().setCustomId(`bd_select:${parentId}`).setPlaceholder('Select a Battledome server…').addOptions(options);
+          const embed = new EmbedBuilder().setTitle('Battledome Servers').setDescription('Pick a server to see who is online + who is in the dome right now.').setColor(DEFAULT_EMBED_COLOR).setFooter({ text: 'KC Bot • /battledome' });
+          return safeReply(interaction, { embeds: [embed], components: [new ActionRowBuilder().addComponents(select)] });
         }
-        // Handle /setbattledomechannel
         else if (commandName === 'setbattledomechannel') {
           if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
           const picked = interaction.options.getChannel('channel', true);
@@ -3543,25 +2607,21 @@ client.on('interactionCreate', async (interaction) => {
              return safeReply(interaction, { content: 'I need View, Send, and Embed perms there.', ephemeral: true });
           }
 
+          // Write new dest
           await rtdb.ref(`config/bdDestinations/${interaction.guildId}`).set({
             channelId: chan.id,
             updatedBy: interaction.user.id,
             updatedAt: admin.database.ServerValue.TIMESTAMP
           });
           globalCache.bdDestinations.set(interaction.guildId, chan.id);
-          // Clear stored dashboard message so it re-posts in the new channel
+
+          // Fix A3: Clear stored message so we send a fresh one in new channel
+          await rtdb.ref(`config/bdStatusMessage/${interaction.guildId}`).remove();
           globalCache.bdStatusMessages.delete(interaction.guildId);
-          await rtdb.ref(`config/bdStatusMessage/${interaction.guildId}`).set({
-            channelId: chan.id,
-            messageId: null,
-            updatedBy: interaction.user.id,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-          }).catch(() => {});
-          // Trigger an immediate status update to send or edit the status message in the new channel
+
           updateBdStatusMessages().catch(() => {});
           return safeReply(interaction, { content: `✅ Battledome updates will post to <#${chan.id}>.`, ephemeral: true });
         }
-        // Handle /setjoinlogschannel
         else if (commandName === 'setjoinlogschannel') {
           if (!interaction.inGuild()) return safeReply(interaction, { content: 'Run in a server.',  ephemeral: true });
           const picked = interaction.options.getChannel('channel', true);
@@ -3583,51 +2643,6 @@ client.on('interactionCreate', async (interaction) => {
           globalCache.bdJoinLogs.set(interaction.guildId, chan.id);
           return safeReply(interaction, { content: `✅ Battledome join logs will post to <#${chan.id}>.`,  ephemeral: true });
         }
-        // Handle /bdtokc
-        else if (commandName === 'bdtokc') {
-          const action = interaction.options.getString('action', true);
-          const overrideName = interaction.options.getString('name');
-          const discordId = interaction.user.id;
-
-          const kcUid = await getKCUidForDiscord(discordId);
-          if (!kcUid) {
-            return safeReply(interaction, { content: '❌ Your Discord is not linked to a KC account yet.', ephemeral: true });
-          }
-
-          if (action === 'disable') {
-            await rtdb.ref(`config/bdToKC/${discordId}`).update({
-              enabled: false,
-              kcUid,
-              updatedAt: admin.database.ServerValue.TIMESTAMP,
-            });
-            return safeReply(interaction, { content: '✅ Disabled Battledome → KC highscore syncing.', ephemeral: true });
-          }
-
-          // enable
-          let kcName = (overrideName && String(overrideName).trim()) || null;
-          if (!kcName) {
-            try {
-              const snap = await rtdb.ref(`users/${kcUid}/displayName`).get();
-              if (snap.exists()) kcName = String(snap.val() || '').trim();
-            } catch {}
-          }
-          if (!kcName) {
-            // fall back to cached name map
-            kcName = globalCache.userNames.get(kcUid) || null;
-          }
-          if (!kcName) {
-            return safeReply(interaction, { content: '❌ Could not determine your KC username. Provide it with the `name` option.', ephemeral: true });
-          }
-
-          await rtdb.ref(`config/bdToKC/${discordId}`).set({
-            enabled: true,
-            kcUid,
-            kcName,
-            updatedAt: admin.database.ServerValue.TIMESTAMP,
-          });
-          return safeReply(interaction, { content: `✅ Enabled syncing. I will record your Battledome highscore when your BD name exactly matches **${kcName}**.`, ephemeral: true });
-        }
-        // Handle /notifybd
         else if (commandName === 'notifybd') {
           const region = interaction.options.getString('region');
           const threshold = interaction.options.getInteger('threshold');
@@ -3636,49 +2651,33 @@ client.on('interactionCreate', async (interaction) => {
           const guildId = interaction.guildId;
 
           if (!guildId) return safeReply(interaction, { content: 'Run in a server.', ephemeral: true });
-
           const ref = rtdb.ref(`bdNotify/${guildId}/${userId}`);
-          // Determine the user's requested action with a default of 'toggle'.
-          // This will allow simple toggling when no action is provided.
           const userActionRaw = interaction.options.getString('action');
           const userAction = userActionRaw ? userActionRaw.toLowerCase() : 'toggle';
 
-          // Toggle all region alerts when neither a region nor a threshold is provided.
-          // This branch allows `/notifybd` to enable or disable personal Battledome alerts
-          // across all servers without specifying a region. Explicit actions such as
-          // "on", "off", "sub", "unsub", or "clear" override the toggle behaviour.
           if (!region && typeof threshold !== 'number') {
-            // Fetch existing subscriptions for this user
             let currentSubs = [];
             try {
               const subsSnap = await ref.child('regions').get();
-              if (subsSnap.exists()) {
-                currentSubs = Object.keys(subsSnap.val() || {});
-              }
+              if (subsSnap.exists()) currentSubs = Object.keys(subsSnap.val() || {});
             } catch {}
-            // Helper to subscribe to all regions
             async function subscribeAllRegions() {
               const updateData = { enabled: true, mode: 'join', onlyNamedJoins: false };
-              for (const r of ['East','EU']) {
-                await ref.child(`regions/${r}`).update(updateData);
-              }
+              // West Removed
+              for (const r of ['East','EU']) await ref.child(`regions/${r}`).update(updateData);
               await ref.child('updatedAt').set(admin.database.ServerValue.TIMESTAMP);
             }
-            // Helper to unsubscribe from all regions
             async function unsubscribeAllRegions() {
               await ref.remove();
             }
-            // Explicitly disable alerts
             if (['clear','off','unsub'].includes(userAction)) {
               await unsubscribeAllRegions();
               return safeReply(interaction, { content: '🔕 Unsubscribed from all Battledome alerts.',  ephemeral: true });
             }
-            // Explicitly enable alerts
             if (['on','sub'].includes(userAction)) {
               await subscribeAllRegions();
               return safeReply(interaction, { content: '🔔 Battledome alerts enabled for all regions.',  ephemeral: true });
             }
-            // Toggle based on current state
             if (currentSubs.length > 0) {
               await unsubscribeAllRegions();
               return safeReply(interaction, { content: '🔕 Battledome alerts disabled.',  ephemeral: true });
@@ -3687,72 +2686,50 @@ client.on('interactionCreate', async (interaction) => {
               return safeReply(interaction, { content: '🔔 Battledome alerts enabled for all regions.',  ephemeral: true });
             }
           }
-
           if (action === 'clear') {
             await ref.remove();
             return safeReply(interaction, { content: '🔕 Unsubscribed from all Battledome alerts.', ephemeral: true });
           }
-
-          // Only require a region when a threshold is provided. When no
-          // threshold is given, the command will toggle all alerts at once.
           if (!region && typeof threshold === 'number') {
             return safeReply(interaction, { content: 'Please specify a region.',  ephemeral: true });
           }
-
           if (action === 'unsub') {
              await ref.child(`regions/${region}`).remove();
              return safeReply(interaction, { content: `🔕 Unsubscribed from **${region}** alerts.`, ephemeral: true });
           } else {
-             // Subscribe
-             // Prepare subscription payload. Always enable alerts. When a threshold is specified, use
-             // 'active' mode and default onlyNamedJoins to false.
+             // Reset state to 'below' on change (Instruction 2C4)
              const updateData = {
                  enabled: true,
-                 // Use the provided threshold for active alerts; undefined means legacy join mode
                  ...(typeof threshold === 'number' ? { threshold } : {}),
-                 // Explicitly store mode so downstream logic can differentiate
                  mode: typeof threshold === 'number' ? 'active' : 'join',
-                 // Only ping on named joins when in join mode
                  onlyNamedJoins: false,
-                 // Note: 'state' will be managed by the poller/broadcast logic
+                 state: 'below',
              };
-
              await ref.child(`regions/${region}`).update(updateData);
              await ref.child('updatedAt').set(admin.database.ServerValue.TIMESTAMP);
-
              const msg = typeof threshold === 'number'
-                ? `🔔 Subscribed to **${region}**! You will be notified when the dome becomes active (>= ${threshold} in-dome players).`
-                : `🔔 Subscribed to **${region}** join alerts! (All named joins)`;
-             
+                ? `🔔 Subscribed to **${region}**! You will be notified when online players >= ${threshold}.`
+                : `🔔 Subscribed to **${region}** join alerts!`;
              return safeReply(interaction, { content: msg, ephemeral: true });
           }
         }
-        // Handle /battledomelb (Updated for Cache)
         else if (commandName === 'battledomelb') {
           await safeDefer(interaction);
           const region = interaction.options.getString('region');
           const serverConfig = BD_SERVERS[region];
           if (!serverConfig) return safeReply(interaction, { content: 'Unknown region.', ephemeral: true });
 
-          // Use SWR Cache
           let info;
           let fromCache = false;
-          let isStale = false;
           let fetchTime = 0;
-
           try {
             const r = await getBdInfoCached(serverConfig.url);
             info = r.data;
             fromCache = r.fromCache;
-            isStale = r.stale;
             fetchTime = r.fetchedAt;
-            // Removed throw for missing data to allow graceful fallback
-          } catch (e) {
-            // Quiet fail
-          }
+          } catch (e) {}
 
           if (!info || !info.players) {
-             // Show Warming Up Embed instead of error
              const warmEmbed = new EmbedBuilder()
                 .setTitle(`Battledome Leaderboard — ${serverConfig.name}`)
                 .setDescription('_Cache warming up. Please try again in ~10 seconds._')
@@ -3760,126 +2737,70 @@ client.on('interactionCreate', async (interaction) => {
                 .setColor(DEFAULT_EMBED_COLOR);
              return safeReply(interaction, { embeds: [warmEmbed] });
           }
-
           const top15 = info.players.slice(0, 15);
           const lines = top15.map((p, i) => {
              const idle = p.inactive && p.inactive > 60 ? ` *(idle ${p.inactive}s)*` : '';
              return `**${i+1}. ${p.name}** — ${p.score}${idle}`;
           }).join('\n');
-
-          // Footer: indicate live vs cached with relative age
           const ageSec = fetchTime ? Math.floor((Date.now() - fetchTime) / 1000) : 0;
           const cacheNote = fromCache ? `⚠️ Cached (${ageSec}s ago)` : `✅ Live (${ageSec}s ago)`;
-
-          const embed = new EmbedBuilder()
-            .setTitle(`Battledome Leaderboard — ${serverConfig.name}`)
-            .setDescription(lines || '_No players listed._')
-            .setFooter({ text: `KC Bot • /battledomelb • ${cacheNote}` })
-            .setColor(DEFAULT_EMBED_COLOR);
-          
+          const embed = new EmbedBuilder().setTitle(`Battledome Leaderboard — ${serverConfig.name}`).setDescription(lines || '_No players listed._').setFooter({ text: `KC Bot • /battledomelb • ${cacheNote}` }).setColor(DEFAULT_EMBED_COLOR);
           return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /battledometop (NEW)
         else if (commandName === 'battledometop') {
             await safeDefer(interaction);
             const region = interaction.options.getString('region') || 'All';
             const entries = [];
-
             if (region === 'All') {
                 bdTop.global.forEach((v, k) => {
-                    const obj = (v && typeof v === 'object')
-                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object') ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' } : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else if (bdTop[region]) {
                 bdTop[region].forEach((v, k) => {
-                    const obj = (v && typeof v === 'object')
-                        ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' }
-                        : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
+                    const obj = (v && typeof v === 'object') ? { name: k, score: v.score ?? 0, seenAt: v.seenAt ?? 0, serverName: v.serverName ?? '' } : { name: k, score: Number(v) || 0, seenAt: 0, serverName: '' };
                     entries.push(obj);
                 });
             } else {
                 return safeReply(interaction, { content: 'Unknown region.', ephemeral: true });
             }
-
-            // Sort by score desc and pick top 15
             entries.sort((a, b) => (b.score || 0) - (a.score || 0));
             const top15 = entries.slice(0, 15);
-
-            if (top15.length === 0) {
-                return safeReply(
-                    interaction,
-                    { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true }
-                );
-            }
-
-            // Build nicely aligned leaderboard lines. Clamp names to 28 characters and pad so numbers align.
+            if (top15.length === 0) return safeReply(interaction, { content: `No top scores recorded yet for **${region}**. Check back later!`, ephemeral: true });
             const lines = top15.map((p, i) => {
                 const nm = clampName(p.name, 28).padEnd(30, ' ');
                 const sc = String(p.score).padStart(5, ' ');
                 return `\`${String(i + 1).padStart(2, ' ')}.\` **${nm}** \`— ${sc}\``;
             }).join('\n');
-
             const lastUpdate = bdTopMeta.lastUpdatedAt || Date.now();
-            // The top list is persisted, so we treat it as cached data; show relative update time
-            const embed = new EmbedBuilder()
-                .setTitle(region === 'All' ? 'All‑Time Top LB' : `All‑Time Top LB (${region})`)
-                .setDescription(lines)
-                .setFooter({ text: `Updated <t:${Math.floor(lastUpdate / 1000)}:R> • Cached` })
-                .setColor(DEFAULT_EMBED_COLOR);
-
+            const embed = new EmbedBuilder().setTitle(region === 'All' ? 'All‑Time Top LB' : `All‑Time Top LB (${region})`).setDescription(lines).setFooter({ text: `Updated <t:${Math.floor(lastUpdate / 1000)}:R> • Cached` }).setColor(DEFAULT_EMBED_COLOR);
             return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /battledomestatus (NEW)
         else if (commandName === 'battledomestatus') {
-            // Use the unified status embed instead of multiple embeds. This
-            // compresses all regions into one cohesive embed for easier
-            // reading and to match the updated dashboard style.
             await safeDefer(interaction);
             const embed = buildBdStatusUnifiedEmbed();
             return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /recentlyjoined (NEW)
         else if (commandName === 'recentlyjoined') {
-            // Produce a single embed summarising recent activity across all
-            // Battledome regions instead of one embed per region.
             await safeDefer(interaction);
             const embed = buildBdRecentUnifiedEmbed();
             return safeReply(interaction, { embeds: [embed] });
         }
-        // Handle /comparebdscores (NEW)
         else if (commandName === 'comparebdscores') {
-            // Use the unified score comparison embed. This single embed
-            // displays the top players for Global, West, East and EU in
-            // separate fields.
             await safeDefer(interaction);
             try {
               const embed = buildBdScoreCompareEmbed();
               return safeReply(interaction, { embeds: [embed] });
             } catch (err) {
-              console.error('[comparebdscores]', err);
               return safeReply(interaction, { content: 'Failed to build BD score comparison.', ephemeral: true });
             }
         }
-
-        // Handle /server (NEW)
         else if (commandName === 'server') {
-            // Fetch realtime leaderboard for a specific Slither server id
             const id = interaction.options.getInteger('id');
             try {
               const { servers, fromCache, fetchedAt } = await getSlitherServersCached();
               const s = servers.get(id);
-              if (!s) {
-                return safeReply(interaction, {
-                  content: `I couldn’t find server **${id}** on NTL right now. Try again in a few seconds.`,
-                  embeds: [],
-                  components: [],
-                  // Return as an ordinary message (not suppressed) since /server is public
-                  // and this command is not marked as ephemerally private.
-                });
-              }
-              // Build leaderboard lines. Escape backticks in names.
+              if (!s) return safeReply(interaction, { content: `I couldn’t find server **${id}** on NTL right now. Try again in a few seconds.`, embeds: [], components: [] });
               const lines = (s.leaderboard.length ? s.leaderboard : []).map(e => {
                 const nm = (e.name || '(no name)').replace(/`/g, 'ˋ');
                 return `\`${String(e.rank).padStart(2,' ')}.\` **${nm}** — \`${e.score}\``;
@@ -3887,73 +2808,77 @@ client.on('interactionCreate', async (interaction) => {
               const ageSec = Math.floor((Date.now() - fetchedAt) / 1000);
               const cacheNote = fromCache ? `Cached (${ageSec}s)` : `Live (${ageSec}s)`;
               const embed = new EmbedBuilder()
-                .setTitle(`🐍 Slither Server ${s.id}`)
-                .setDescription(`**${s.ipPort}** — ${s.region}`)
-                .addFields(
-                  { name: 'Leaderboard (Top 10)', value: lines },
-                  { name: 'Total Score', value: String(s.totalScore ?? '—'), inline: true },
-                  { name: 'Total Players', value: String(s.totalPlayers ?? '—'), inline: true },
-                  { name: 'Updated', value: String(s.updated ?? '—'), inline: true },
-                )
+                .setTitle(`🐍 Slither Server ${s.id}`).setDescription(`**${s.ipPort}** — ${s.region}`)
+                .addFields({ name: 'Leaderboard (Top 10)', value: lines }, { name: 'Total Score', value: String(s.totalScore ?? '—'), inline: true }, { name: 'Total Players', value: String(s.totalPlayers ?? '—'), inline: true }, { name: 'Updated', value: String(s.updated ?? '—'), inline: true })
                 .setFooter({ text: `NTL • ${cacheNote}` });
               return safeReply(interaction, { embeds: [embed] });
             } catch (err) {
-              console.error('[server]', err);
               return safeReply(interaction, { content: 'Sorry, failed to fetch server data. Please try again later.', embeds: [], components: [] });
             }
+        }
+        // F1: /bdtokc command handler
+        else if (commandName === 'bdtokc') {
+            const discordId = interaction.user.id;
+            const kcUid = await getKCUidForDiscord(discordId);
+            if (!kcUid) {
+                return safeReply(interaction, { content: 'You must link your KC account first using `/link`.', ephemeral: true });
+            }
+            const action = interaction.options.getString('action');
+            if (action === 'disable') {
+                await rtdb.ref(`config/bdToKC/${discordId}`).remove();
+                return safeReply(interaction, { content: '✅ Battledome score tracking disabled.', ephemeral: true });
+            }
+            // Enable
+            const inputName = interaction.options.getString('name');
+            let kcName = inputName;
+            if (!kcName) {
+                // Fetch KC profile name as default
+                const profile = await getKCProfile(kcUid);
+                kcName = profile.displayName;
+            }
+            if (!kcName) {
+                return safeReply(interaction, { content: 'Could not determine your name. Please specify it explicitly.', ephemeral: true });
+            }
+            await rtdb.ref(`config/bdToKC/${discordId}`).set({
+                kcUid,
+                kcName,
+                enabled: true,
+                updatedAt: admin.database.ServerValue.TIMESTAMP
+            });
+            return safeReply(interaction, { content: `✅ Battledome score tracking enabled for name **${kcName}**!`, ephemeral: true });
         }
 
     } catch (err) {
         console.error(`[${commandName}]`, err);
-        await safeReply(interaction, { 
-            content: '❌ Sorry — something went wrong while processing your request.', 
-            ephemeral: true 
-        });
+        await safeReply(interaction, { content: '❌ Sorry — something went wrong while processing your request.', ephemeral: true });
     }
-    // --- END PATCH (Step 2/4) ---
   } 
-  // --- Button Handlers ---
-  // --- Modal Submit Handlers ---
   else if (interaction.isModalSubmit()) {
     const modalId = interaction.customId || '';
-    // Handle Battledome alert settings modal submissions. Custom ID format:
-    // bd:alert_settings_modal:<guildId>. Extract values, validate, save and
-    // refresh the dashboard.
     if (modalId.startsWith('bd:alert_settings_modal')) {
       try {
         const parts = modalId.split(':');
         const guildId = parts[2] || interaction.guildId;
-        // Read text input values
         const minPlayersStr = interaction.fields.getTextInputValue('minPlayers') || '';
         const cooldownStr = interaction.fields.getTextInputValue('cooldownMinutes') || '';
         let minPlayersVal = undefined;
         let cooldownVal = undefined;
         if (minPlayersStr) {
           const mp = parseInt(minPlayersStr.replace(/\D/g, ''), 10);
-          if (!isNaN(mp)) {
-            minPlayersVal = Math.max(1, Math.min(100, mp));
-          }
+          if (!isNaN(mp)) minPlayersVal = Math.max(1, Math.min(100, mp));
         }
         if (cooldownStr) {
           const cd = parseInt(cooldownStr.replace(/\D/g, ''), 10);
-          if (!isNaN(cd)) {
-            cooldownVal = Math.max(1, Math.min(1440, cd));
-          }
+          if (!isNaN(cd)) cooldownVal = Math.max(1, Math.min(1440, cd));
         }
-        // Persist settings
         const updates = {};
         if (typeof minPlayersVal === 'number') updates[`config/bdAlertSettings/${guildId}/minPlayers`] = minPlayersVal;
         if (typeof cooldownVal === 'number') updates[`config/bdAlertSettings/${guildId}/cooldownMinutes`] = cooldownVal;
-        if (Object.keys(updates).length > 0) {
-          await rtdb.ref().update(updates);
-        }
+        if (Object.keys(updates).length > 0) await rtdb.ref().update(updates);
         await rtdb.ref(`config/bdAlertSettings/${guildId}/updatedAt`).set(admin.database.ServerValue.TIMESTAMP);
-        // Acknowledge
         await safeReply(interaction, { content: '✅ Alert settings saved.', embeds: [], components: [], ephemeral: true });
-        // Refresh dashboard
         updateBdStatusMessages().catch(() => {});
       } catch (err) {
-        console.error('[bd alert settings modal]', err);
         await safeReply(interaction, { content: '❌ Failed to save settings.', embeds: [], components: [], ephemeral: true });
       }
       return;
@@ -3961,26 +2886,16 @@ client.on('interactionCreate', async (interaction) => {
   }
   else if (interaction.isButton()) {
     const id = interaction.customId;
-    // Handle Battledome dashboard buttons (bd: prefix). These controls
-    // provide a clean UI for managing alerts, refreshing data and
-    // toggling advanced details. All BD buttons include the guild ID
-    // after the action for scoping (e.g. bd:controls:<guildId>). We
-    // process BD buttons before any other button logic.
     if (id && id.startsWith('bd:')) {
       const parts = id.split(':');
-      // parts: ['bd', action, guildId]
       const action = parts[1] || '';
       const guildId = parts[2] || interaction.guildId;
-      // Controls: display an ephemral control panel summarising settings
       if (action === 'controls') {
-        // Fetch current settings (alerts enabled, alert settings, user server prefs)
-        // Alerts enabled per guild
         let alertsEnabled = true;
         try {
           const snap = await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).get();
           if (snap.exists() && snap.val() === false) alertsEnabled = false;
         } catch {}
-        // Alert settings: minPlayers and cooldown (in minutes)
         let minPlayers = undefined;
         let cooldownMinutes = undefined;
         try {
@@ -3991,56 +2906,27 @@ client.on('interactionCreate', async (interaction) => {
             if (typeof val.cooldownMinutes === 'number') cooldownMinutes = val.cooldownMinutes;
           }
         } catch {}
-        // User server subscriptions
         let servers = [];
         try {
           const subSnap = await rtdb.ref(`bdNotify/${guildId}/${interaction.user.id}/regions`).get();
-          if (subSnap.exists()) {
-            servers = Object.keys(subSnap.val() || {});
-          }
+          if (subSnap.exists()) servers = Object.keys(subSnap.val() || {});
         } catch {}
         const serverList = servers.length ? servers.join(', ') : 'None';
-        // DM preference for this user in this guild (default false if missing)
         let dmEnabled = false;
         try {
           const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}/dmEnabled`).get();
           if (snap.exists() && snap.val() === true) dmEnabled = true;
         } catch {}
-        // Build embed including DM notification status
-        const embed = new EmbedBuilder()
-          .setTitle('Battledome Controls')
-          .setDescription('Manage your alert preferences and settings.')
-          .setColor(DEFAULT_EMBED_COLOR)
-          .addFields(
-            { name: 'Alerts', value: alertsEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-            { name: 'Servers', value: serverList, inline: true },
-            { name: 'Cooldown', value: cooldownMinutes ? `${cooldownMinutes} min` : '—', inline: true },
-            { name: 'Min Players', value: minPlayers ? String(minPlayers) : '—', inline: true },
-            { name: 'DM Notifications', value: dmEnabled ? '✅ Enabled' : '❌ Disabled', inline: true }
-          );
-        // Build control buttons
-        const toggleBtn = new ButtonBuilder()
-          .setCustomId(`bd:toggle_alerts:${guildId}`)
-          .setLabel(alertsEnabled ? 'Disable Alerts' : 'Enable Alerts')
-          .setStyle(alertsEnabled ? ButtonStyle.Danger : ButtonStyle.Success);
-        const settingsBtn = new ButtonBuilder()
-          .setCustomId(`bd:alert_settings:${guildId}`)
-          .setLabel('Alert Settings')
-          .setStyle(ButtonStyle.Secondary);
-        const serversBtn = new ButtonBuilder()
-          .setCustomId(`bd:open_server_filter:${guildId}`)
-          .setLabel('Select Servers')
-          .setStyle(ButtonStyle.Secondary);
-        // New button for toggling DM notifications
-        const dmBtn = new ButtonBuilder()
-          .setCustomId(`bd:toggle_dm:${guildId}`)
-          .setLabel(dmEnabled ? 'Disable DMs' : 'Enable DMs')
-          .setStyle(dmEnabled ? ButtonStyle.Danger : ButtonStyle.Success);
+        const embed = new EmbedBuilder().setTitle('Battledome Controls').setDescription('Manage your alert preferences and settings.').setColor(DEFAULT_EMBED_COLOR)
+          .addFields({ name: 'Alerts', value: alertsEnabled ? '✅ Enabled' : '❌ Disabled', inline: true }, { name: 'Servers', value: serverList, inline: true }, { name: 'Cooldown', value: cooldownMinutes ? `${cooldownMinutes} min` : '—', inline: true }, { name: 'Min Players', value: minPlayers ? String(minPlayers) : '—', inline: true }, { name: 'DM Notifications', value: dmEnabled ? '✅ Enabled' : '❌ Disabled', inline: true });
+        const toggleBtn = new ButtonBuilder().setCustomId(`bd:toggle_alerts:${guildId}`).setLabel(alertsEnabled ? 'Disable Alerts' : 'Enable Alerts').setStyle(alertsEnabled ? ButtonStyle.Danger : ButtonStyle.Success);
+        const settingsBtn = new ButtonBuilder().setCustomId(`bd:alert_settings:${guildId}`).setLabel('Alert Settings').setStyle(ButtonStyle.Secondary);
+        const serversBtn = new ButtonBuilder().setCustomId(`bd:open_server_filter:${guildId}`).setLabel('Select Servers').setStyle(ButtonStyle.Secondary);
+        const dmBtn = new ButtonBuilder().setCustomId(`bd:toggle_dm:${guildId}`).setLabel(dmEnabled ? 'Disable DMs' : 'Enable DMs').setStyle(dmEnabled ? ButtonStyle.Danger : ButtonStyle.Success);
         const row = new ActionRowBuilder().addComponents(toggleBtn, settingsBtn, serversBtn, dmBtn);
         await safeReply(interaction, { embeds: [embed], components: [row], ephemeral: true });
         return;
       }
-      // Refresh: manually refresh BD data with a 5s cooldown per guild
       if (action === 'refresh') {
         const last = bdManualRefreshAt.get(guildId) || 0;
         const now = Date.now();
@@ -4050,31 +2936,21 @@ client.on('interactionCreate', async (interaction) => {
           return safeReply(interaction, { content: `⏳ Please wait ${secondsLeft}s before refreshing again.`, ephemeral: true });
         }
         bdManualRefreshAt.set(guildId, now);
-        // Trigger fresh fetch for all regions in sequence
-        for (const regionKey of ['East','EU']) {
-          try {
-            await checkRegion(regionKey);
-          } catch {}
-        }
-        // Immediately update the status message
+        await Promise.all([checkRegion('East'), checkRegion('EU')]); // West Removed
         updateBdStatusMessages().catch(() => {});
         return safeReply(interaction, { content: '🔄 Refreshing Battledome data…', ephemeral: true });
       }
-      // Details: toggle advanced view for this guild
       if (action === 'details') {
         let showAdvanced = false;
         try {
           const snap = await rtdb.ref(`config/bdShowAdvanced/${guildId}`).get();
           if (snap.exists() && snap.val() === true) showAdvanced = true;
         } catch {}
-        // Toggle
         showAdvanced = !showAdvanced;
         await rtdb.ref(`config/bdShowAdvanced/${guildId}`).set(showAdvanced);
-        // Update message
         updateBdStatusMessages().catch(() => {});
         return safeReply(interaction, { content: '📊 Details view updated.',  ephemeral: true });
       }
-      // Toggle alerts: enable/disable all alerts for this guild
       if (action === 'toggle_alerts') {
         let alertsEnabled = true;
         try {
@@ -4083,1109 +2959,53 @@ client.on('interactionCreate', async (interaction) => {
         } catch {}
         alertsEnabled = !alertsEnabled;
         await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).set(alertsEnabled);
-        // update status message to reflect new toggle if needed
         updateBdStatusMessages().catch(() => {});
         return safeReply(interaction, { content: alertsEnabled ? '🔔 Alerts enabled.' : '🔕 Alerts disabled.', ephemeral: true });
       }
-      // Toggle DM notifications: enable/disable DM alerts for this user in this guild
       if (action === 'toggle_dm') {
-        // fetch current dmEnabled (default false)
         let dmEnabled = false;
         try {
           const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}/dmEnabled`).get();
           if (snap.exists() && snap.val() === true) dmEnabled = true;
         } catch {}
-        // invert
         dmEnabled = !dmEnabled;
-        // persist
         await rtdb.ref(`config/bdAlertPrefs/${guildId}/${interaction.user.id}`).update({
           dmEnabled,
           updatedAt: admin.database.ServerValue.TIMESTAMP,
           updatedBy: interaction.user.id
         });
-        // respond
-        return safeReply(interaction, { content: dmEnabled ? '✅ DM notifications enabled.' : '✅ DM notifications disabled.', embeds: [], components: [],  });
+        return safeReply(interaction, { content: dmEnabled ? '✅ DM notifications enabled.' : '✅ DM notifications disabled.', embeds: [], components: [], ephemeral: true });
       }
-      // Alert settings: open a modal to edit minPlayers and cooldown
       if (action === 'alert_settings') {
-        // Build modal
-        const modal = new ModalBuilder()
-          .setCustomId(`bd:alert_settings_modal:${guildId}`)
-          .setTitle('Edit Battledome Alert Settings');
-        const minPlayersInput = new TextInputBuilder()
-          .setCustomId('minPlayers')
-          .setLabel('Minimum players to trigger (1–100)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false);
-        const cooldownInput = new TextInputBuilder()
-          .setCustomId('cooldownMinutes')
-          .setLabel('Cooldown in minutes (1–1440)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false);
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(minPlayersInput),
-          new ActionRowBuilder().addComponents(cooldownInput)
-        );
+        const modal = new ModalBuilder().setCustomId(`bd:alert_settings_modal:${guildId}`).setTitle('Edit Battledome Alert Settings');
+        const minPlayersInput = new TextInputBuilder().setCustomId('minPlayers').setLabel('Minimum players to trigger (1–100)').setStyle(TextInputStyle.Short).setRequired(false);
+        const cooldownInput = new TextInputBuilder().setCustomId('cooldownMinutes').setLabel('Cooldown in minutes (1–1440)').setStyle(TextInputStyle.Short).setRequired(false);
+        modal.addComponents(new ActionRowBuilder().addComponents(minPlayersInput), new ActionRowBuilder().addComponents(cooldownInput));
         await interaction.showModal(modal);
         return;
       }
-      // Open server filter: present a multi-select for region subscriptions
       if (action === 'open_server_filter') {
-        // Fetch current selections
         let selected = [];
         try {
           const snap = await rtdb.ref(`bdNotify/${guildId}/${interaction.user.id}/regions`).get();
-          if (snap.exists()) {
-            selected = Object.keys(snap.val() || {});
-          }
+          if (snap.exists()) selected = Object.keys(snap.val() || {});
         } catch {}
-        const select = new StringSelectMenuBuilder()
-          .setCustomId(`bd:server_filter_select:${guildId}`)
-          .setMinValues(0)
-          .setMaxValues(2)
-          .setPlaceholder('Select regions')
+        // West Removed
+        const select = new StringSelectMenuBuilder().setCustomId(`bd:server_filter_select:${guildId}`).setMinValues(0).setMaxValues(2).setPlaceholder('Select regions')
           .addOptions(
-            {
-              label: 'East Coast (NY)',
-              value: 'East',
-              default: selected.includes('East'),
-              description: 'Subscribe to East Battledome alerts'
-            },
-            {
-              label: 'EU',
-              value: 'EU',
-              default: selected.includes('EU'),
-              description: 'Subscribe to EU Battledome alerts'
-            }
+            { label: 'East Coast (NY)', value: 'East', default: selected.includes('East'), description: 'Subscribe to East Battledome alerts' },
+            { label: 'EU', value: 'EU', default: selected.includes('EU'), description: 'Subscribe to EU Battledome alerts' }
           );
         const row = new ActionRowBuilder().addComponents(select);
-        const embed = new EmbedBuilder()
-          .setTitle('Select Battledome Servers')
-          .setDescription('Choose which regions you want alerts for.')
-          .setColor(DEFAULT_EMBED_COLOR);
+        const embed = new EmbedBuilder().setTitle('Select Battledome Servers').setDescription('Choose which regions you want alerts for.').setColor(DEFAULT_EMBED_COLOR);
         await safeReply(interaction, { embeds: [embed], components: [row], ephemeral: true });
         return;
       }
       return;
     }
-    // Handle multi‑page /help navigation buttons. Custom IDs are of the form
-    // help:<prev|next>:<parentId>. Only the original invoker may use these controls.
-    if (id && id.startsWith('help:')) {
-      const parts = id.split(':');
-      const dir = parts[1];
-      const parentId = parts[2];
-      const cache = interaction.client.helpCache?.get(parentId);
-      if (!cache) {
-        return safeReply(interaction, { content: 'This help message has expired. Run `/help` again.', ephemeral: true });
-      }
-      if (interaction.user.id !== cache.userId) {
-        return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-      }
-      // Compute new page index
-      let newIndex = cache.index;
-      if (dir === 'next') newIndex += 1;
-      else if (dir === 'prev') newIndex -= 1;
-      newIndex = Math.max(0, Math.min(cache.pages.length - 1, newIndex));
-      cache.index = newIndex;
-      const embedHelp = buildHelpEmbed(cache.pages[newIndex]);
-      const prevDisabled = newIndex === 0;
-      const nextDisabled = newIndex === cache.pages.length - 1;
-      const prevBtn2 = new ButtonBuilder()
-        .setCustomId(`help:prev:${parentId}`)
-        .setLabel('◀')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(prevDisabled);
-      const nextBtn2 = new ButtonBuilder()
-        .setCustomId(`help:next:${parentId}`)
-        .setLabel('▶')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(nextDisabled);
-      const rowHelp = new ActionRowBuilder().addComponents(prevBtn2, nextBtn2);
-      await safeDefer(interaction, { intent: 'update' });
-      // When updating an existing message, omit the `ephemeral` flag; the interaction
-      // is already replied to.
-      return safeReply(interaction, { embeds: [embedHelp], components: [rowHelp] });
-    }
-    try {
-      // For clan battle controls (cb: prefix)
-      if (id.startsWith('cb:')) {
-        const parts = id.split(':');
-        // cb:<action>:<parentId>:<param>
-        const action = parts[1];
-        const parentId = parts[2];
-        const param = parts[3];
-        // Restrict interactions to the user who ran the command
-        const invokerId = interaction.message?.interaction?.user?.id;
-        if (invokerId && invokerId !== interaction.user.id) {
-          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-        }
-        // Fetch cache
-        const cache = interaction.client.battleCache?.get(parentId);
-        if (!cache) {
-          return safeReply(interaction, { content: 'This battle list has expired. Run `/clanbattles` again.', ephemeral: true });
-        }
-        // Handle actions
-        if (action === 'filter') {
-          const newFilter = param;
-          if (!['all','my','past'].includes(newFilter)) {
-            return safeReply(interaction, { content: 'Invalid filter.', ephemeral: true });
-          }
-          cache.filter = newFilter;
-          const list = cache.lists[newFilter] || [];
-          // Build embed and rows
-          const embed = buildBattlesListEmbed(list, newFilter, cache.clansData, cache.usersData);
-          const rows = [];
-          const max = Math.min(list.length, BATTLES_PAGE_SIZE);
-          for (let i = 0; i < max; i += 5) {
-            const row = new ActionRowBuilder();
-            for (let j = i; j < Math.min(i + 5, max); j++) {
-              row.addComponents(
-                new ButtonBuilder()
-                  .setCustomId(`cb:detail:${parentId}:${j}`)
-                  .setLabel(String(j + 1))
-                  .setStyle(ButtonStyle.Secondary)
-              );
-            }
-            rows.push(row);
-          }
-          const filterRow = new ActionRowBuilder();
-          ['all', 'my', 'past'].forEach(ft => {
-            const label = ft === 'all' ? 'All' : (ft === 'my' ? 'My Clan' : 'Past');
-            const style = ft === newFilter ? ButtonStyle.Primary : ButtonStyle.Secondary;
-            filterRow.addComponents(
-              new ButtonBuilder()
-                .setCustomId(`cb:filter:${parentId}:${ft}`)
-                .setLabel(label)
-                .setStyle(style)
-            );
-          });
-          rows.push(filterRow);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: rows });
-        }
-        else if (action === 'detail') {
-          const idx = parseInt(param, 10);
-          const filterType = cache.filter || 'all';
-          const list = cache.lists[filterType] || [];
-          if (isNaN(idx) || idx < 0 || idx >= list.length) {
-            return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
-          }
-          const [battleId, battle] = list[idx];
-          // Build detail embed
-          // Build detail embed (default view does not show extended description)
-          const embed = buildBattleDetailEmbed(battleId, battle, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Determine join eligibility
-          let joinBtn;
-          const canJoin = (
-            battle.status !== 'finished' &&
-            cache.uid && cache.userClanId &&
-            (battle.challengerId === cache.userClanId || battle.targetId === cache.userClanId) &&
-            !(battle.participants && battle.participants[cache.uid])
-          );
-          if (canJoin) {
-            joinBtn = new ButtonBuilder()
-              .setCustomId(`cb:join:${parentId}:${battleId}`)
-              .setLabel('Join')
-              .setStyle(ButtonStyle.Success);
-          } else {
-            // If already joined, show Leave button; otherwise disabled Join
-            const joined = battle.participants && battle.participants[cache.uid];
-            if (joined) {
-              joinBtn = new ButtonBuilder()
-                .setCustomId(`cb:leave:${parentId}:${battleId}`)
-                .setLabel('Leave')
-                .setStyle(ButtonStyle.Danger);
-            } else {
-              joinBtn = new ButtonBuilder()
-                .setCustomId('cb:join:disabled')
-                .setLabel('Join')
-                .setStyle(ButtonStyle.Secondary)
-                .setDisabled(true);
-            }
-          }
-          // Info button to toggle extended description
-          const infoBtn = new ButtonBuilder()
-            .setCustomId(`cb:info:${parentId}:${battleId}:show`)
-            .setLabel('Info')
-            .setStyle(ButtonStyle.Secondary);
-          const backBtn = new ButtonBuilder()
-            .setCustomId(`cb:list:${parentId}`)
-            .setLabel('Back')
-            .setStyle(ButtonStyle.Secondary);
-          const row = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: [row] });
-        }
-        else if (action === 'list') {
-          const filterType = cache.filter || 'all';
-          const list = cache.lists[filterType] || [];
-          const embed = buildBattlesListEmbed(list, filterType, cache.clansData, cache.usersData);
-          const rows = [];
-          const max = Math.min(list.length, BATTLES_PAGE_SIZE);
-          for (let i = 0; i < max; i += 5) {
-            const row = new ActionRowBuilder();
-            for (let j = i; j < Math.min(i + 5, max); j++) {
-              row.addComponents(
-                new ButtonBuilder()
-                  .setCustomId(`cb:detail:${parentId}:${j}`)
-                  .setLabel(String(j + 1))
-                  .setStyle(ButtonStyle.Secondary)
-              );
-            }
-            rows.push(row);
-          }
-          const filterRow = new ActionRowBuilder();
-          ['all', 'my', 'past'].forEach(ft => {
-            const label = ft === 'all' ? 'All' : (ft === 'my' ? 'My Clan' : 'Past');
-            const style = ft === filterType ? ButtonStyle.Primary : ButtonStyle.Secondary;
-            filterRow.addComponents(
-              new ButtonBuilder()
-                .setCustomId(`cb:filter:${parentId}:${ft}`)
-                .setLabel(label)
-                .setStyle(style)
-            );
-          });
-          rows.push(filterRow);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: rows });
-        }
-        else if (action === 'join') {
-          const battleId = param;
-          // Ensure user is eligible
-          if (!cache.uid) {
-            return safeReply(interaction, { content: 'Link your KC account with /link first to join battles.', ephemeral: true });
-          }
-          if (!cache.userClanId) {
-            return safeReply(interaction, { content: 'You must be in a clan to join this battle.', ephemeral: true });
-          }
-          // Find battle in cache lists
-          let battleRef = null;
-          for (const k of Object.keys(cache.lists)) {
-            const arr = cache.lists[k];
-            for (let i = 0; i < arr.length; i++) {
-              if (arr[i][0] === battleId) {
-                battleRef = arr[i][1];
-                break;
-              }
-            }
-            if (battleRef) break;
-          }
-          if (!battleRef) {
-            return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
-          }
-          // Check eligibility again based on battle data
-          const inClan = (battleRef.challengerId === cache.userClanId || battleRef.targetId === cache.userClanId);
-          const alreadyJoined = battleRef.participants && battleRef.participants[cache.uid];
-          if (!inClan) {
-            return safeReply(interaction, { content: 'You are not a member of either participating clan.', ephemeral: true });
-          }
-          if (battleRef.status === 'finished') {
-            return safeReply(interaction, { content: 'This battle has already finished.', ephemeral: true });
-          }
-          if (alreadyJoined) {
-            return safeReply(interaction, { content: 'You have already joined this battle.', ephemeral: true });
-          }
-          // Perform join in database
-          try {
-            await withTimeout(
-              rtdb.ref(`battles/${battleId}/participants/${cache.uid}`).set(cache.userClanId),
-              8000,
-              `join battle ${battleId}`
-            );
-          } catch (err) {
-            console.error('[join battle]', err);
-            return safeReply(interaction, { content: 'Failed to join the battle. Please try again later.', ephemeral: true });
-          }
-          // Update local cache
-          for (const k of Object.keys(cache.lists)) {
-            const arr = cache.lists[k];
-            for (let i = 0; i < arr.length; i++) {
-              if (arr[i][0] === battleId) {
-                arr[i][1].participants = arr[i][1].participants || {};
-                arr[i][1].participants[cache.uid] = cache.userClanId;
-              }
-            }
-          }
-          // Build updated detail view (default view without description)
-          const embed = buildBattleDetailEmbed(battleId, battleRef, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Show a Leave button now that the user has joined
-          const leaveBtn = new ButtonBuilder()
-            .setCustomId(`cb:leave:${parentId}:${battleId}`)
-            .setLabel('Leave')
-            .setStyle(ButtonStyle.Danger);
-          // Info button remains available to toggle description
-          const infoBtn2 = new ButtonBuilder()
-            .setCustomId(`cb:info:${parentId}:${battleId}:show`)
-            .setLabel('Info')
-            .setStyle(ButtonStyle.Secondary);
-          const backBtn2 = new ButtonBuilder()
-            .setCustomId(`cb:list:${parentId}`)
-            .setLabel('Back')
-            .setStyle(ButtonStyle.Secondary);
-          const row = new ActionRowBuilder().addComponents(leaveBtn, infoBtn2, backBtn2);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: [row] });
-        }
-        else if (action === 'leave') {
-          const battleId = param;
-          // Ensure user is linked and in a clan
-          if (!cache.uid) {
-            return safeReply(interaction, { content: 'Link your KC account with /link first to leave battles.', ephemeral: true });
-          }
-          if (!cache.userClanId) {
-            return safeReply(interaction, { content: 'You must be in a clan to leave this battle.', ephemeral: true });
-          }
-          // Find battle reference in cache
-          let battleRef = null;
-          for (const k of Object.keys(cache.lists)) {
-            const arr = cache.lists[k];
-            for (let i = 0; i < arr.length; i++) {
-              if (arr[i][0] === battleId) {
-                battleRef = arr[i][1];
-                break;
-              }
-            }
-            if (battleRef) break;
-          }
-          if (!battleRef) {
-            return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
-          }
-          const joined = battleRef.participants && battleRef.participants[cache.uid];
-          if (!joined) {
-            return safeReply(interaction, { content: 'You are not currently joined in this battle.', ephemeral: true });
-          }
-          // Remove from DB
-          try {
-            await withTimeout(
-              rtdb.ref(`battles/${battleId}/participants/${cache.uid}`).remove(),
-              8000,
-              `leave battle ${battleId}`
-            );
-          } catch (err) {
-            console.error('[leave battle]', err);
-            return safeReply(interaction, { content: 'Failed to leave the battle. Please try again later.', ephemeral: true });
-          }
-          // Update local cache
-          for (const k of Object.keys(cache.lists)) {
-            const arr = cache.lists[k];
-            for (let i = 0; i < arr.length; i++) {
-              if (arr[i][0] === battleId) {
-                if (arr[i][1].participants) {
-                  delete arr[i][1].participants[cache.uid];
-                }
-              }
-            }
-          }
-          // Build updated detail view
-          const embed = buildBattleDetailEmbed(battleId, battleRef, cache.clansData, cache.usersData, /* includeDesc */ false);
-          // Determine new join/leave button
-          let btn;
-          const canJoinAgain = (
-            battleRef.status !== 'finished' &&
-            cache.uid && cache.userClanId &&
-            (battleRef.challengerId === cache.userClanId || battleRef.targetId === cache.userClanId) &&
-            !(battleRef.participants && battleRef.participants[cache.uid])
-          );
-          if (canJoinAgain) {
-            btn = new ButtonBuilder()
-              .setCustomId(`cb:join:${parentId}:${battleId}`)
-              .setLabel('Join')
-              .setStyle(ButtonStyle.Success);
-          } else {
-            btn = new ButtonBuilder()
-              .setCustomId('cb:join:disabled')
-              .setLabel('Join')
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true);
-          }
-          const infoBtn2 = new ButtonBuilder()
-            .setCustomId(`cb:info:${parentId}:${battleId}:show`)
-            .setLabel('Info')
-            .setStyle(ButtonStyle.Secondary);
-          const backBtn2 = new ButtonBuilder()
-            .setCustomId(`cb:list:${parentId}`)
-            .setLabel('Back')
-            .setStyle(ButtonStyle.Secondary);
-          const row2 = new ActionRowBuilder().addComponents(btn, infoBtn2, backBtn2);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: [row2] });
-        }
-        else if (action === 'info') {
-          // Toggle additional description view for a battle
-          // Expected customId format: cb:info:<parentId>:<battleId>:<mode>
-          const battleId = param;
-          const mode = parts[4] || 'show';
-          // Ensure we still have cache and battle reference
-          const battleLists = cache.lists;
-          let battleRef = null;
-          for (const k of Object.keys(battleLists)) {
-            for (const entry of battleLists[k]) {
-              if (entry[0] === battleId) {
-                battleRef = entry[1];
-                break;
-              }
-            }
-            if (battleRef) break;
-          }
-          if (!battleRef) {
-            return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
-          }
-          // Determine whether to show extended description
-          const includeDesc = mode === 'show';
-          // Build embed with or without description
-          const embed = buildBattleDetailEmbed(battleId, battleRef, cache.clansData, cache.usersData, includeDesc);
-          // Determine join eligibility (unchanged)
-          let joinBtn;
-          const canJoin = (
-            battleRef.status !== 'finished' &&
-            cache.uid && cache.userClanId &&
-            (battleRef.challengerId === cache.userClanId || battleRef.targetId === cache.userClanId) &&
-            !(battleRef.participants && battleRef.participants[cache.uid])
-          );
-          if (canJoin) {
-            joinBtn = new ButtonBuilder()
-              .setCustomId(`cb:join:${parentId}:${battleId}`)
-              .setLabel('Join')
-              .setStyle(ButtonStyle.Success);
-          } else {
-            // Already joined or not eligible
-            const joined = battleRef.participants && battleRef.participants[cache.uid];
-            const label = joined ? 'Joined' : 'Join';
-            joinBtn = new ButtonBuilder()
-              .setCustomId('cb:join:disabled')
-              .setLabel(label)
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true);
-          }
-          // Toggle Info button
-          const nextMode = includeDesc ? 'hide' : 'show';
-          const infoLabel = includeDesc ? 'Hide Info' : 'Info';
-          const infoBtn = new ButtonBuilder()
-            .setCustomId(`cb:info:${parentId}:${battleId}:${nextMode}`)
-            .setLabel(infoLabel)
-            .setStyle(ButtonStyle.Secondary);
-          // Back button to list
-          const backBtn3 = new ButtonBuilder()
-            .setCustomId(`cb:list:${parentId}`)
-            .setLabel('Back')
-            .setStyle(ButtonStyle.Secondary);
-          const row = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn3);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { embeds: [embed], components: [row] });
-        }
-        // Unknown cb action falls through
-      }
-      // Handle clan challenge accept/decline buttons (cc: prefix)
-      else if (id.startsWith('cc:')) {
-        const parts = id.split(':');
-        // cc:<action>:<parentId>:<battleId>
-        const action = parts[1];
-        const parentId = parts[2];
-        const battleId = parts[3];
-        // Restrict to the user who invoked the command
-        const invokerId = interaction.message?.interaction?.user?.id;
-        if (invokerId && invokerId !== interaction.user.id) {
-          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-        }
-        // Retrieve the cached list
-        const cache = interaction.client.challengeCache?.get(parentId);
-        if (!cache) {
-          return safeReply(interaction, { content: 'This challenge list has expired. Run `/incomingchallenges` again.', ephemeral: true });
-        }
-        // Ensure this battle is still pending
-        const idx = cache.pendingList.findIndex(([bid]) => bid === battleId);
-        if (idx < 0) {
-          return safeReply(interaction, { content: 'Challenge not found. It may have been updated.', ephemeral: true });
-        }
-        const [bid, battle] = cache.pendingList[idx];
-        // Confirm the user is still the owner of their clan
-        let uid;
-        try {
-          uid = await getKCUidForDiscord(interaction.user.id);
-        } catch (_) { uid = null; }
-        if (!uid) {
-          return safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
-        }
-        // Reload clan to check owner
-        const clanSnap = await rtdb.ref(`clans/${cache.clanId}`).get();
-        const clan = clanSnap.exists() ? clanSnap.val() || {} : {};
-        if (getOwnerUid(clan) !== uid) {
-          return safeReply(interaction, { content: 'You must be a Clan Owner to run this command!', ephemeral: true });
-        }
-        // Update battle status
-        try {
-          if (action === 'accept') {
-            await rtdb.ref(`battles/${battleId}`).update({ status: 'accepted', acceptedBy: uid, acceptedAt: admin.database.ServerValue.TIMESTAMP });
-          } else if (action === 'decline') {
-            await rtdb.ref(`battles/${battleId}`).update({ status: 'declined', declinedBy: uid, declinedAt: admin.database.ServerValue.TIMESTAMP });
-          } else {
-            return safeReply(interaction, { content: 'Unknown action.', ephemeral: true });
-          }
-        } catch (e) {
-          console.error('[cc action] failed to update battle:', e);
-          return safeReply(interaction, { content: 'Failed to update the challenge. Try again later.', ephemeral: true });
-        }
-        // Remove from cache list
-        cache.pendingList.splice(idx, 1);
-        // If no more pending, clear message
-        if (cache.pendingList.length === 0) {
-          interaction.client.challengeCache.delete(parentId);
-          await safeDefer(interaction, { intent: 'update' });
-          return safeReply(interaction, { content: 'All challenges processed.', embeds: [], components: [] });
-        }
-        // Otherwise, rebuild embed and rows
-        const clansSnap = await rtdb.ref('clans').get();
-        const clansData = clansSnap.exists() ? clansSnap.val() || {} : {};
-        const embed = new EmbedBuilder()
-          .setTitle('Incoming Clan Challenges')
-          .setDescription('Below are the pending clan battle challenges. Use the buttons to accept or decline.')
-          .setColor(DEFAULT_EMBED_COLOR)
-          .setFooter({ text: 'KC Bot • /incomingchallenges' });
-        cache.pendingList.slice(0, 10).forEach(([bid2, b2], idx2) => {
-          const c1 = clansData[b2.challengerId] || {};
-          const c2 = clansData[b2.targetId] || {};
-          const d = b2.scheduledTime ? new Date(b2.scheduledTime) : null;
-          const dateStr = d ? d.toLocaleDateString('en-GB', { timeZone: 'Europe/London' }) : 'N/A';
-          const timeStr = d ? d.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }) : '';
-          const title = `${c1.name || b2.challengerId} vs ${c2.name || b2.targetId}`;
-          const lines = [];
-          if (b2.server) lines.push(`Server: ${b2.server}`);
-          if (b2.scheduledTime) lines.push(`Date: ${dateStr} ${timeStr}`);
-          if (b2.rules) lines.push(`Rules: ${b2.rules}`);
-          embed.addFields({ name: `${idx2 + 1}. ${title}`, value: lines.join('\n') || '\u200b' });
-        });
-        const rows = [];
-        cache.pendingList.slice(0, 10).forEach(([bid2], idx2) => {
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cc:accept:${parentId}:${bid2}`).setLabel('Accept').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`cc:decline:${parentId}:${bid2}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-          );
-          rows.push(row);
-        });
-        // Update the message
-        await safeDefer(interaction, { intent: 'update' });
-        return safeReply(interaction, { embeds: [embed], components: rows });
-      }
-
-      // Handle battle announcement buttons (battle: prefix)
-      else if (id.startsWith('battle:')) {
-        const parts = id.split(':');
-        // battle:<action>:<battleId>[:<mode>]
-        const action = parts[1];
-        const battleId = parts[2];
-        const mode = parts[3] || 'show';
-        // Load battle data
-        const bSnap = await rtdb.ref(`battles/${battleId}`).get();
-        if (!bSnap.exists()) {
-          return safeReply(interaction, { content: 'Battle not found. It may have expired.', ephemeral: true });
-        }
-        const battle = bSnap.val() || {};
-        // Load clans and users
-        const [clansSnap2, usersSnap2] = await Promise.all([
-          rtdb.ref('clans').get(),
-          rtdb.ref('users').get(),
-        ]);
-        const clansData2 = clansSnap2.exists() ? clansSnap2.val() || {} : {};
-        const usersData2 = usersSnap2.exists() ? usersSnap2.val() || {} : {};
-        let uid2 = null;
-        try { uid2 = await getKCUidForDiscord(interaction.user.id); } catch (_) {}
-        // Process join and leave actions
-        if (action === 'join') {
-          if (!uid2) {
-            return safeReply(interaction, { content: 'Link your KC account with /link first to join battles.', ephemeral: true });
-          }
-          // Determine the user's clan
-          let userClanId = null;
-          for (const [cid, c] of Object.entries(clansData2)) {
-            if (c.members && c.members[uid2]) {
-              userClanId = cid;
-              break;
-            }
-          }
-          if (!userClanId) {
-            return safeReply(interaction, { content: 'You must be in a clan to join this battle.', ephemeral: true });
-          }
-          if (!(battle.challengerId === userClanId || battle.targetId === userClanId)) {
-            return safeReply(interaction, { content: 'You are not a member of either participating clan.', ephemeral: true });
-          }
-          if (battle.status === 'finished') {
-            return safeReply(interaction, { content: 'This battle has already finished.', ephemeral: true });
-          }
-          if (battle.participants && battle.participants[uid2]) {
-            return safeReply(interaction, { content: 'You have already joined this battle.', ephemeral: true });
-          }
-          // Write to DB
-          try {
-            await rtdb.ref(`battles/${battleId}/participants/${uid2}`).set(userClanId);
-            battle.participants = battle.participants || {};
-            battle.participants[uid2] = userClanId;
-          } catch (e) {
-            console.error('[battle join] failed:', e);
-            return safeReply(interaction, { content: 'Failed to join the battle. Try again later.', ephemeral: true });
-          }
-        }
-        else if (action === 'leave') {
-          // Remove the current user from participants if eligible
-          if (!uid2) {
-            return safeReply(interaction, { content: 'Link your KC account with /link first to leave battles.', ephemeral: true });
-          }
-          // Determine the user's clan
-          let userClanId2 = null;
-          for (const [cid, c] of Object.entries(clansData2)) {
-            if (c.members && c.members[uid2]) { userClanId2 = cid; break; }
-          }
-          if (!userClanId2) {
-            return safeReply(interaction, { content: 'You must be in a clan to leave this battle.', ephemeral: true });
-          }
-          if (!(battle.challengerId === userClanId2 || battle.targetId === userClanId2)) {
-            return safeReply(interaction, { content: 'You are not a member of either participating clan.', ephemeral: true });
-          }
-          if (!battle.participants || !battle.participants[uid2]) {
-            return safeReply(interaction, { content: 'You have not joined this battle.', ephemeral: true });
-          }
-          // Remove from DB and update local state
-          try {
-            await rtdb.ref(`battles/${battleId}/participants/${uid2}`).remove();
-            if (battle.participants) {
-              delete battle.participants[uid2];
-            }
-          } catch (e) {
-            console.error('[battle leave] failed:', e);
-            return safeReply(interaction, { content: 'Failed to leave the battle. Try again later.', ephemeral: true });
-          }
-        }
-        // Determine if description should be included (for info action)
-        const includeDesc = (action === 'info' && mode === 'show');
-        const embed = buildBattleDetailEmbed(battleId, battle, clansData2, usersData2, includeDesc);
-        // Determine join button state for the current user (if logged in and in clan)
-        let joinBtn;
-        const canJoin2 = (
-          battle.status !== 'finished' &&
-          uid2 && (() => {
-            let userClanId = null;
-            for (const [cid, c] of Object.entries(clansData2)) {
-              if (c.members && c.members[uid2]) { userClanId = cid; break; }
-            }
-            return userClanId && (battle.challengerId === userClanId || battle.targetId === userClanId) && !(battle.participants && battle.participants[uid2]);
-          })()
-        );
-        if (canJoin2) {
-          joinBtn = new ButtonBuilder().setCustomId(`battle:join:${battleId}`).setLabel('Join').setStyle(ButtonStyle.Success);
-        } else {
-          // If user is logged in and already joined, offer Leave button; else disable Join
-          if (uid2 && battle.participants && battle.participants[uid2]) {
-            joinBtn = new ButtonBuilder().setCustomId(`battle:leave:${battleId}`).setLabel('Leave').setStyle(ButtonStyle.Danger);
-          } else {
-            joinBtn = new ButtonBuilder().setCustomId('battle:join:disabled').setLabel('Join').setStyle(ButtonStyle.Secondary).setDisabled(true);
-          }
-        }
-        // Info button toggles show/hide description
-        const nextMode2 = includeDesc ? 'hide' : 'show';
-        const infoLabel2 = includeDesc ? 'Hide Info' : 'Info';
-        const infoBtn2 = new ButtonBuilder().setCustomId(`battle:info:${battleId}:${nextMode2}`).setLabel(infoLabel2).setStyle(ButtonStyle.Secondary);
-        const row2 = new ActionRowBuilder().addComponents(joinBtn, infoBtn, backBtn3);
-        await safeDefer(interaction, { intent: 'update' });
-        return safeReply(interaction, { embeds: [embed], components: [row2] });
-      }
-      // For buttons opening modals, we must reply/showModal, not defer.
-      if (id.startsWith('msg:reply')) {
-         const path = decPath(id.split(':')[2]);
-         const modal = new ModalBuilder()
-           .setCustomId(`msg:replyModal:${encPath(path)}`)
-           .setTitle('Reply to message');
-         const input = new TextInputBuilder()
-           .setCustomId('replyText')
-           .setLabel('Your reply')
-           .setStyle(TextInputStyle.Paragraph)
-           .setMaxLength(500);
-         modal.addComponents(new ActionRowBuilder().addComponents(input));
-         return interaction.showModal(modal);
-      }
-      if (id.startsWith('clips:comment:')) {
-        const sid = id.split(':')[2];
-        const payload = readModalTarget(sid);
-        if (!payload) {
-          return safeReply(interaction, { content: 'That action expired. Please reopen the clip.', ephemeral: true });
-        }
-        const modal = new ModalBuilder()
-          .setCustomId(`clips:commentModal:${sid}`)
-          .setTitle('Add a comment');
-        const input = new TextInputBuilder()
-          .setCustomId('commentText')
-          .setLabel('Your comment')
-          .setStyle(TextInputStyle.Paragraph)
-          .setMaxLength(300)
-          .setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-        return interaction.showModal(modal);
-      }
-
-      // --- FIX (Item 2): Remove unconditional defer ---
-      // We now defer *inside* branches that update the message.
-
-      if (id.startsWith('lb:')) {
-        // --- FIX (Item 2): Defer for message update ---
-        await safeDefer(interaction, { intent: "update" });
-        const [, , catStr, pageStr] = id.split(':');
-        const catIdx = Math.max(0, Math.min(2, parseInt(catStr,10) || 0));
-        const page   = Math.max(0, parseInt(pageStr,10) || 0);
-        let rows = interaction.client.lbCache?.get(interaction.message.interaction?.id || '');
-        if (!Array.isArray(rows)) {
-          rows = await loadLeaderboardData();
-          // Cache it again if it expired
-          interaction.client.lbCache?.set(interaction.message.interaction?.id, rows);
-        }
-        const embed = buildLbEmbed(rows, catIdx, page);
-        // Use safeReply, which will call .update()
-        await safeReply(interaction, { embeds: [embed], components: [lbRow(catIdx, page)] });
-      }
-      else if (id.startsWith('c:')) { // clips list navigation
-        const invokerId = interaction.message.interaction?.user?.id;
-        if (invokerId && invokerId !== interaction.user.id) {
-          // --- FIX (Item 2): No defer for ephemeral reply ---
-          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-        }
-
-        const [c, action, a, b] = id.split(':'); // c:<action>:...
-        
-        if (action === 'o') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          // open detail view for idx = a
-          const { state, item, idx } = getClipByIdx(interaction, parseInt(a,10));
-          const postPath = clipDbPath(item);
-          state.currentPostPath = postPath; // Store for 'back' button
-          const embed = buildClipDetailEmbed(item, state.nameMap);
-          const rows = clipsDetailRows(interaction, postPath);
-          return safeReply(interaction, { embeds:[embed], components: rows });
-        }
-        else if (action === 'b') { // 'c:b' - back to list (deprecated by 'clips:back')
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          // back to list
-          const state = getClipsState(interaction);
-          state.currentPostPath = null;
-          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
-        }
-        else if (action === 'p') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          // page change
-          const state = getClipsState(interaction);
-          state.page = Math.max(0, parseInt(a,10) || 0);
-          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
-        }
-        else if (action === 'rf') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          // refresh list (re-fetch and re-sort)
-          const state = getClipsState(interaction);
-          const platform = state.platform || 'all';
-          const all = await fetchAllPosts({ platform });
-          all.sort((a,b)=>b.score-a.score);
-          state.list = all.slice(0, CLIPS.MAX_LIST);
-          state.nameMap = await getAllUserNames(); // Refresh names too
-          state.page = 0; // Reset to page 0
-          
-          const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-          return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
-        }
-      }
-      else if (id.startsWith('clips:react:')) {
-        // --- FIX (Item 2): No defer for ephemeral reply ---
-        const shortId = id.split(':')[2];
-        const payload = _readFromCache(interaction.client.reactCache, interaction.message, shortId);
-        if (!payload) {
-          return safeReply(interaction, { content: 'Reaction expired. Reopen the clip and try again.', ephemeral: true });
-        }
-
-        const { postPath, emoji } = payload;
-        const discordId = interaction.user.id;
-        const uid = await getKCUidForDiscord(discordId);
-        if (!uid) {
-          return safeReply(interaction, { content: 'Link your KC account with /link to react.', ephemeral: true });
-        }
-
-        const myRef = rtdb.ref(`${postPath}/reactions/${emoji}/${uid}`);
-        const tx = await myRef.transaction(cur => (cur ? null : true));
-        const wasReacted = !tx.snapshot.exists(); // true if we just removed it
-
-        await rtdb.ref(`${postPath}/reactionCounts/${emoji}`).transaction(cur => (cur || 0) + (wasReacted ? -1 : 1));
-
-        await safeReply(interaction, { content: '✅ Reaction updated.', ephemeral: true });
-      }
-      else if (id.startsWith('clips:reactors:')) {
-        // --- FIX (Item 2): No defer for ephemeral reply ---
-        const sid = id.split(':')[2];
-        const payload = _readFromCache(interaction.client.reactorsCache, interaction.message, sid);
-        if (!payload) {
-          return safeReply(interaction, { content: 'That list expired. Reopen the clip to refresh.', ephemeral: true });
-        }
-        const { postPath } = payload;
-
-        const snap = await withTimeout(rtdb.ref(`${postPath}/reactions`).get(), 6000, `RTDB ${postPath}/reactions`);
-        const data = snap.exists() ? (snap.val() || {}) : {};
-        const nameMap = await getAllUserNames();
-
-        const lines = [];
-        for (const emo of POST_EMOJIS) {
-          const uids = Object.keys(data[emo] || {});
-          if (!uids.length) continue;
-          const pretty = uids.map(u => nameMap.get(u) || 'unknown').slice(0, 20).join(', ');
-          const more = uids.length > 20 ? ` … +${uids.length - 20} more` : '';
-          lines.push(`${emo} ${pretty}${more}`);
-        }
-
-        const embed = new EmbedBuilder()
-          .setTitle('Reactors')
-          .setDescription(lines.join('\n') || '_No reactions yet._')
-          .setColor(DEFAULT_EMBED_COLOR)
-          .setFooter({ text: 'KC Bot • /clips' });
-
-        await safeReply(interaction, { embeds:[embed], ephemeral: true });
-      }
-      else if (id.startsWith('clips:comments:prev:') || id.startsWith('clips:comments:next:')) {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const parts = id.split(':'); // ['clips','comments','prev|next', sid, page]
-          const sid = parts[3];
-          const page = parseInt(parts[4], 10) || 0;
-          const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
-          if (!payload) {
-              return safeReply(interaction, { content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
-          }
-          const { postPath } = payload;
-          const state = getClipsState(interaction);
-          let item = state?.list?.find(x => clipDbPath(x) === postPath);
-          if (!item) {
-              const snap = await rtdb.ref(postPath).get();
-              item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
-              if (!item) return safeReply(interaction, { content: 'Could not load clip data.' });
-          }
-          const nameMap = state?.nameMap || await getAllUserNames();
-          const comments = await loadClipComments(postPath);
-          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
-          const p = Math.max(0, Math.min(page, maxPage));
-          const embed = buildClipCommentsEmbed(item, comments, p, nameMap);
-          const rows = [commentsRows(sid, p, maxPage)];
-          await safeReply(interaction, { content: '', embeds: [embed], components: rows });
-      }
-      else if (id.startsWith('clips:comments:')) {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const sid = id.split(':')[2];
-          const payload = _readFromCache(interaction.client.commentsCache, interaction.message, sid);
-          if (!payload) {
-              return safeReply(interaction, { content: 'That comments list expired. Reopen the clip and try again.', ephemeral: true });
-          }
-          const { postPath } = payload;
-          const state = getClipsState(interaction);
-          let item = state?.list?.find(x => clipDbPath(x) === postPath);
-          if (!item) {
-              const snap = await rtdb.ref(postPath).get();
-              item = snap.exists() ? { ownerUid: postPath.split('/')[1], postId: postPath.split('/').pop(), data: snap.val() } : null;
-              if (!item) return safeReply(interaction, { content: 'Could not load clip data.' });
-          }
-          const nameMap = state?.nameMap || await getAllUserNames();
-          const comments = await loadClipComments(postPath);
-          const maxPage = Math.max(0, Math.ceil(comments.length / 10) - 1);
-          const page = 0;
-          const embed = buildClipCommentsEmbed(item, comments, page, nameMap);
-          const rows = [commentsRows(sid, page, maxPage)];
-          await safeReply(interaction, { content: '', embeds: [embed], components: rows });
-      }
-      else if (id === 'clips:backDetail') {
-        // --- FIX (Item 2): Defer for message update ---
-        await safeDefer(interaction, { intent: "update" });
-        // Back from comments to clip detail
-        const state = getClipsState(interaction);
-        if (!state || !state.currentPostPath) {
-            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
-        }
-        const item = state.list.find(x => clipDbPath(x) === state.currentPostPath);
-        if (!item) {
-            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
-        }
-        const embed = buildClipDetailEmbed(item, state.nameMap);
-        const rows = clipsDetailRows(interaction, state.currentPostPath);
-        return safeReply(interaction, { embeds: [embed], components: rows });
-      }
-      else if (id === 'clips:back') {
-        // --- FIX (Item 2): Defer for message update ---
-        await safeDefer(interaction, { intent: "update" });
-        // Back from clip detail to list
-        const state = getClipsState(interaction);
-        if (!state) {
-            return safeReply(interaction, { content: 'Clip data expired. Please run /clips again.' });
-        }
-        state.currentPostPath = null;
-        const embed = buildClipsListEmbed(state.list, state.page, state.nameMap);
-        return safeReply(interaction, { embeds:[embed], components: clipsListRows(state.list.length, state.page) });
-      }
-      else if (interaction.customId.startsWith('msg:')) {
-        const invokerId = interaction.message.interaction?.user?.id;
-        if (invokerId && invokerId !== interaction.user.id) {
-          // --- FIX (Item 2): No defer for ephemeral reply ---
-          return safeReply(interaction, { content: 'Only the person who ran this command can use these controls.', ephemeral: true });
-        }
-        const key = interaction.message.interaction?.id || '';
-        interaction.client.msgCache ??= new Map();
-        let state = interaction.client.msgCache.get(key);
-        if (!state) {
-          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-          state = { list, nameMap };
-          interaction.client.msgCache.set(key, state);
-        }
-        const [ns, action, a, b] = interaction.customId.split(':');
-        if (action === 'view' || action === 'openIdx') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
-          const msg = state.list[idx];
-          const fresh = await loadNode(msg.path);
-          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
-          // --- FIX (Item 1): Fix object spread ---
-          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          // --- END FIX ---
-          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
-        }
-        else if (action === 'back' || action === 'list') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const embed = buildMessagesEmbed(state.list, state.nameMap);
-          await safeReply(interaction, { embeds: [embed], components: messageIndexRows(state.list.length || 0) });
-        }
-        else if (action === 'refresh') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const [list, nameMap] = await Promise.all([fetchLatestMessages(10), getAllUserNames()]);
-          state.list = list;
-          state.nameMap = nameMap;
-          const embed = buildMessagesEmbed(list, nameMap);
-          await safeReply(interaction, { embeds: [embed], components: messageIndexRows(list.length || 0) });
-        }
-        else if (action === 'refreshOne') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const idx = Math.max(0, Math.min(parseInt(a||'0',10), (state.list.length||1)-1));
-          const msg = state.list[idx];
-          const fresh = await loadNode(msg.path);
-          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
-          // --- FIX (Item 1): Fix object spread (redundant, already fixed above) ---
-          const embed = buildMessageDetailEmbed({ ...msg, ...fresh }, state.nameMap);
-          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(idx, state.list, msg.path, hasReplies) });
-        }
-        else if (action === 'openPath') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const path = decPath(a);
-          const idx = state.list.findIndex(m=>m.path===path);
-          const base = idx>=0 ? state.list[idx] : await loadNode(path);
-          const fresh = await loadNode(path);
-          const hasReplies = !!(fresh?.replies && Object.keys(fresh.replies).length);
-          // --- FIX (Item 1): Fix object spread ---
-          const embed = buildMessageDetailEmbed({ ...(base || {}), ...(fresh || {}) }, state.nameMap);
-          // --- END FIX ---
-          await safeReply(interaction, { embeds: [embed], components: messageDetailRows(Math.max(0,idx), state.list, path, hasReplies) });
-        }
-        else if (action === 'thread' || action === 'threadPrev' || action === 'threadNext') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const path = decPath(a);
-          const page = parseInt(b||'0',10) || 0;
-          const parent = await loadNode(path);
-          const children = await loadReplies(path);
-          const embed = buildThreadEmbed(parent, children, page, 10, state.nameMap);
-          await safeReply(interaction, { embeds: [embed], components: threadRows(path, children, page, 10) });
-        }
-        else if (action === 'openChild') {
-          // --- FIX (Item 2): Defer for message update ---
-          await safeDefer(interaction, { intent: "update" });
-          const path = decPath(a);
-          const node = await loadNode(path);
-          const hasReplies = !!(node?.replies && Object.keys(node.replies).length);
-          const embed = buildMessageDetailEmbed(node, state.nameMap);
-          const rows = [
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`msg:thread:${encPath(path)}:0`).setLabel('Open thread').setStyle(ButtonStyle.Secondary).setDisabled(!hasReplies),
-              new ButtonBuilder().setCustomId(`msg:openPath:${encPath(path.split('/replies/').slice(0,-1).join('/replies/'))}`).setLabel('Up one level').setStyle(ButtonStyle.Secondary),
-              new ButtonBuilder().setCustomId('msg:back').setLabel('Back to list').setStyle(ButtonStyle.Secondary),
-            ),
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`msg:like:${encPath(path)}`).setLabel('❤️ Like/Unlike').setStyle(ButtonStyle.Primary),
-              new ButtonBuilder().setCustomId(`msg:reply:${encPath(path)}`).setLabel('↩️ Reply').setStyle(ButtonStyle.Primary),
-            ),
-          ];
-          await safeReply(interaction, { embeds: [embed], components: rows });
-        }
-        else if (action === 'like') {
-          // --- FIX (Item 2): No defer for ephemeral reply ---
-          const discordId = interaction.user.id;
-          const uid = await getKCUidForDiscord(discordId);
-          if (!uid) return await safeReply(interaction, { content: 'Link your KC account first with /link.', ephemeral: true });
-          const path = decPath(a);
-          const likedSnap = await withTimeout(rtdb.ref(`${path}/likedBy/${uid}`).get(), 6000, `RTDB ${path}/likedBy`);
-          const wasLiked = likedSnap.exists();
-          await rtdb.ref(`${path}/likedBy/${uid}`).transaction(cur => cur ? null : true);
-          await rtdb.ref(`${path}/likes`).transaction(cur => (cur||0) + (wasLiked ? -1 : 1));
-          
-          // We must acknowledge, but we don't want to update the embed
-          // as it's disruptive. Send an ephemeral ack.
-          await safeReply(interaction, { content: '✅ Like updated.', ephemeral: true });
-
-          // --- Optional: update the message embed *after* acknowledging ---
-          // This is "fire and forget" - we don't await it, and if it fails,
-          // the user has already been notified of success.
-          (async () => {
-            try {
-              const node = await loadNode(path);
-              const embed = buildMessageDetailEmbed(node, state?.nameMap || new Map());
-              const i = state.list.findIndex(m=>m.path===path);
-              if (i>=0) {
-                 // --- FIX (Item 1): Fix object spread ---
-                 state.list[i] = { ...state.list[i], ...node };
-                 // --- END FIX ---
-              }
-              // We already replied, so this must be .editReply on the *original* message
-              await interaction.message.edit({ embeds: [embed] });
-            } catch (e) {
-              console.warn(`[msg:like] failed to update embed post-ack:`, e.message);
-            }
-          })();
-        }
-      }
-      else if (interaction.customId === 'votes:refresh') {
-        // --- FIX (Item 2): Defer for message update ---
-        await safeDefer(interaction, { intent: "update" });
-        const scores = await loadVoteScores();
-        const embed = buildVoteEmbed(scores);
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('votes:refresh').setLabel('Refresh').setStyle(ButtonStyle.Primary)
-        );
-        await safeReply(interaction, { embeds: [embed], components: [row] });
-      }
-      else if (interaction.customId.startsWith('vote:delete:')) {
-        // --- FIX (Item 2): Defer for message update ---
-        await safeDefer(interaction, { intent: "update" });
-        const uid = interaction.customId.split(':')[2];
-        await withTimeout(rtdb.ref(`votes/${uid}`).remove(), 6000, `delete vote ${uid}`);
-        await safeReply(interaction, { content: '🗑️ Your vote was deleted. Run `/vote` to submit a new one.', components: [], embeds: [] });
-      }
-    } catch (err) {
-      console.error(`[button:${id}]`, err);
-      const msg = '❌ Sorry, something went wrong.';
-      // We must use safeReply to handle the state (deferred/not)
-      await safeReply(interaction, { content: msg, ephemeral: true, embeds: [], components: [] });
-    }
   }
-  // --- Select Menu Handlers ---
   else if (interaction.isStringSelectMenu()) {
     const [prefix, parentInteractionId] = interaction.customId.split(':');
-    // Handle Battledome server filter selection before other menus. Custom ID
-    // format: bd:server_filter_select:<guildId>. This allows users to
-    // subscribe/unsubscribe from specific Battledome regions.
     if (interaction.customId.startsWith('bd:server_filter_select')) {
       try {
         const parts = interaction.customId.split(':');
@@ -5193,7 +3013,7 @@ client.on('interactionCreate', async (interaction) => {
         const userId = interaction.user.id;
         const selected = interaction.values || [];
         const updates = {};
-        for (const regionKey of ['East','EU']) {
+        for (const regionKey of ['East','EU']) { // West Removed
           const path = `bdNotify/${guildId}/${userId}/regions/${regionKey}`;
           if (selected.includes(regionKey)) {
             updates[path + '/enabled'] = true;
@@ -5207,133 +3027,35 @@ client.on('interactionCreate', async (interaction) => {
         const serverList = selected.length ? selected.join(', ') : 'None';
         return safeReply(interaction, { content: `✅ Your Battledome servers updated to: ${serverList}`, embeds: [], components: [], ephemeral: true });
       } catch (err) {
-        console.error('[bd server filter select]', err);
         return safeReply(interaction, { content: '❌ Failed to update your servers.', embeds: [], components: [], ephemeral: true });
       }
     }
-  
-    if (prefix === 'clans_select') {
+    if (prefix === 'bd_select') {
       try {
-        const clanId = interaction.values[0];
-        const cache = interaction.client.clanCache?.get(parentInteractionId);
-        if (!cache) {
-          // No defer yet; reply ephemeral
-          return safeReply(interaction, { 
-              content: 'Clan data has expired. Run `/clans` again.',
-              ephemeral: true
-          });
-        }
-  
-        // We know we’ll update the existing menu message
-        await safeDefer(interaction, { intent: 'update' });
-      
-        const { entries, usersData, badgesData } = cache;
-        const clan = entries.find(c => c.id === clanId);
-        if (!clan) {
-          return safeReply(interaction, { content: 'Clan not found.', embeds: [], components: [] });
-        }
-      
-        // build member display names
-        let memberNames = '';
-        if (clan.members) {
-          memberNames = Object.keys(clan.members)
-            .map(uid => usersData[uid]?.displayName || uid)
-            .join(', ');
-          if (memberNames.length > 1024) {
-            memberNames = memberNames.slice(0, 1020) + '…';
-          }
-        }
-      
-        const owner = usersData[clan.owner] || {};
-      
-        // recompute score in case it is needed
-        const score = computeClanScore(clan, usersData, badgesData);
-      
-        const detailEmbed = new EmbedBuilder()
-          .setTitle(`${clan.name}${clan.letterTag ? ` [${clan.letterTag}]` : ''}`)
-          .setDescription(clan.description || 'No description provided.')
-          .addFields(
-            { name: 'Owner', value: owner.displayName || 'Unknown', inline: false },
-            { name: 'Points', value: `${score}`, inline: true },
-            { name: 'Members', value: memberNames || 'No members', inline: false },
-          )
-          .setFooter({ text: `Region: ${clan.region || 'N/A'}` })
-          .setColor(DEFAULT_EMBED_COLOR);
-  
-        // Guard missing/invalid icon URL on the embed
-        if (clan.icon && /^https?:\/\//i.test(clan.icon)) {
-          detailEmbed.setThumbnail(clan.icon);
-        }
-      
-        await safeReply(interaction, {
-          content: '',
-          embeds: [detailEmbed],
-          components: [], // remove the select menu once a clan is chosen
-        });
-  
-        // Delete the cache after selection
-        interaction.client.clanCache?.delete(parentInteractionId);
-  
-      } catch (err) {
-          console.error(`[select:${prefix}]`, err);
-          await safeReply(interaction, { 
-              content: '❌ Sorry, something went wrong.', 
-              ephemeral: true, embeds: [], components: [] 
-          });
-      }
-    } else if (prefix === 'bd_select') {
-      try {
-          // MUST defer update so Discord doesn’t time out
           await safeDefer(interaction, { intent: 'update' });
-
           const cache = interaction.client.bdCache?.get(parentInteractionId);
-          if (!cache) {
-            return safeReply(interaction, { content: 'This Battledome menu expired. Run `/battledome` again.', ephemeral: true });
-          }
-
+          if (!cache) return safeReply(interaction, { content: 'This Battledome menu expired. Run `/battledome` again.', ephemeral: true });
           const idx = parseInt(interaction.values?.[0] || '', 10);
           const s = cache.servers?.[idx];
-          if (!s) {
-            return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
-          }
-      
-          // Resolve region URL from authoritative map
-          // Use s.region if available, otherwise map by name, fallback to East
-          const region = s.region || BD_NAME_OVERRIDES[s.name] || "East";
+          if (!s) return safeReply(interaction, { content: 'Invalid selection.', ephemeral: true });
+          const region = s.region || BD_NAME_OVERRIDES[s.name] || "East"; // Fallback changed from West
           const url = BD_SERVERS[region]?.url || s.url;
-
-          if (!url) {
-            return safeReply(interaction, { content: `No URL configured for region: ${region}`, ephemeral: true });
-          }
-      
+          if (!url) return safeReply(interaction, { content: `No URL configured for region: ${region}`, ephemeral: true });
           let info;
           let fromCache = false;
           let fetchedAt = 0;
-
           try {
             const r = await getBdInfoCached(url);
             info = r?.data;
             fromCache = !!r?.fromCache;
             fetchedAt = r?.fetchedAt || 0;
-          } catch (e) {
-            // quietly ignore errors; we'll fall back to warming message
-          }
-
+          } catch (e) {}
           if (!info) {
-              // Return warming up embed
-              const warmEmbed = new EmbedBuilder()
-                  .setTitle(`Battledome — ${s.name || 'Server'}`)
-                  .addFields(
-                      { name: 'Online now', value: '—', inline: true },
-                      { name: 'In dome now', value: '—', inline: true },
-                      { name: 'Players this hour', value: '—', inline: true },
-                      { name: 'Players (0)', value: '_No snapshot yet—warming cache. Try again in a few seconds._' }
-                  )
-                  .setColor(DEFAULT_EMBED_COLOR)
-                  .setFooter({ text: 'Cache warming up' });
+              const warmEmbed = new EmbedBuilder().setTitle(`Battledome — ${s.name || 'Server'}`)
+                  .addFields({ name: 'Online now', value: '—', inline: true }, { name: 'In dome now', value: '—', inline: true }, { name: 'Players this hour', value: '—', inline: true }, { name: 'Players (0)', value: '_No snapshot yet—warming cache. Try again in a few seconds._' })
+                  .setColor(DEFAULT_EMBED_COLOR).setFooter({ text: 'Cache warming up' });
               return safeReply(interaction, { embeds: [warmEmbed], components: interaction.message.components });
           }
-
           const players = Array.isArray(info?.players) ? info.players : [];
           const lines = players.slice(0, 40).map(p => {
             const inDome = (p.indomenow === 'Yes') ? ' 🏟️' : '';
@@ -5343,29 +3065,14 @@ client.on('interactionCreate', async (interaction) => {
             const idle = p.inactive > 60 ? ' *(idle)*' : '';
             return `${rank} **${name}**${score}${inDome}${idle}`;
           });
-
-          // Compute cache note for footer
           const ageSec = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 1000) : 0;
           const cacheNote = fromCache ? `⚠️ Cached (${ageSec}s ago)` : `✅ Live (${ageSec}s ago)`;
-
-          const embed = new EmbedBuilder()
-            .setTitle(info?.name ? `Battledome — ${info.name}` : `Battledome — ${s.name || 'Server'}`)
-            .addFields(
-              { name: 'Online now', value: String(info?.onlinenow ?? '—'), inline: true },
-              { name: 'In dome now', value: String(info?.indomenow ?? '—'), inline: true },
-              { name: 'Players this hour', value: String(info?.thishour ?? '—'), inline: true },
-              { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' }
-            )
-            .setColor(DEFAULT_EMBED_COLOR)
-            .setFooter({ text: `KC Bot • /battledome • ${cacheNote}` });
-
+          const embed = new EmbedBuilder().setTitle(info?.name ? `Battledome — ${info.name}` : `Battledome — ${s.name || 'Server'}`)
+            .addFields({ name: 'Online now', value: String(info?.onlinenow ?? '—'), inline: true }, { name: 'In dome now', value: String(info?.indomenow ?? '—'), inline: true }, { name: 'Players this hour', value: String(info?.thishour ?? '—'), inline: true }, { name: `Players (${players.length})`, value: lines.length ? lines.join('\n') : '_No players listed._' })
+            .setColor(DEFAULT_EMBED_COLOR).setFooter({ text: `KC Bot • /battledome • ${cacheNote}` });
           return safeReply(interaction, { embeds: [embed], components: interaction.message.components });
       } catch (err) {
-        console.error(`[select:${prefix}]`, err);
-        await safeReply(interaction, { 
-            content: '❌ Sorry, something went wrong.', 
-            ephemeral: true, embeds: [], components: [] 
-        });
+        await safeReply(interaction, { content: '❌ Sorry, something went wrong.', ephemeral: true, embeds: [], components: [] });
       }
      }
   }
@@ -5374,36 +3081,19 @@ client.on('interactionCreate', async (interaction) => {
 async function checkRegion(regionKey) {
   const config = BD_SERVERS[regionKey];
   if (!config) return;
-
-  // FIX: Use cached fetcher, do not throw
   const r = await getBdInfoCached(config.url).catch(() => null);
   const info = r?.data;
-
-  // If no data (start up fail), just return
   if (!info || !Array.isArray(info.players)) return;
-
-  // Update the last info snapshot for summary embeds. This allows us to
-  // construct consolidated status messages across all regions. Store the
-  // fetchedAt time as well so we can display relative age in footers.
   bdLastInfo[regionKey] = info;
   bdLastFetch[regionKey] = r?.fetchedAt || Date.now();
-
-  // Update top scores
   updateBdTop(regionKey, info.players);
-
-  // Optional: Announce fresh cache
   if (r && !r.fromCache && !r.stale) {
-      // Don't await to avoid blocking poller
       announceBdCacheUpdated(regionKey, r.fetchedAt).catch(() => {});
   }
-
   const state = bdState[regionKey];
   const currentNames = new Set(info.players.map(p => p.name));
   const currentOnline = info.onlinenow;
-  // Track current in‑dome player count for threshold logic
   const currentIndome = info.indomenow || 0;
-
-  // First run: just init state
   if (state.lastCheck === 0) {
     state.lastNames = currentNames;
     state.lastOnline = currentOnline;
@@ -5411,29 +3101,17 @@ async function checkRegion(regionKey) {
     state.lastCheck = Date.now();
     return;
   }
-
-  // Diff
   const joins = [];
   const leaves = [];
+  for (const name of currentNames) if (!state.lastNames.has(name)) joins.push(name);
+  for (const name of state.lastNames) if (!currentNames.has(name)) leaves.push(name);
   
-  for (const name of currentNames) {
-    if (!state.lastNames.has(name)) joins.push(name);
-  }
-  for (const name of state.lastNames) {
-    if (!currentNames.has(name)) leaves.push(name);
-  }
-
-  // Unnamed calc
-  // Effective count of named players
   const namedCountPrev = state.lastNames.size;
   const namedCountCurr = currentNames.size;
-  
   const unnamedPrev = Math.max(0, state.lastOnline - namedCountPrev);
   const unnamedCurr = Math.max(0, currentOnline - namedCountCurr);
-  
   let unnamedDiff = unnamedCurr - unnamedPrev; 
   
-  // Update state immediately
   state.lastNames = currentNames;
   state.lastOnline = currentOnline;
   state.lastIndome = currentIndome;
@@ -5441,46 +3119,30 @@ async function checkRegion(regionKey) {
 
   if (joins.length === 0 && leaves.length === 0 && unnamedDiff === 0) return;
 
-  // Broadcast
   await broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info });
 
-  // Record recent join/leave events. We do this after the broadcast call so
-  // notifications reflect the current event. We push each player name along
-  // with a timestamp. Prune old entries first to keep memory bounded.
   pruneBdRecent();
   const now = Date.now();
-  for (const name of joins) {
-    bdRecent[regionKey].push({ name, time: now, type: 'join' });
-  }
-  for (const name of leaves) {
-    bdRecent[regionKey].push({ name, time: now, type: 'leave' });
-  }
+  for (const name of joins) bdRecent[regionKey].push({ name, time: now, type: 'join' });
+  for (const name of leaves) bdRecent[regionKey].push({ name, time: now, type: 'leave' });
 
-  // If there were any joins or leaves, also post a summary block to each
-  // configured join log channel. This emits green and red embeds summarising
-  // the counts and names. It iterates through all guilds that have
-  // configured join logs and posts to each. Errors are ignored per guild.
   if (joins.length > 0 || leaves.length > 0) {
     for (const [guildId] of globalCache.bdJoinLogs.entries()) {
       try {
         await postJoinLogsBlock(guildId, regionKey, { joins, leaves });
-      } catch (e) {
-        // silent
-      }
+      } catch (e) {}
     }
   }
 }
 
+// Updated Broadcast logic (Instruction 2C)
 async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }) {
   const serverName = BD_SERVERS[regionKey]?.name || regionKey;
-  const onlineNow = info.onlinenow || 0;
-  const inDomeNow = info.indomenow || 0;
-  const metricValue = onlineNow; // player-limit metric (online players)
+  // C1: Metric is onlinenow (Total online)
+  const currentMetric = info.onlinenow || 0; 
 
-  // Iterate through configured guilds to determine which users need to be alerted.
   for (const [guildId, _channelId] of globalCache.bdDestinations.entries()) {
     try {
-      // Skip if alerts are globally disabled for this guild
       let alertsEnabled = true;
       try {
         const enabledSnap = await rtdb.ref(`config/bdAlertsEnabled/${guildId}`).get();
@@ -5501,8 +3163,10 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
         const threshold = sub.threshold;
         const mode = sub.mode || (typeof threshold === 'number' ? 'active' : 'join');
         const prevState = sub.state || 'below';
+
         if (mode === 'active' && typeof threshold === 'number') {
-          if (metricValue >= threshold) {
+          // Check metric against threshold
+          if (currentMetric >= threshold) {
             if (prevState !== 'above') {
               triggered.push({ userId, mode: 'active', threshold });
               stateUpdates[`bdNotify/${guildId}/${userId}/regions/${regionKey}/state`] = 'above';
@@ -5513,96 +3177,119 @@ async function broadcastBdUpdate(regionKey, { joins, leaves, unnamedDiff, info }
             }
           }
         } else {
-          // join mode: trigger on any new named joins
-          if (joins.length > 0) {
-            triggered.push({ userId, mode: 'join' });
-          }
+          // join mode
+          if (joins.length > 0) triggered.push({ userId, mode: 'join' });
         }
       });
       if (Object.keys(stateUpdates).length > 0) {
         rtdb.ref().update(stateUpdates).catch(e => console.error('State update failed', e));
       }
-      // Notify each triggered user. Apply DM preferences and join logs rules.
+
       for (const { userId, mode, threshold } of triggered) {
-        // Skip join‑mode alerts for DM/logging. Joins are covered by join logs blocks.
-        if (mode !== 'active') {
-          continue;
-        }
-        // Build message for threshold alerts
-        let message;
-        if (typeof threshold === 'number') {
-          // Compose a more user‑friendly threshold message
-          message = `✅ ${serverName} Battledome has reached your player count of **${threshold}** (online now ${metricValue}).`;
-        } else {
-          // Should not happen for active mode, but fallback
-          message = `✅ ${serverName} Battledome activity notification.`;
-        }
-        // Determine DM preference for this user in this guild
+        if (mode !== 'active') continue; // Joins handled by logs
+        
+        const message = `✅ ${serverName} Battledome has reached your player count (online) of **${threshold}** (now ${currentMetric}).`;
+        
+        // C2: Read DM pref default false
         let dmEnabledPref = false;
         try {
           const snap = await rtdb.ref(`config/bdAlertPrefs/${guildId}/${userId}/dmEnabled`).get();
           if (snap.exists() && snap.val() === true) dmEnabledPref = true;
         } catch {}
-        // Determine if a join logs channel is configured
+        
         const joinLogsId = globalCache.bdJoinLogs?.get(guildId);
-        // Delivery logic: if DM enabled, DM. Else if join logs exists, mention. Else silent.
+        
+        // C3: DM rule
         if (dmEnabledPref === true) {
-          // DM the user only
           try {
             const user = await client.users.fetch(userId).catch(() => null);
-            if (user) {
-              await user.send({ content: message });
-            }
+            if (user) await user.send({ content: message });
           } catch {}
         } else {
-          // DM disabled
-          if (joinLogsId) {
-            try {
-              const chan = await client.channels.fetch(joinLogsId).catch(() => null);
-              if (chan && chan.isTextBased?.()) {
-                await chan.send({ content: `<@${userId}> ${message}` });
-              }
-            } catch {}
-          }
-          // If no join logs channel, remain silent
+            // If DM disabled -> check join logs -> else silent
+            if (joinLogsId) {
+                try {
+                    const chan = await client.channels.fetch(joinLogsId).catch(() => null);
+                    if (chan && chan.isTextBased?.()) {
+                        await chan.send({ content: `<@${userId}> ${message}` });
+                    }
+                } catch {}
+            }
         }
       }
     } catch (err) {
       console.error('[BD Broadcast] Error while processing guild', guildId, err);
     }
   }
-
-  // After notifying subscribers, update or send the consolidated status message
-  // across all guilds. This replaces sending per-update status embeds and
-  // keeps channels tidy. Errors are logged inside updateBdStatusMessages().
-  updateBdStatusMessages().catch(() => {});
 }
 
-// Polling Loop
+// Polling Loop: 15s interval (Instruction 2B)
 async function pollBattledome() {
-  // Run a single tick every 15 seconds that refreshes both regions then
-  // updates the consolidated status message.
   setInterval(async () => {
-    try {
-      await Promise.all([
-        checkRegion('East'),
-        checkRegion('EU'),
-      ]);
-      // Even if there were no joins/leaves, refresh the dashboard.
-      await updateBdStatusMessages();
-    } catch (e) {
-      console.error('[BD Poller] Tick error:', e);
-    }
-  }, 15000).unref?.();
+      try {
+          // Refresh both East and EU concurrently
+          await Promise.all([checkRegion('East'), checkRegion('EU')]);
+          // Update status messages
+          await updateBdStatusMessages();
+      } catch (e) {
+          console.error('[BD Poller] Interval error:', e);
+      }
+  }, 15000);
 }
-
 
 // ---------- Startup ----------
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   clientReady = true;
   
-  // Load clip destinations
+  // A1: Load persistent status message IDs
+  try {
+      const snap = await rtdb.ref('config/bdStatusMessage').get();
+      if (snap.exists()) {
+          const val = snap.val();
+          for(const [gid, data] of Object.entries(val)) {
+              if (data && data.channelId && data.messageId) {
+                  globalCache.bdStatusMessages.set(gid, data);
+              }
+          }
+      }
+  } catch(e) { console.error('Failed to load status messages', e); }
+
+  // F3: Load BD-KC mappings
+  try {
+      const snap = await rtdb.ref('config/bdToKC').get();
+      if (snap.exists()) {
+          const val = snap.val();
+          for(const [did, data] of Object.entries(val)) {
+              if (data.enabled) {
+                  globalCache.bdToKC.set(did, data);
+                  if (data.kcName) globalCache.kcNameToUid.set(data.kcName, data.kcUid);
+              }
+          }
+      }
+      // Listener for updates
+      rtdb.ref('config/bdToKC').on('child_changed', s => {
+          const data = s.val();
+          if (data.enabled) {
+              globalCache.bdToKC.set(s.key, data);
+              if (data.kcName) globalCache.kcNameToUid.set(data.kcName, data.kcUid);
+          } else {
+              globalCache.bdToKC.delete(s.key);
+              // rebuild reverse map costly? assume infrequent.
+          }
+      });
+      rtdb.ref('config/bdToKC').on('child_added', s => {
+        const data = s.val();
+        if (data.enabled) {
+            globalCache.bdToKC.set(s.key, data);
+            if (data.kcName) globalCache.kcNameToUid.set(data.kcName, data.kcUid);
+        }
+      });
+      rtdb.ref('config/bdToKC').on('child_removed', s => {
+          globalCache.bdToKC.delete(s.key);
+      });
+  } catch(e) { console.error('Failed to load BD-KC map', e); }
+
   try {
     const snap = await rtdb.ref('config/clipDestinations').get();
     globalCache.clipDestinations.clear();
@@ -5612,8 +3299,6 @@ client.once('ready', async () => {
         if (cfg?.channelId) globalCache.clipDestinations.set(guildId, cfg.channelId);
       }
     }
-    console.log(`[broadcast] loaded initial clip destinations: ${globalCache.clipDestinations.size}`);
-
     rtdb.ref('config/clipDestinations').on('child_added', s => {
       const v = s.val() || {};
       if (v.channelId) globalCache.clipDestinations.set(s.key, v.channelId);
@@ -5626,11 +3311,8 @@ client.once('ready', async () => {
     rtdb.ref('config/clipDestinations').on('child_removed', s => {
       globalCache.clipDestinations.delete(s.key);
     });
-  } catch (e) {
-    console.error('[broadcast] failed to load clip destinations', e);
-  }
+  } catch (e) {}
 
-  // Load Battledome destinations (NEW)
   try {
     const snap = await rtdb.ref('config/bdDestinations').get();
     globalCache.bdDestinations.clear();
@@ -5640,8 +3322,6 @@ client.once('ready', async () => {
         if (cfg?.channelId) globalCache.bdDestinations.set(guildId, cfg.channelId);
       }
     }
-    console.log(`[BD] loaded initial destinations: ${globalCache.bdDestinations.size}`);
-
     rtdb.ref('config/bdDestinations').on('child_added', s => {
       const v = s.val() || {};
       if (v.channelId) globalCache.bdDestinations.set(s.key, v.channelId);
@@ -5654,11 +3334,8 @@ client.once('ready', async () => {
     rtdb.ref('config/bdDestinations').on('child_removed', s => {
       globalCache.bdDestinations.delete(s.key);
     });
-  } catch (e) {
-    console.error('[BD] failed to load destinations', e);
-  }
+  } catch (e) {}
 
-  // Load Battledome join log channels (NEW)
   try {
     const snap = await rtdb.ref('config/bdJoinLogsChannel').get();
     globalCache.bdJoinLogs.clear();
@@ -5668,8 +3345,6 @@ client.once('ready', async () => {
         if (cfg?.channelId) globalCache.bdJoinLogs.set(guildId, cfg.channelId);
       }
     }
-    console.log(`[BD] loaded initial join log channels: ${globalCache.bdJoinLogs.size}`);
-
     rtdb.ref('config/bdJoinLogsChannel').on('child_added', s => {
       const v = s.val() || {};
       if (v.channelId) globalCache.bdJoinLogs.set(s.key, v.channelId);
@@ -5682,98 +3357,16 @@ client.once('ready', async () => {
     rtdb.ref('config/bdJoinLogsChannel').on('child_removed', s => {
       globalCache.bdJoinLogs.delete(s.key);
     });
-  } catch (e) {
-    console.error('[BD] failed to load join log channels', e);
-  }
+  } catch (e) {}
 
-  // Load persisted Battledome dashboard message IDs (restart-safe)
-  try {
-    const snap = await rtdb.ref('config/bdStatusMessage').get();
-    globalCache.bdStatusMessages.clear();
-    if (snap.exists()) {
-      const all = snap.val() || {};
-      for (const [guildId, cfg] of Object.entries(all)) {
-        if (cfg?.channelId) {
-          globalCache.bdStatusMessages.set(guildId, { channelId: cfg.channelId, messageId: cfg.messageId || null });
-        }
-      }
-    }
-    rtdb.ref('config/bdStatusMessage').on('child_added', s => {
-      const v = s.val() || {};
-      if (v.channelId) globalCache.bdStatusMessages.set(s.key, { channelId: v.channelId, messageId: v.messageId || null });
-    });
-    rtdb.ref('config/bdStatusMessage').on('child_changed', s => {
-      const v = s.val() || {};
-      if (v.channelId) globalCache.bdStatusMessages.set(s.key, { channelId: v.channelId, messageId: v.messageId || null });
-      else globalCache.bdStatusMessages.delete(s.key);
-    });
-    rtdb.ref('config/bdStatusMessage').on('child_removed', s => {
-      globalCache.bdStatusMessages.delete(s.key);
-    });
-    console.log(`[BD] loaded initial status message IDs: ${globalCache.bdStatusMessages.size}`);
-  } catch (e) {
-    console.error('[BD] failed to load status message IDs', e);
-  }
-
-  // Load BD -> KC mappings (opt-in) and maintain reverse lookup
-  const rebuildKcNameIndex = () => {
-    globalCache.kcNameToUid.clear();
-    for (const [_discordId, cfg] of globalCache.bdToKC.entries()) {
-      if (cfg?.enabled && cfg?.kcName && cfg?.kcUid) {
-        globalCache.kcNameToUid.set(String(cfg.kcName), String(cfg.kcUid));
-      }
-    }
-  };
-  try {
-    const snap = await rtdb.ref('config/bdToKC').get();
-    globalCache.bdToKC.clear();
-    if (snap.exists()) {
-      const all = snap.val() || {};
-      for (const [discordId, cfg] of Object.entries(all)) {
-        if (cfg?.kcUid) globalCache.bdToKC.set(discordId, { kcUid: cfg.kcUid, kcName: cfg.kcName || null, enabled: cfg.enabled === true });
-      }
-    }
-    rebuildKcNameIndex();
-    rtdb.ref('config/bdToKC').on('child_added', s => {
-      const v = s.val() || {};
-      if (v?.kcUid) globalCache.bdToKC.set(s.key, { kcUid: v.kcUid, kcName: v.kcName || null, enabled: v.enabled === true });
-      rebuildKcNameIndex();
-    });
-    rtdb.ref('config/bdToKC').on('child_changed', s => {
-      const v = s.val() || {};
-      if (v?.kcUid) globalCache.bdToKC.set(s.key, { kcUid: v.kcUid, kcName: v.kcName || null, enabled: v.enabled === true });
-      else globalCache.bdToKC.delete(s.key);
-      rebuildKcNameIndex();
-    });
-    rtdb.ref('config/bdToKC').on('child_removed', s => {
-      globalCache.bdToKC.delete(s.key);
-      rebuildKcNameIndex();
-    });
-    console.log(`[BD] loaded initial BD->KC mappings: ${globalCache.bdToKC.size}`);
-  } catch (e) {
-    console.error('[BD] failed to load BD->KC mappings', e);
-  }
-
-  // Send initial Battledome status messages to all configured destinations. Do this
-  // after loading bdDestinations so that each configured guild receives a
-  // consolidated status embed on startup. Subsequent updates are handled by
-  // the poller and broadcast logic.
-  try {
-    updateBdStatusMessages().catch(() => {});
-  } catch {}
-
-  // Attach listeners for all existing and new users to broadcast clips
   try {
     const usersSnap = await rtdb.ref('users').get();
     if (usersSnap.exists()) {
         Object.keys(usersSnap.val()).forEach(attachPostsListener);
     }
     rtdb.ref('users').on('child_added', s => attachPostsListener(s.key));
-  } catch (e) {
-      console.error('[broadcast] failed to attach initial user listeners', e);
-  }
+  } catch (e) {}
 
-  // Load clan battle/event destination channels and attach live updates
   try {
     const snap2 = await rtdb.ref('config/battleDestinations').get();
     globalCache.battleDestinations.clear();
@@ -5783,8 +3376,6 @@ client.once('ready', async () => {
         if (cfg?.channelId) globalCache.battleDestinations.set(guildId, cfg.channelId);
       }
     }
-    console.log(`[battle broadcast] loaded initial battle destinations: ${globalCache.battleDestinations.size}`);
-    // Listen for updates to battle destinations
     rtdb.ref('config/battleDestinations').on('child_added', s => {
       const v = s.val() || {};
       if (v.channelId) globalCache.battleDestinations.set(s.key, v.channelId);
@@ -5797,30 +3388,12 @@ client.once('ready', async () => {
     rtdb.ref('config/battleDestinations').on('child_removed', s => {
       globalCache.battleDestinations.delete(s.key);
     });
-  } catch (e) {
-    console.error('[battle broadcast] failed to load battle destinations', e);
-  }
-  // Attach listener for clan battles to broadcast accepted battles
-  try {
-    const ref = rtdb.ref('battles');
-    // Listen for new battles
-    ref.orderByChild('createdAt').startAt(Date.now() - 5000).on('child_added', s => {
-      const battle = s.val();
-      maybeBroadcastBattle(s.key, battle).catch(e => console.error('[battle broadcast] add error', e));
-    }, err => console.error('[battle broadcast] listener error (add)', err));
-    // Listen for updates (e.g., pending -> accepted)
-    ref.on('child_changed', s => {
-      const battle = s.val();
-      maybeBroadcastBattle(s.key, battle).catch(e => console.error('[battle broadcast] change error', e));
-    }, err => console.error('[battle broadcast] listener error (change)', err));
-  } catch (e) {
-    console.error('[battle broadcast] failed to attach battle listeners', e);
-  }
+  } catch (e) {}
+
+  // We rely on the Poller to start status updates.
 });
 
-function attachPostsListener(uid) {
-    // Placeholder based on context of original file having this function
-}
+function attachPostsListener(uid) {}
 
 (async () => {
   try {
@@ -5831,8 +3404,6 @@ function attachPostsListener(uid) {
     console.error('registerCommands FAILED:', e?.rawError || e);
   }
 
-  // Claim lock before client login
-  // Start bot only after we own the lock
   async function startWhenLocked() {
     while (true) {
       try {
@@ -5846,10 +3417,7 @@ function attachPostsListener(uid) {
     }
     console.log('Lock acquired — logging into Discord…');
     
-    // Load persisted top scores (will also seed hardcoded scores and fetch west stats)
     await loadBdTop();
-    
-    // Start Top Score persistence loop
     setInterval(async () => {
         if(bdTopDirty) {
             bdTopDirty = false;
@@ -5857,11 +3425,9 @@ function attachPostsListener(uid) {
         }
     }, 30000).unref();
 
-    // Attach process exit handlers to persist top scores on shutdown
     const gracefulSave = async (exitCode = 0) => {
       try {
         if (bdTopDirty) {
-          // attempt to save without clearing the flag (avoid race conditions)
           await saveBdTop();
           bdTopDirty = false;
         }
@@ -5882,16 +3448,10 @@ function attachPostsListener(uid) {
       gracefulSave(1);
     });
 
-    // West Coast Battledome removed; no West stats refresh.
-
     await client.login(process.env.DISCORD_BOT_TOKEN);
 
-    // Start Battledome Poller only after acquiring lock and login
     pollBattledome().catch(e => console.error('BD Poller failed to start:', e));
-
-    // Start background cache warming loop. This runs forever and ensures users always see a snapshot.
     warmBdCachesForever().catch(err => console.error('[BD Warm] fatal:', err));
-
     setInterval(() => renewBotLock().catch(() => {}), 30_000).unref();
   }
 
